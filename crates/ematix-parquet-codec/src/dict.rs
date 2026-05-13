@@ -31,7 +31,10 @@ pub fn decode_rle_dictionary_indices(body: &[u8], num_values: usize) -> Result<V
 /// Look up `indices` in `dict` to produce the column's actual values.
 /// Bounds-checked: an out-of-range index returns
 /// `CodecError::DictIndexOutOfRange`.
-pub fn lookup_dict_i64(dict: &[i64], indices: &[u32]) -> Result<Vec<i64>> {
+///
+/// Generic over the dict value type — `T: Copy` covers all parquet
+/// physical types we materialize (Int32, Int64, Float32, Float64).
+pub fn lookup_dict<T: Copy>(dict: &[T], indices: &[u32]) -> Result<Vec<T>> {
     let n = dict.len();
     let mut out = Vec::with_capacity(indices.len());
     for &idx in indices {

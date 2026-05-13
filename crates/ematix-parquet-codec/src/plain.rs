@@ -51,3 +51,99 @@ pub fn decode_plain_i64_n(bytes: &[u8], n: usize) -> Result<Vec<i64>> {
     }
     Ok(out)
 }
+
+/// PLAIN-encoded INT32 — 4-byte little-endian per value.
+pub fn decode_plain_i32(bytes: &[u8]) -> Result<Vec<i32>> {
+    if bytes.len() % 4 != 0 {
+        return Err(CodecError::UnalignedPlainBuffer {
+            value_width: 4,
+            buffer_len: bytes.len(),
+        });
+    }
+    let n = bytes.len() / 4;
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(4) {
+        out.push(i32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(out)
+}
+
+pub fn decode_plain_i32_n(bytes: &[u8], n: usize) -> Result<Vec<i32>> {
+    let needed = n * 4;
+    if bytes.len() < needed {
+        return Err(CodecError::UnderflowingPlainBuffer {
+            value_width: 4,
+            buffer_len: bytes.len(),
+            requested_values: n,
+        });
+    }
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes[..needed].chunks_exact(4) {
+        out.push(i32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(out)
+}
+
+/// PLAIN-encoded FLOAT (IEEE-754 single, 4 bytes LE).
+pub fn decode_plain_f32(bytes: &[u8]) -> Result<Vec<f32>> {
+    if bytes.len() % 4 != 0 {
+        return Err(CodecError::UnalignedPlainBuffer {
+            value_width: 4,
+            buffer_len: bytes.len(),
+        });
+    }
+    let n = bytes.len() / 4;
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(4) {
+        out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(out)
+}
+
+pub fn decode_plain_f32_n(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+    let needed = n * 4;
+    if bytes.len() < needed {
+        return Err(CodecError::UnderflowingPlainBuffer {
+            value_width: 4,
+            buffer_len: bytes.len(),
+            requested_values: n,
+        });
+    }
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes[..needed].chunks_exact(4) {
+        out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(out)
+}
+
+/// PLAIN-encoded DOUBLE (IEEE-754 double, 8 bytes LE).
+pub fn decode_plain_f64(bytes: &[u8]) -> Result<Vec<f64>> {
+    if bytes.len() % 8 != 0 {
+        return Err(CodecError::UnalignedPlainBuffer {
+            value_width: 8,
+            buffer_len: bytes.len(),
+        });
+    }
+    let n = bytes.len() / 8;
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(8) {
+        out.push(f64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(out)
+}
+
+pub fn decode_plain_f64_n(bytes: &[u8], n: usize) -> Result<Vec<f64>> {
+    let needed = n * 8;
+    if bytes.len() < needed {
+        return Err(CodecError::UnderflowingPlainBuffer {
+            value_width: 8,
+            buffer_len: bytes.len(),
+            requested_values: n,
+        });
+    }
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes[..needed].chunks_exact(8) {
+        out.push(f64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(out)
+}

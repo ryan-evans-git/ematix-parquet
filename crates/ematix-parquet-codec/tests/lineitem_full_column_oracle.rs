@@ -14,7 +14,7 @@ use std::fs::File;
 use std::path::PathBuf;
 
 use ematix_parquet_codec::compression::decompress_snappy;
-use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, lookup_dict_i64};
+use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, lookup_dict};
 use ematix_parquet_codec::plain::decode_plain_i64;
 use ematix_parquet_format::types::Encoding;
 use ematix_parquet_io::{PageWalker, ParquetFile};
@@ -94,7 +94,7 @@ let mut ours: Vec<i64> = Vec::with_capacity(total_values);
             Encoding::RleDictionary | Encoding::PlainDictionary => {
                 let indices =
                     decode_rle_dictionary_indices(&decompressed, n_values).expect("rle indices");
-                let values = lookup_dict_i64(&dict, &indices).expect("dict lookup");
+                let values = lookup_dict(&dict, &indices).expect("dict lookup");
                 ours.extend(values);
                 dict_data_pages += 1;
             }

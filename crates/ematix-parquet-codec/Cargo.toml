@@ -72,3 +72,10 @@ path = "examples/bench_unpack.rs"
 [[example]]
 name = "probe_bitwidths"
 path = "examples/probe_bitwidths.rs"
+
+# Snappy microbench: hand-rolled vs snap crate across random,
+# back-reference-heavy, and parquet-shaped inputs.
+# Run: cargo run --release --example bench_snappy
+[[example]]
+name = "bench_snappy"
+path = "examples/bench_snappy.rs"

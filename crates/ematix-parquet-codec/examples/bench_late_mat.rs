@@ -25,9 +25,9 @@ use ematix_parquet_codec::column::{DictColumnChunk, Segment};
 use ematix_parquet_codec::compression::decompress_snappy;
 use ematix_parquet_codec::dict::{
     decode_rle_dictionary_indices, decode_rle_dictionary_into,
-    decode_rle_dictionary_predicate_bitmap_bw12,
+    decode_rle_dictionary_predicate_bitmap_bw12, gather_dict_at_bitmap_into,
 };
-use ematix_parquet_codec::plain::{decode_plain_i32, decode_plain_i32_n};
+use ematix_parquet_codec::plain::{decode_plain_f64, decode_plain_i32, decode_plain_i32_n};
 use ematix_parquet_format::types::Encoding;
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
@@ -309,6 +309,162 @@ fn main() {
     });
     pretty_ratio("end-to-end neon-fused vs parquet-rs", nf_count, pr_full);
     pretty_ratio("end-to-end neon-fused vs stream-fused", nf_count, sf_count);
+    println!();
+
+    println!("Phase 6: Q14 full lever — shipdate bitmap → sparse l_extendedprice gather");
+    println!("(Phase 5 fused-NEON filter + bitmap-driven gather; produces Vec<f64> of matching rows)");
+
+    // Correctness check: ours vs parquet-rs baseline must match
+    // up to f64 order (both walk rows in row-group order).
+    let ours_ref = q14_lever_shipdate_then_extprice(&path);
+    let theirs_ref = parquet_rs_q14_baseline(&path);
+    assert_eq!(
+        ours_ref.len(),
+        theirs_ref.len(),
+        "Phase 6 row count {} != parquet-rs row count {}",
+        ours_ref.len(),
+        theirs_ref.len()
+    );
+    let sum_ours: f64 = ours_ref.iter().sum();
+    let sum_theirs: f64 = theirs_ref.iter().sum();
+    assert!(
+        (sum_ours - sum_theirs).abs() < 1e-6 * sum_theirs.abs(),
+        "Phase 6 sum {:.4} differs from parquet-rs {:.4}",
+        sum_ours,
+        sum_theirs
+    );
+    println!(
+        "  ✓ correctness: {} matching rows, SUM(l_extprice) = {:.2}",
+        ours_ref.len(),
+        sum_ours
+    );
+
+    let (q14_full, _, _) = bench(
+        "Q14 fused-filter + sparse-gather",
+        || q14_lever_shipdate_then_extprice(&path),
+    );
+    let (pr_q14, _, _) = bench("parquet-rs (read shipdate + read extprice, filter + gather)", || {
+        parquet_rs_q14_baseline(&path)
+    });
+    pretty_ratio("Phase 6 vs parquet-rs (Q14 lever)", q14_full, pr_q14);
+}
+
+/// Q14 critical-path baseline using parquet-rs: read both columns,
+/// filter by shipdate, gather extprice at matching rows.
+fn parquet_rs_q14_baseline(path: &Path) -> Vec<f64> {
+    let r = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
+    let rgr = r.get_row_group(0).unwrap();
+    let total = r.metadata().row_group(0).num_rows() as usize;
+
+    let mut shipdate: Vec<i32> = Vec::with_capacity(total);
+    let mut sd_reader = match rgr.get_column_reader(10).unwrap() {
+        ColumnReader::Int32ColumnReader(t) => t,
+        _ => panic!(),
+    };
+    sd_reader.read_records(total, None, None, &mut shipdate).unwrap();
+
+    let mut extprice: Vec<f64> = Vec::with_capacity(total);
+    let mut ep_reader = match rgr.get_column_reader(5).unwrap() {
+        ColumnReader::DoubleColumnReader(t) => t,
+        _ => panic!(),
+    };
+    ep_reader.read_records(total, None, None, &mut extprice).unwrap();
+
+    let mut out: Vec<f64> = Vec::new();
+    for (i, &d) in shipdate.iter().enumerate() {
+        if d >= LO && d < HI {
+            out.push(extprice[i]);
+        }
+    }
+    out
+}
+
+/// Phase 6: full Q14 column lever.
+///   1. Phase-5-style fused-NEON filter on l_shipdate → bitmap.
+///   2. Walk l_extendedprice chunk; per data page, sparse-gather
+///      values at bitmap-true rows via `gather_dict_at_bitmap_into`.
+fn q14_lever_shipdate_then_extprice(path: &Path) -> Vec<f64> {
+    let file = ParquetFile::open(path).unwrap();
+    let total = {
+        let md = file.metadata().unwrap();
+        md.row_groups[0].columns[10].meta_data.as_ref().unwrap().num_values as usize
+    };
+
+    // Step 1: shipdate → bitmap (mirrors Phase 5 helper, inlined to
+    // hold onto the bitmap rather than discarding it after a count).
+    let (sd_chunk, _) = read_chunk_bytes(&file, 0, 10);
+    let mut walker = PageWalker::new(&sd_chunk);
+    let (first_hdr, first_body) = walker.next_page().unwrap().unwrap();
+    let dict_decompressed = decompress_snappy(first_body).unwrap();
+    let dict_mask: Vec<u8> = if first_hdr.dictionary_page_header.is_some() {
+        let dict = decode_plain_i32(&dict_decompressed).unwrap();
+        let mut m = vec![0u8; 4096];
+        for (i, &v) in dict.iter().enumerate() {
+            if v >= LO && v < HI {
+                m[i] = 1;
+            }
+        }
+        m
+    } else {
+        vec![0u8; 4096]
+    };
+    let mut bitmap: Vec<u8> = Vec::with_capacity(total.div_ceil(8));
+    let mut sd_emitted: usize = 0;
+    while sd_emitted < total {
+        let (hdr, body) = walker.next_page().unwrap().unwrap();
+        let dph = hdr.data_page_header.as_ref().unwrap();
+        let n = dph.num_values as usize;
+        let decompressed = decompress_snappy(body).unwrap();
+        decode_rle_dictionary_predicate_bitmap_bw12(&decompressed, n, &dict_mask, &mut bitmap)
+            .unwrap();
+        sd_emitted += n;
+    }
+
+    // Step 2: l_extendedprice (col 5, DOUBLE) → sparse gather.
+    let (ep_chunk, _) = read_chunk_bytes(&file, 0, 5);
+    let mut walker = PageWalker::new(&ep_chunk);
+    let (first_hdr, first_body) = walker.next_page().unwrap().unwrap();
+    let dict_decompressed = decompress_snappy(first_body).unwrap();
+    let ep_dict: Vec<f64> = if first_hdr.dictionary_page_header.is_some() {
+        decode_plain_f64(&dict_decompressed).unwrap()
+    } else {
+        Vec::new()
+    };
+
+    let mut out: Vec<f64> = Vec::with_capacity(bitmap.iter().map(|b| b.count_ones() as usize).sum());
+    let mut ep_emitted: usize = 0;
+    while ep_emitted < total {
+        let (hdr, body) = walker.next_page().unwrap().unwrap();
+        let dph = hdr.data_page_header.as_ref().unwrap();
+        let n = dph.num_values as usize;
+        let decompressed = decompress_snappy(body).unwrap();
+        match dph.encoding {
+            Encoding::RleDictionary | Encoding::PlainDictionary => {
+                gather_dict_at_bitmap_into(
+                    &decompressed,
+                    n,
+                    &bitmap,
+                    ep_emitted,
+                    &ep_dict,
+                    &mut out,
+                )
+                .unwrap();
+            }
+            Encoding::Plain => {
+                // PLAIN f64: 8 bytes per value; per-row bitmap check.
+                let vals = decode_plain_f64(&decompressed).unwrap();
+                for (i, &v) in vals.iter().enumerate().take(n) {
+                    let bit_pos = ep_emitted + i;
+                    if (bitmap[bit_pos / 8] >> (bit_pos % 8)) & 1 == 1 {
+                        out.push(v);
+                    }
+                }
+            }
+            _ => panic!("unexpected ext-price encoding {:?}", dph.encoding),
+        }
+        ep_emitted += n;
+    }
+    out
 }
 
 /// Q14-shape end-to-end using the NEON-fused predicate kernel.

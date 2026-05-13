@@ -351,6 +351,228 @@ fn fused_bitmap_chunk(
     }
 }
 
+/// Bitmap-driven sparse gather from a dict-encoded data page.
+///
+/// Walks the RLE/bit-packed body, and for each row where the global
+/// row-mask `bitmap[bitmap_offset + row]` is 1, pushes `dict[idx[row]]`
+/// into `out`. Rows whose bitmap bit is 0 are skipped (bit stream
+/// still advances).
+///
+/// Use case: after a Phase-5-style filter produces a column bitmap,
+/// the aggregate columns (l_partkey, l_extendedprice, l_discount in
+/// Q14) are decoded sparsely — only the matching rows materialize.
+/// At typical Q14 selectivity (~1%) this collapses the per-page
+/// gather from ~20K writes to ~250 writes. The unpack still walks
+/// the full stream (parquet's bit-packing is positional), but the
+/// allocator + cache traffic drops 100×.
+///
+/// `bitmap_offset` is the global row index of `num_values=0`. Used
+/// when the same bitmap covers multiple pages of a row group.
+pub fn gather_dict_at_bitmap_into<T: Copy>(
+    body: &[u8],
+    num_values: usize,
+    bitmap: &[u8],
+    bitmap_offset: usize,
+    dict: &[T],
+    out: &mut Vec<T>,
+) -> Result<()> {
+    if body.is_empty() {
+        return Err(CodecError::EmptyDictPageBody);
+    }
+    let bit_width = body[0];
+    if bit_width > 32 {
+        return Err(CodecError::BitWidthOutOfRange(bit_width));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let dict_size = dict.len();
+
+    if bit_width == 0 {
+        if dict_size == 0 {
+            return Err(CodecError::DictIndexOutOfRange {
+                index: 0,
+                dict_size: 0,
+            });
+        }
+        let v = dict[0];
+        for row in 0..num_values {
+            let bit_pos = bitmap_offset + row;
+            let bit = (bitmap[bit_pos / 8] >> (bit_pos % 8)) & 1;
+            if bit == 1 {
+                out.push(v);
+            }
+        }
+        return Ok(());
+    }
+
+    let value_bytes = (bit_width as usize + 7) / 8;
+    let mut cur = Cursor::new(&body[1..]);
+    let mut row: usize = 0;
+
+    while row < num_values {
+        let header = read_uvarint(&mut cur)?;
+        let is_bit_packed = (header & 1) == 1;
+        let count = (header >> 1) as usize;
+
+        if is_bit_packed {
+            let total = count * 8;
+            let to_consume = (num_values - row).min(total);
+            let needed = (total * bit_width as usize + 7) / 8;
+            let chunk = cur.take(needed)?;
+
+            // Iterate 8 rows at a time. Each 8-row block consumes a
+            // whole byte count of input (8 × bit_width bits = N bytes),
+            // so we can skip a block by advancing the bit cursor by
+            // `bit_width` bytes without unpacking, *iff* the bitmap
+            // byte for that block is 0. At Q14-shape selectivity
+            // (~1%) almost all bitmap bytes are 0, so most blocks
+            // skip entirely.
+            let bytes_per_8 = bit_width as usize;
+            debug_assert_eq!(8 * bit_width as usize, bytes_per_8 * 8);
+            let mut byte_cursor = 0usize;
+            let mut block_row = 0usize;
+            let mut scratch: [u32; 8] = [0; 8];
+            while block_row + 8 <= to_consume {
+                let bit_pos_base = bitmap_offset + row + block_row;
+                debug_assert_eq!(bit_pos_base % 8, 0, "bitmap_offset must be byte-aligned for sparse-gather");
+                let mask_byte = bitmap[bit_pos_base / 8];
+                if mask_byte != 0 {
+                    // Unpack only the 8 indices for this block.
+                    unpack_8_indices(&chunk[byte_cursor..byte_cursor + bytes_per_8], bit_width, &mut scratch);
+                    for lane in 0..8 {
+                        if (mask_byte >> lane) & 1 == 1 {
+                            let idx_u = scratch[lane] as usize;
+                            if idx_u >= dict_size {
+                                return Err(CodecError::DictIndexOutOfRange {
+                                    index: scratch[lane],
+                                    dict_size,
+                                });
+                            }
+                            out.push(dict[idx_u]);
+                        }
+                    }
+                }
+                byte_cursor += bytes_per_8;
+                block_row += 8;
+            }
+            // Tail (< 8 rows) at the end of the run: scalar per-row.
+            if block_row < to_consume {
+                let tail = to_consume - block_row;
+                let tail_bytes = (tail * bit_width as usize + 7) / 8;
+                let mut tail_idxs: Vec<u32> = Vec::with_capacity(tail);
+                unpack_indices_into(
+                    &chunk[byte_cursor..byte_cursor + tail_bytes],
+                    tail,
+                    bit_width,
+                    &mut tail_idxs,
+                )?;
+                for (i, idx) in tail_idxs.into_iter().enumerate() {
+                    let bit_pos = bitmap_offset + row + block_row + i;
+                    let bit = (bitmap[bit_pos / 8] >> (bit_pos % 8)) & 1;
+                    if bit == 1 {
+                        let idx_u = idx as usize;
+                        if idx_u >= dict_size {
+                            return Err(CodecError::DictIndexOutOfRange {
+                                index: idx,
+                                dict_size,
+                            });
+                        }
+                        out.push(dict[idx_u]);
+                    }
+                }
+            }
+            row += to_consume;
+        } else {
+            // RLE run: one index repeated `count` times. Bitmap tells
+            // us how many matching rows to emit, all with the same value.
+            let value_chunk = cur.take(value_bytes)?;
+            let mut idx_u32: u32 = 0;
+            for j in 0..value_bytes {
+                idx_u32 |= (value_chunk[j] as u32) << (j * 8);
+            }
+            let idx_u = idx_u32 as usize;
+            if idx_u >= dict_size {
+                return Err(CodecError::DictIndexOutOfRange {
+                    index: idx_u32,
+                    dict_size,
+                });
+            }
+            let v = dict[idx_u];
+            let to_consume = (num_values - row).min(count);
+            // Count set bits in `bitmap[bitmap_offset + row .. + to_consume]`
+            // and push `v` that many times. Faster than per-row test
+            // for long RLE runs since `v` is constant.
+            let matched = popcount_range(bitmap, bitmap_offset + row, bitmap_offset + row + to_consume);
+            for _ in 0..matched {
+                out.push(v);
+            }
+            row += to_consume;
+        }
+    }
+    Ok(())
+}
+
+/// Streaming bit-unpack of exactly 8 values at `bit_width` bits each.
+/// Input must be exactly `bit_width` bytes (= 8 values' worth).
+/// Used by `gather_dict_at_bitmap_into` to unpack one 8-row block
+/// only when the bitmap byte indicates at least one match.
+#[inline]
+fn unpack_8_indices(packed: &[u8], bit_width: u8, out: &mut [u32; 8]) {
+    debug_assert_eq!(packed.len(), bit_width as usize);
+    let mask: u64 = if bit_width == 32 {
+        u32::MAX as u64
+    } else {
+        (1u64 << bit_width) - 1
+    };
+    let mut buf: u64 = 0;
+    let mut bits: u32 = 0;
+    let mut byte_idx = 0usize;
+    for lane in 0..8 {
+        while bits < bit_width as u32 {
+            buf |= (packed[byte_idx] as u64) << bits;
+            byte_idx += 1;
+            bits += 8;
+        }
+        out[lane] = (buf & mask) as u32;
+        buf >>= bit_width;
+        bits -= bit_width as u32;
+    }
+}
+
+/// Count the number of set bits in `bitmap[start_bit..end_bit]`.
+/// Fast paths whole-byte aligned cases via `count_ones()`; partial
+/// head/tail bytes via masked count.
+fn popcount_range(bitmap: &[u8], start_bit: usize, end_bit: usize) -> usize {
+    if start_bit >= end_bit {
+        return 0;
+    }
+    let mut bit = start_bit;
+    let mut total: usize = 0;
+    // Partial head.
+    while bit < end_bit && bit % 8 != 0 {
+        let b = bitmap[bit / 8];
+        if (b >> (bit % 8)) & 1 == 1 {
+            total += 1;
+        }
+        bit += 1;
+    }
+    // Whole bytes.
+    while bit + 8 <= end_bit {
+        total += bitmap[bit / 8].count_ones() as usize;
+        bit += 8;
+    }
+    // Partial tail.
+    while bit < end_bit {
+        let b = bitmap[bit / 8];
+        if (b >> (bit % 8)) & 1 == 1 {
+            total += 1;
+        }
+        bit += 1;
+    }
+    total
+}
+
 pub fn lookup_dict<T: Copy>(dict: &[T], indices: &[u32]) -> Result<Vec<T>> {
     let n = dict.len();
     let mut out = Vec::with_capacity(indices.len());

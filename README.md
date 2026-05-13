@@ -1,34 +1,36 @@
 # ematix-parquet
 
-A hand-rolled Apache Parquet decoder in Rust, optimised for AArch64
-(NEON) and analytical query workloads. Goal: a self-contained read
-(soon also write) path that competes with `parquet-rs` on the shapes
-where most analytical queries actually live.
+A hand-rolled Apache Parquet implementation in Rust — both read and
+write — optimised for AArch64 (NEON) and analytical query workloads.
+The goal is a self-contained crate that competes with `parquet-rs` on
+the shapes where most analytical queries actually live.
 
 Sibling project to [ematix-flow](https://github.com/ryan-evans-git/ematix-flow);
-designed to be a clean drop-in alternative for high-throughput
-columnar scans.
+designed to be a clean drop-in for high-throughput columnar scans and
+a write path that produces files the rest of the ecosystem can read.
 
 ## Status
 
-`v0.0.1` — pre-1.0, API still moving. Read path is feature-complete
-for the most common Parquet shapes; write path is the headline open
-item for v1.0. Downstream consumers should pin by SHA.
+`v0.0.x` — pre-1.0, API still moving. The standard read+write path is
+feature-complete for every Parquet shape covered below; the missing
+items are listed explicitly in the roadmap. Downstream consumers
+should pin by SHA.
 
 ## What's implemented
 
 ### Read path
 
-**Physical types** — INT32, INT64, FLOAT, DOUBLE, BOOLEAN, BYTE_ARRAY
-(INT96 and FIXED_LEN_BYTE_ARRAY parsed in metadata but not yet
-decoded).
+**Physical types** — INT32, INT64, INT96, FLOAT, DOUBLE, BOOLEAN,
+BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY. Every Parquet primitive.
 
-**Encodings** — PLAIN, PLAIN_DICTIONARY, RLE_DICTIONARY (with the RLE +
-bit-pack hybrid for dictionary indices and definition / repetition
-levels), DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY.
+**Encodings** — PLAIN, PLAIN_DICTIONARY, RLE_DICTIONARY (the
+RLE + bit-pack hybrid for dictionary indices and definition /
+repetition levels), DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY,
+DELTA_BYTE_ARRAY. BYTE_STREAM_SPLIT is still open.
 
 **Compression** — Snappy (hand-rolled fast path + `snap` fallback),
-Zstd, Uncompressed. Gzip / Brotli / LZ4 are stubs for v1.0.
+Zstd, Gzip, Brotli, LZ4_RAW, Uncompressed. The complete set of
+mainstream codecs.
 
 **Metadata** — Thrift compact-protocol parse of file footer, row
 groups, column chunks, page headers, schema (logical + converted
@@ -36,9 +38,40 @@ types), statistics (min / max / null count). Page index + column
 index parsed; pruning is wired but only fires when stats are tight
 enough to skip pages.
 
+### Write path
+
+**Single-column writers** — one entry point per scalar type, two
+shapes per codec (default-uncompressed + explicit codec):
+
+```rust
+ematix_parquet_codec::write::write_i64_column_to_path(path, name, values);
+ematix_parquet_codec::write::write_i32_column_to_path_with_codec(
+    path, name, values, CompressionCodec::Snappy,
+);
+```
+
+Variants exist for `i32`, `i64`, `f64`, `bool`, `byte_array`. All
+emit PLAIN-encoded REQUIRED columns inside a single row group.
+
+**Multi-column writer** — for tables with mixed types:
+
+```rust
+let columns = vec![
+    ("id",    ColumnData::I64(&ids)),
+    ("price", ColumnData::F64(&prices)),
+    ("name",  ColumnData::ByteArray(&name_refs)),
+];
+write_table_to_path(path, &columns, CompressionCodec::Snappy)?;
+```
+
+All five mainstream codecs (Snappy / Zstd / Gzip / Brotli / LZ4_RAW)
+are wired on the write side. Round-trip oracles validate every
+codec × type combination against `parquet-rs`.
+
 ### Performance
 
-**SIMD bit-unpackers (NEON, AArch64)** —
+**SIMD bit-unpackers (NEON, AArch64)**
+
 - bw=12: hot for date columns (`l_shipdate`, `l_commitdate`,
   `l_receiptdate`) — ~10× the scalar baseline.
 - bw=17: hot for price / key columns (`l_extendedprice`,
@@ -63,21 +96,34 @@ to keep the slow path off the hot loop.
 
 ### Test coverage
 
-Oracle tests compare every decoder against `parquet-rs` on real
-TPC-H SF=1 lineitem.parquet (and synthetic round-trips written by
-`parquet-rs`):
+Oracle tests against `parquet-rs` cover both directions on every
+codec and every type. ~200 tests across 30+ test binaries. The
+matrix:
 
-- `lineitem_full_column_oracle` — INT64 full column-chunk parity
-- `lineitem_dict_oracle` — dictionary-encoded column parity
-- `lineitem_byte_array_oracle` — BYTE_ARRAY parity
-- `lineitem_multi_column_oracle` — Q14-shape end-to-end parity
-- `delta_real_file_oracle` — `parquet-rs` writes DELTA_BINARY_PACKED →
-  ours reads
-- `zstd_real_file_oracle` — `parquet-rs` writes Zstd → ours reads
-- `page_index_real_file_oracle` — column-index range selection parity
+**Read side** — `parquet-rs` writes files we then decode and
+diff value-by-value:
 
-Plus ~20 unit tests across compression, dict, delta, bitpack, levels,
-page index, predicate fusion.
+- TPC-H SF=1 lineitem column oracles (i64 / dict / byte_array /
+  Q14-shape multi-column / page-index range selection)
+- DELTA_BINARY_PACKED, DELTA_BYTE_ARRAY round-trip
+- Gzip / Brotli / LZ4_RAW / Zstd round-trip
+- INT96, FIXED_LEN_BYTE_ARRAY PLAIN decode
+- High-level façade: i32 / i64 / f64 / byte_array against
+  TPC-H lineitem
+
+**Write side** — we write the file and `parquet-rs` reads it
+back, plus a symmetric check via our own reader:
+
+- PLAIN i64 / i32 / f64 / bool / byte_array round-trip
+- Snappy / Zstd / Gzip / Brotli / LZ4_RAW round-trip per codec
+- Multi-column mixed-type table
+- Empty-column + i64-extremes edge cases
+- Compression-shrinks-file check (catches "codec field set but body
+  uncompressed" bugs that round-trip would miss)
+
+Plus ~30 unit tests on compact-protocol writer primitives,
+page-header writers, file-footer writers, bit-pack, RLE, predicate
+fusion, page-index parsing.
 
 ### Benchmarks
 
@@ -102,13 +148,13 @@ Three crates with sharp boundaries:
 
 | Crate                    | Purpose                                                |
 | ------------------------ | ------------------------------------------------------ |
-| `ematix-parquet-format`  | Thrift compact-protocol decoder + Parquet metadata types |
+| `ematix-parquet-format`  | Thrift compact-protocol reader + writer + Parquet metadata types |
 | `ematix-parquet-io`      | File / page-header reading on top of `std::io::Read`   |
-| `ematix-parquet-codec`   | Column decoders, bit-unpackers, compression, NEON kernels |
+| `ematix-parquet-codec`   | Column decoders + encoders, bit-unpackers, compression, NEON kernels, high-level read/write façades |
 
 `format` has no deps beyond `std`. `io` depends on `format`. `codec`
-depends on `format` (for types) but not `io` — so codec can be fed
-bytes from any source (mmap, network, in-memory test buffer).
+depends on both — its low-level decoders are byte-slice based and
+don't pull in `io`, but the high-level read/write façades do.
 
 ## Using it
 
@@ -121,36 +167,57 @@ ematix-parquet-format = { git = "https://github.com/ryan-evans-git/ematix-parque
 ematix-parquet-io     = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "<sha>" }
 ```
 
-Today the public surface is low-level: `ParquetFile::open` → iterate
-row groups → iterate column chunks → `PageWalker` over the chunk →
-match encoding → decompress → decode. A higher-level façade
-(`read_column<T>(file, rg, col) -> Iter<T>`) lands in v1.0.
+**Reading** — high-level façade collapses the page-walk boilerplate:
 
-The canonical integration example is ematix-flow's
-[`ematix_parquet_bridge.rs`](https://github.com/ryan-evans-git/ematix-flow/blob/main/crates/ematix-flow-core/src/ematix_parquet_bridge.rs),
-which produces Arrow `RecordBatch`es from ematix-parquet column chunks
-without going through `parquet-rs`'s `ParquetRecordBatchReader`.
+```rust
+use ematix_parquet_codec::read::read_column_i64;
+use ematix_parquet_io::ParquetFile;
 
-## Roadmap to v1.0
+let file = ParquetFile::open("data.parquet")?;
+let values: Vec<i64> = read_column_i64(&file, 0, 0)?;
+```
+
+**Writing** — single-call entry points per type:
+
+```rust
+use ematix_parquet_codec::write::{write_table_to_path, ColumnData};
+use ematix_parquet_format::types::CompressionCodec;
+
+let cols = vec![
+    ("id",   ColumnData::I64(&[1, 2, 3])),
+    ("name", ColumnData::ByteArray(&[b"a" as &[u8], b"bb", b"ccc"])),
+];
+write_table_to_path("out.parquet", &cols, CompressionCodec::Snappy)?;
+```
+
+For zero-copy or per-page access (Arrow integration, predicate-fused
+decode, custom dictionary handling), drop down to the low-level
+decoders directly. `ematix-flow`'s
+[`ematix_parquet_bridge.rs`](https://github.com/ryan-evans-git/ematix-flow/blob/main/crates/ematix-flow-core/src/ematix_parquet_bridge.rs)
+is the canonical example — it produces Arrow `RecordBatch`es from
+ematix-parquet column chunks without going through `parquet-rs`'s
+`ParquetRecordBatchReader`.
+
+## What's still open
+
+Aiming for these in v1.0+:
 
 | Item                                                               | Status   |
 | ------------------------------------------------------------------ | -------- |
-| Read: numeric + bool + byte_array, PLAIN + dict + DELTA, Snappy + Zstd | Done     |
-| NEON kernels for hot bit-widths (12, 17)                           | Done     |
-| Oracle test suite vs `parquet-rs` on real TPC-H lineitem            | Done     |
-| Predicate-fused decode + sparse gather                             | Done     |
-| **High-level `read_column<T>` façade**                             | Open     |
-| **Write path (PLAIN + dict + Snappy + footer write)**              | Open     |
-| Round-trip oracle (ours writes → ours reads, parity vs `parquet-rs`) | Open     |
-| GZIP / Brotli / LZ4 / LZ4_RAW compression                          | Open     |
-| INT96 + FIXED_LEN_BYTE_ARRAY decoders                              | Open     |
-| BYTE_STREAM_SPLIT encoding                                         | Open     |
-| Bloom-filter decoder                                               | Open     |
+| **Dictionary encoding on writes**                                  | Open     |
+| **Multi row-group writes** (writer currently emits one row group)  | Open     |
+| **Statistics on writes** (min / max / null_count on column chunks) | Open     |
+| **DataPageV2 read + write**                                        | Open     |
+| BYTE_STREAM_SPLIT encoding (rare in practice)                       | Open     |
+| Bloom-filter decoder                                                | Open     |
+| Page-index pruning wired into the read façade (parsed today)        | Open     |
 | NEON kernels for mid-range widths (1, 4, 5, 8, 18, 20, 21)          | Open     |
+| INT96 / FLBA dispatch in the high-level façade (low-level done)     | Open     |
 
-Not on the v1.0 path: encrypted modules, async / object-store
-integration (the `io` crate is sync over `Read`), x86 SIMD targets
-(scalar fallback works on any target; NEON is the only hand-tuned path).
+**Not on the v1.0 path**: encrypted modules (out of scope), async /
+object-store integration (the `io` crate is sync over `Read` —
+async is its own design choice), x86 SIMD targets (scalar fallback
+works on every target; NEON is the only hand-tuned path).
 
 ## Build
 

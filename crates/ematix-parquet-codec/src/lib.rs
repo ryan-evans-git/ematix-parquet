@@ -17,7 +17,9 @@
 //!   5. `byte_stream_split` — Parquet v2 numeric encoding. (Not yet.)
 
 pub mod compression;
+pub mod dict;
 pub mod error;
 pub mod plain;
+pub mod rle;
 
 pub use error::{CodecError, Result};

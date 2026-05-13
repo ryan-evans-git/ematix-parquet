@@ -1,7 +1,10 @@
+use ematix_parquet_format::error::FormatError;
 use std::fmt;
 
 #[derive(Debug)]
 pub enum CodecError {
+    /// Wire-format error from the format crate (Cursor reads, varints).
+    Wire(FormatError),
     /// Snappy / Zstd / Gzip / etc. surfaced a decompression failure.
     Decompress(String),
     /// A PLAIN-encoded byte stream had a partial value at the end —
@@ -17,11 +20,20 @@ pub enum CodecError {
         buffer_len: usize,
         requested_values: usize,
     },
+    /// RLE/bit-packed primitive: caller passed a `bit_width` outside
+    /// the supported [0, 64] range.
+    BitWidthOutOfRange(u8),
+    /// A dictionary-encoded data page had a body of zero bytes, so
+    /// the leading bit-width byte was missing.
+    EmptyDictPageBody,
+    /// A dictionary index referenced a slot beyond the dict.
+    DictIndexOutOfRange { index: u32, dict_size: usize },
 }
 
 impl fmt::Display for CodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Wire(e) => write!(f, "wire-format error: {e}"),
             Self::Decompress(s) => write!(f, "decompression failed: {s}"),
             Self::UnalignedPlainBuffer {
                 value_width,
@@ -39,7 +51,19 @@ impl fmt::Display for CodecError {
                 "PLAIN buffer length {buffer_len} too short for {requested_values} \
                  values of width {value_width}"
             ),
+            Self::BitWidthOutOfRange(w) => write!(f, "bit_width {w} outside supported [0, 64]"),
+            Self::EmptyDictPageBody => write!(f, "dictionary-encoded data page had an empty body"),
+            Self::DictIndexOutOfRange { index, dict_size } => write!(
+                f,
+                "dictionary index {index} ≥ dict size {dict_size}"
+            ),
         }
+    }
+}
+
+impl From<FormatError> for CodecError {
+    fn from(e: FormatError) -> Self {
+        Self::Wire(e)
     }
 }
 

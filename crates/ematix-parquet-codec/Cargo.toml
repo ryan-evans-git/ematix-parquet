@@ -20,7 +20,7 @@ snap = "1"
 
 [dev-dependencies]
 ematix-parquet-io = { path = "../ematix-parquet-io" }
-parquet = { version = "58", default-features = false, features = ["snap"] }
+parquet = { version = "58", default-features = false, features = ["snap", "experimental"] }
 # Third-party comparator in the three-way bench. Polars's
 # `LazyFrame::scan_parquet` is what real polars users pay, so we
 # time it directly. Pulls in a heavy dep tree (only for bench

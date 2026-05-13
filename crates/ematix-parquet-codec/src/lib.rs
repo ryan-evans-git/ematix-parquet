@@ -19,6 +19,7 @@
 pub mod bitpack;
 pub mod column;
 pub mod compression;
+pub mod delta;
 pub mod dict;
 pub mod error;
 pub mod levels;

@@ -174,6 +174,64 @@ pub fn read_binary<'a>(cur: &mut Cursor<'a>) -> Result<&'a [u8]> {
     cur.take(len)
 }
 
+/// Decode a `list<i32>` (also wire-compatible with `list<enum>` — the
+/// caller can map results through `ThriftEnum::from_i32`).
+pub fn read_list_i32(cur: &mut Cursor<'_>) -> Result<Vec<i32>> {
+    let (n, et) = read_list_header(cur)?;
+    if !matches!(et, FieldType::I32) {
+        return Err(FormatError::UnexpectedListElementType {
+            expected: FieldType::I32,
+            actual: et,
+        });
+    }
+    (0..n).map(|_| read_zigzag_i32(cur)).collect()
+}
+
+/// Decode a `list<i64>`.
+pub fn read_list_i64(cur: &mut Cursor<'_>) -> Result<Vec<i64>> {
+    let (n, et) = read_list_header(cur)?;
+    if !matches!(et, FieldType::I64) {
+        return Err(FormatError::UnexpectedListElementType {
+            expected: FieldType::I64,
+            actual: et,
+        });
+    }
+    (0..n).map(|_| read_zigzag_i64(cur)).collect()
+}
+
+/// Decode a `list<binary>` (also `list<string>` — wire-identical).
+pub fn read_list_binary<'a>(cur: &mut Cursor<'a>) -> Result<Vec<&'a [u8]>> {
+    let (n, et) = read_list_header(cur)?;
+    if !matches!(et, FieldType::Binary) {
+        return Err(FormatError::UnexpectedListElementType {
+            expected: FieldType::Binary,
+            actual: et,
+        });
+    }
+    (0..n).map(|_| read_binary(cur)).collect()
+}
+
+/// Decode a `list<struct>` by invoking `decode_one` for each element.
+/// The closure consumes one struct's worth of bytes (including its
+/// inner STOP) per call.
+pub fn read_list_struct<'a, T, F>(cur: &mut Cursor<'a>, mut decode_one: F) -> Result<Vec<T>>
+where
+    F: FnMut(&mut Cursor<'a>) -> Result<T>,
+{
+    let (n, et) = read_list_header(cur)?;
+    if !matches!(et, FieldType::Struct) {
+        return Err(FormatError::UnexpectedListElementType {
+            expected: FieldType::Struct,
+            actual: et,
+        });
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(decode_one(cur)?);
+    }
+    Ok(out)
+}
+
 fn decode_field_type(nibble: u8) -> Result<FieldType> {
     Ok(match nibble {
         1 => FieldType::BoolTrue,

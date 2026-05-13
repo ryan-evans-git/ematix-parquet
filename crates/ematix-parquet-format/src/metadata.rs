@@ -5,10 +5,11 @@
 //! need owned data can `.to_vec()` the slices.
 
 use crate::compact::{
-    read_binary, read_field_header, read_zigzag_i32, read_zigzag_i64, Cursor, FieldType,
+    read_binary, read_field_header, read_list_i32, read_list_binary, read_list_struct,
+    read_zigzag_i32, read_zigzag_i64, Cursor, FieldType,
 };
 use crate::error::{FormatError, Result};
-use crate::types::{Encoding, PageType, ThriftEnum};
+use crate::types::{CompressionCodec, Encoding, PageType, ParquetType, ThriftEnum};
 
 /// Per-page or per-column-chunk statistics, as produced by writers
 /// that support the deprecated (min/max) and/or current
@@ -92,6 +93,173 @@ fn missing(struct_name: &'static str, field_id: i16) -> FormatError {
 
 fn unknown(struct_name: &'static str, field_id: i16) -> FormatError {
     FormatError::UnknownStructField { struct_name, field_id }
+}
+
+/// Per-(page_type, encoding) page count, used for read-side stats
+/// even though `encoding_stats` itself is optional on `ColumnMetaData`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageEncodingStats {
+    pub page_type: PageType,
+    pub encoding: Encoding,
+    pub count: i32,
+}
+
+/// Per-column-chunk descriptor. Fields 16/17 (SizeStatistics,
+/// GeospatialStatistics) from newer spec revisions are not yet
+/// modeled and will error as `UnknownStructField`. Bloom-filter
+/// fields are present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnMetaData<'a> {
+    pub column_type: ParquetType,
+    pub encodings: Vec<Encoding>,
+    pub path_in_schema: Vec<&'a [u8]>,
+    pub codec: CompressionCodec,
+    pub num_values: i64,
+    pub total_uncompressed_size: i64,
+    pub total_compressed_size: i64,
+    pub key_value_metadata: Option<Vec<KeyValue<'a>>>,
+    pub data_page_offset: i64,
+    pub index_page_offset: Option<i64>,
+    pub dictionary_page_offset: Option<i64>,
+    pub statistics: Option<Statistics<'a>>,
+    pub encoding_stats: Option<Vec<PageEncodingStats>>,
+    pub bloom_filter_offset: Option<i64>,
+    pub bloom_filter_length: Option<i32>,
+}
+
+/// Top-level chunk descriptor in `RowGroup.columns`. Fields 8/9
+/// (ColumnCryptoMetaData union, encrypted_column_metadata) are not
+/// yet modeled.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ColumnChunk<'a> {
+    pub file_path: Option<&'a [u8]>,
+    pub file_offset: i64,
+    pub meta_data: Option<ColumnMetaData<'a>>,
+    pub offset_index_offset: Option<i64>,
+    pub offset_index_length: Option<i32>,
+    pub column_index_offset: Option<i64>,
+    pub column_index_length: Option<i32>,
+}
+
+pub fn read_page_encoding_stats(cur: &mut Cursor<'_>) -> Result<PageEncodingStats> {
+    let mut page_type = None;
+    let mut encoding = None;
+    let mut count = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::I32) => page_type = Some(PageType::read(cur)?),
+            (2, FieldType::I32) => encoding = Some(Encoding::read(cur)?),
+            (3, FieldType::I32) => count = Some(read_zigzag_i32(cur)?),
+            _ => return Err(unknown("PageEncodingStats", h.id)),
+        }
+    }
+    Ok(PageEncodingStats {
+        page_type: page_type.ok_or_else(|| missing("PageEncodingStats", 1))?,
+        encoding: encoding.ok_or_else(|| missing("PageEncodingStats", 2))?,
+        count: count.ok_or_else(|| missing("PageEncodingStats", 3))?,
+    })
+}
+
+pub fn read_column_metadata<'a>(cur: &mut Cursor<'a>) -> Result<ColumnMetaData<'a>> {
+    let mut column_type = None;
+    let mut encodings = None;
+    let mut path = None;
+    let mut codec = None;
+    let mut num_values = None;
+    let mut total_uncompressed = None;
+    let mut total_compressed = None;
+    let mut kv = None;
+    let mut data_page_offset = None;
+    let mut index_page_offset = None;
+    let mut dict_page_offset = None;
+    let mut statistics = None;
+    let mut encoding_stats = None;
+    let mut bloom_offset = None;
+    let mut bloom_length = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::I32) => column_type = Some(ParquetType::read(cur)?),
+            (2, FieldType::List) => {
+                let raw = read_list_i32(cur)?;
+                encodings = Some(
+                    raw.into_iter()
+                        .map(Encoding::from_i32)
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+            (3, FieldType::List) => path = Some(read_list_binary(cur)?),
+            (4, FieldType::I32) => codec = Some(CompressionCodec::read(cur)?),
+            (5, FieldType::I64) => num_values = Some(read_zigzag_i64(cur)?),
+            (6, FieldType::I64) => total_uncompressed = Some(read_zigzag_i64(cur)?),
+            (7, FieldType::I64) => total_compressed = Some(read_zigzag_i64(cur)?),
+            (8, FieldType::List) => kv = Some(read_list_struct(cur, read_key_value)?),
+            (9, FieldType::I64) => data_page_offset = Some(read_zigzag_i64(cur)?),
+            (10, FieldType::I64) => index_page_offset = Some(read_zigzag_i64(cur)?),
+            (11, FieldType::I64) => dict_page_offset = Some(read_zigzag_i64(cur)?),
+            (12, FieldType::Struct) => statistics = Some(read_statistics(cur)?),
+            (13, FieldType::List) => {
+                encoding_stats = Some(read_list_struct(cur, |c| read_page_encoding_stats(c))?);
+            }
+            (14, FieldType::I64) => bloom_offset = Some(read_zigzag_i64(cur)?),
+            (15, FieldType::I32) => bloom_length = Some(read_zigzag_i32(cur)?),
+            _ => return Err(unknown("ColumnMetaData", h.id)),
+        }
+    }
+    Ok(ColumnMetaData {
+        column_type: column_type.ok_or_else(|| missing("ColumnMetaData", 1))?,
+        encodings: encodings.ok_or_else(|| missing("ColumnMetaData", 2))?,
+        path_in_schema: path.ok_or_else(|| missing("ColumnMetaData", 3))?,
+        codec: codec.ok_or_else(|| missing("ColumnMetaData", 4))?,
+        num_values: num_values.ok_or_else(|| missing("ColumnMetaData", 5))?,
+        total_uncompressed_size: total_uncompressed
+            .ok_or_else(|| missing("ColumnMetaData", 6))?,
+        total_compressed_size: total_compressed.ok_or_else(|| missing("ColumnMetaData", 7))?,
+        key_value_metadata: kv,
+        data_page_offset: data_page_offset.ok_or_else(|| missing("ColumnMetaData", 9))?,
+        index_page_offset,
+        dictionary_page_offset: dict_page_offset,
+        statistics,
+        encoding_stats,
+        bloom_filter_offset: bloom_offset,
+        bloom_filter_length: bloom_length,
+    })
+}
+
+pub fn read_column_chunk<'a>(cur: &mut Cursor<'a>) -> Result<ColumnChunk<'a>> {
+    let mut file_path = None;
+    let mut file_offset = None;
+    let mut meta_data = None;
+    let mut offset_index_offset = None;
+    let mut offset_index_length = None;
+    let mut column_index_offset = None;
+    let mut column_index_length = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Binary) => file_path = Some(read_binary(cur)?),
+            (2, FieldType::I64) => file_offset = Some(read_zigzag_i64(cur)?),
+            (3, FieldType::Struct) => meta_data = Some(read_column_metadata(cur)?),
+            (4, FieldType::I64) => offset_index_offset = Some(read_zigzag_i64(cur)?),
+            (5, FieldType::I32) => offset_index_length = Some(read_zigzag_i32(cur)?),
+            (6, FieldType::I64) => column_index_offset = Some(read_zigzag_i64(cur)?),
+            (7, FieldType::I32) => column_index_length = Some(read_zigzag_i32(cur)?),
+            _ => return Err(unknown("ColumnChunk", h.id)),
+        }
+    }
+    Ok(ColumnChunk {
+        file_path,
+        file_offset: file_offset.ok_or_else(|| missing("ColumnChunk", 2))?,
+        meta_data,
+        offset_index_offset,
+        offset_index_length,
+        column_index_offset,
+        column_index_length,
+    })
 }
 
 pub fn read_key_value<'a>(cur: &mut Cursor<'a>) -> Result<KeyValue<'a>> {

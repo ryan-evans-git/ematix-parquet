@@ -100,6 +100,49 @@ impl CompactBuilder {
         self.i32_field(id, value)
     }
 
+    fn list_header(&mut self, count: usize, type_nibble: u8) {
+        if count < 15 {
+            self.buf.push(((count as u8) << 4) | type_nibble);
+        } else {
+            self.buf.push(0xF0 | type_nibble);
+            self.write_uvarint(count as u64);
+        }
+    }
+
+    /// Field that is a list<i32> (and structurally list<Encoding>,
+    /// list<PageType>, etc. — same i32 wire form).
+    pub fn list_i32_field(&mut self, id: i16, values: &[i32]) -> &mut Self {
+        self.header(id, 9); // type=List
+        self.list_header(values.len(), 5); // elem type=I32
+        for &v in values {
+            let u = ((v << 1) ^ (v >> 31)) as u32 as u64;
+            self.write_uvarint(u);
+        }
+        self
+    }
+
+    /// Field that is a list<string|binary>.
+    pub fn list_binary_field(&mut self, id: i16, values: &[&[u8]]) -> &mut Self {
+        self.header(id, 9);
+        self.list_header(values.len(), 8); // elem type=Binary
+        for v in values {
+            self.write_uvarint(v.len() as u64);
+            self.buf.extend_from_slice(v);
+        }
+        self
+    }
+
+    /// Field that is a list<struct>. Each element's bytes must already
+    /// include its own STOP terminator.
+    pub fn list_struct_field(&mut self, id: i16, elements: &[Vec<u8>]) -> &mut Self {
+        self.header(id, 9);
+        self.list_header(elements.len(), 12); // elem type=Struct
+        for e in elements {
+            self.buf.extend_from_slice(e);
+        }
+        self
+    }
+
     pub fn stop(&mut self) -> Vec<u8> {
         self.buf.push(0x00);
         std::mem::take(&mut self.buf)

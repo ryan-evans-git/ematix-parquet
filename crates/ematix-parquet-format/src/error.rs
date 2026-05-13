@@ -1,3 +1,4 @@
+use crate::compact::FieldType;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +18,10 @@ pub enum FormatError {
     UnexpectedFieldType {
         struct_name: &'static str,
         field_id: i16,
+    },
+    UnexpectedListElementType {
+        expected: FieldType,
+        actual: FieldType,
     },
 }
 
@@ -40,6 +45,9 @@ impl fmt::Display for FormatError {
             }
             Self::UnexpectedFieldType { struct_name, field_id } => {
                 write!(f, "{struct_name}: unexpected wire type for field id {field_id}")
+            }
+            Self::UnexpectedListElementType { expected, actual } => {
+                write!(f, "list element type: expected {expected:?}, got {actual:?}")
             }
         }
     }

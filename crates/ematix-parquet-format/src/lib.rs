@@ -15,6 +15,7 @@
 //! round-trip against `parquet-rs` for the same input bytes.
 
 pub mod compact;
+pub mod compact_writer;
 pub mod error;
 pub mod metadata;
 pub mod types;

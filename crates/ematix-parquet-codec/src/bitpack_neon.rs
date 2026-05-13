@@ -249,6 +249,164 @@ where
     Ok(())
 }
 
+/// Predicate-fused decode: unpack bw=12 indices and write the
+/// per-row predicate result into a packed bitmap, without ever
+/// materializing a Vec<u32> of indices.
+///
+/// `dict_mask[i]` must be 0 (miss) or 1 (match), and `dict_mask`
+/// must be at least 4096 bytes long (zero-padded for any unused
+/// dict slots). The caller fills `dict_mask` once per page by
+/// applying its predicate to each dict value — typically negligible
+/// (~2.5K ops for l_shipdate's ~2525-entry dict).
+///
+/// Output: `out` receives `num_values.div_ceil(8)` bytes. Bit `i`
+/// of byte `k` represents row `8k + i`.
+///
+/// Per 8 input rows the kernel runs:
+///   - 1 NEON load + shuffle + variable shift + mask (≈ 7 ops)
+///   - 8 scalar byte loads from dict_mask (L1 cached)
+///   - 8 shifted ORs into one u8
+///   - 1 byte store
+///
+/// vs the previous path which writes 8 × i32 (32 bytes) plus a
+/// downstream Vec<bool> scan, this writes 1 byte and stops. 32× less
+/// output write traffic. Targets the Q14 lever in TPC-H lineitem
+/// (l_shipdate predicate).
+pub fn decode_predicate_bitmap_neon_bw12(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < 4096 {
+        return Err(CodecError::Decompress(format!(
+            "neon bw12 fused: dict_mask must be ≥ 4096 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 12).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "neon bw12 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let tail = num_values % 8;
+
+    // Safety boundary on NEON load: kernel reads 16 bytes per block
+    // but uses 12. The final iteration may overrun if packed.len() is
+    // exactly 12 * full_blocks. Drop the last full block to scalar in
+    // that case.
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 12 * (full_blocks - 1) + 16 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    unsafe {
+        fused_predicate_neon_bw12(
+            packed,
+            safe_full_blocks,
+            dict_mask,
+            &mut out[out_start..out_start + safe_full_blocks],
+        );
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        // Scalar fallback for the trailing blocks + tail.
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw12(&packed[processed * 12 / 8..], remaining, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            // SAFETY: idx is 12-bit ≤ 4095, dict_mask is ≥ 4096.
+            let bit = unsafe { *dict_mask.get_unchecked(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    let _ = tail; // consumed via `remaining`
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn fused_predicate_neon_bw12(
+    packed: &[u8],
+    full_blocks: usize,
+    dict_mask: &[u8],
+    bitmap_out: &mut [u8],
+) {
+    use std::arch::aarch64::*;
+    debug_assert!(dict_mask.len() >= 4096);
+    debug_assert_eq!(bitmap_out.len(), full_blocks);
+
+    let shuffle: uint8x16_t = vld1q_u8(
+        [0u8, 1, 1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11].as_ptr(),
+    );
+    let shifts: int16x8_t = vld1q_s16([0i16, -4, 0, -4, 0, -4, 0, -4].as_ptr());
+    let idx_mask: uint16x8_t = vdupq_n_u16(0x0FFF);
+
+    let mut src_ptr = packed.as_ptr();
+    let mask_ptr = dict_mask.as_ptr();
+
+    for blk in 0..full_blocks {
+        let bytes16 = vld1q_u8(src_ptr);
+        let shuffled = vqtbl1q_u8(bytes16, shuffle);
+        let as_u16 = vreinterpretq_u16_u8(shuffled);
+        let shifted = vreinterpretq_u16_s16(vshlq_s16(
+            vreinterpretq_s16_u16(as_u16),
+            shifts,
+        ));
+        let masked = vandq_u16(shifted, idx_mask);
+
+        // 8 lane gathers + bit-pack. LLVM keeps these independent
+        // (no false dependency chain) so they pipeline through the
+        // load units.
+        let i0 = vgetq_lane_u16::<0>(masked) as usize;
+        let i1 = vgetq_lane_u16::<1>(masked) as usize;
+        let i2 = vgetq_lane_u16::<2>(masked) as usize;
+        let i3 = vgetq_lane_u16::<3>(masked) as usize;
+        let i4 = vgetq_lane_u16::<4>(masked) as usize;
+        let i5 = vgetq_lane_u16::<5>(masked) as usize;
+        let i6 = vgetq_lane_u16::<6>(masked) as usize;
+        let i7 = vgetq_lane_u16::<7>(masked) as usize;
+        // SAFETY: indices ≤ 4095, dict_mask ≥ 4096 (checked by caller).
+        let b0 = *mask_ptr.add(i0);
+        let b1 = *mask_ptr.add(i1);
+        let b2 = *mask_ptr.add(i2);
+        let b3 = *mask_ptr.add(i3);
+        let b4 = *mask_ptr.add(i4);
+        let b5 = *mask_ptr.add(i5);
+        let b6 = *mask_ptr.add(i6);
+        let b7 = *mask_ptr.add(i7);
+        let byte = b0
+            | (b1 << 1)
+            | (b2 << 2)
+            | (b3 << 3)
+            | (b4 << 4)
+            | (b5 << 5)
+            | (b6 << 6)
+            | (b7 << 7);
+        *bitmap_out.get_unchecked_mut(blk) = byte;
+
+        src_ptr = src_ptr.add(12);
+    }
+}
+
 /// Streaming-bit-buffer scalar fallback for a small remainder. Keeps
 /// the public API simple: caller doesn't need to know about block
 /// boundaries.

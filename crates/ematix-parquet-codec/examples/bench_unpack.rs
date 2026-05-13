@@ -107,6 +107,63 @@ fn run_one(bit_width: u8) {
 }
 
 #[cfg(target_arch = "aarch64")]
+fn run_predicate_fused_bw12() {
+    use ematix_parquet_codec::bitpack_neon::decode_predicate_bitmap_neon_bw12;
+
+    let mask: u32 = 0xFFF;
+    let mut seed: u32 = 0xC0FFEE ^ 0xBEEFu32;
+    let values: Vec<u32> = (0..N_VALUES)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & mask
+        })
+        .collect();
+    let packed = pack(&values, 12);
+    // Q14-shape predicate: dict_mask matches ~1% of slots.
+    let mut dict_mask = vec![0u8; 4096];
+    for i in 1000..1040 {
+        dict_mask[i] = 1;
+    }
+
+    let mut bitmap: Vec<u8> = Vec::with_capacity(N_VALUES.div_ceil(8));
+
+    // Warmup
+    for _ in 0..3 {
+        bitmap.clear();
+        decode_predicate_bitmap_neon_bw12(black_box(&packed), N_VALUES, &dict_mask, &mut bitmap)
+            .unwrap();
+    }
+    // Sanity check
+    let match_count: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+    let expected = values.iter().filter(|v| **v >= 1000 && **v < 1040).count();
+    assert_eq!(match_count, expected);
+
+    let mut best: f64 = f64::INFINITY;
+    for _ in 0..ITERS {
+        bitmap.clear();
+        let t0 = Instant::now();
+        decode_predicate_bitmap_neon_bw12(black_box(&packed), N_VALUES, &dict_mask, &mut bitmap)
+            .unwrap();
+        let dt = t0.elapsed().as_secs_f64();
+        if dt < best {
+            best = dt;
+        }
+    }
+    let ns_per_value = best * 1e9 / N_VALUES as f64;
+    let bytes_out = N_VALUES.div_ceil(8);
+    let gbps_out = bytes_out as f64 / best / 1e9;
+    let gbps_in = packed.len() as f64 / best / 1e9;
+    println!(
+        "  bw=12 NEON-fused (idx + predicate → bitmap): {:>7.3} ms  {:>5.2} ns/val  in={:>4.2} GB/s  out={:>5.3} GB/s  ({} match)",
+        best * 1e3,
+        ns_per_value,
+        gbps_in,
+        gbps_out,
+        match_count
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
 fn run_neon_bw12() {
     let mask: u32 = 0xFFF;
     let mut seed: u32 = 0xC0FFEE ^ 12u32;
@@ -160,4 +217,6 @@ fn main() {
     }
     #[cfg(target_arch = "aarch64")]
     run_neon_bw12();
+    #[cfg(target_arch = "aarch64")]
+    run_predicate_fused_bw12();
 }

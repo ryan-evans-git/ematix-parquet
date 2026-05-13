@@ -21,7 +21,10 @@
 use ematix_parquet_format::types::{CompressionCodec, Encoding, PageType};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
-use crate::compression::{decompress_snappy_into, decompress_zstd_into};
+use crate::compression::{
+    decompress_brotli_into, decompress_gzip_into, decompress_lz4_raw_into,
+    decompress_snappy_into, decompress_zstd_into,
+};
 use crate::dict::decode_rle_dictionary_into;
 use crate::error::{CodecError, Result};
 use crate::plain::{
@@ -232,6 +235,9 @@ fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> R
         }
         CompressionCodec::Snappy => decompress_snappy_into(body, out),
         CompressionCodec::Zstd => decompress_zstd_into(body, out),
+        CompressionCodec::Gzip => decompress_gzip_into(body, out),
+        CompressionCodec::Brotli => decompress_brotli_into(body, out),
+        CompressionCodec::Lz4Raw => decompress_lz4_raw_into(body, out),
         other => Err(CodecError::Unsupported(format!(
             "compression codec not yet wired in façade: {other:?}"
         ))),

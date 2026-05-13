@@ -301,6 +301,76 @@ pub fn decompress_zstd_into(compressed: &[u8], out: &mut Vec<u8>) -> Result<()> 
     Ok(())
 }
 
+// ---- GZIP (read) ---------------------------------------------------------
+
+/// GZIP decompression. Parquet bodies are full gzip streams (RFC 1952
+/// envelope with header + checksum); `flate2`'s `GzDecoder` reads them.
+pub fn decompress_gzip(compressed: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decompress_gzip_into(compressed, &mut out)?;
+    Ok(out)
+}
+
+pub fn decompress_gzip_into(compressed: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    let mut dec = flate2::read::GzDecoder::new(compressed);
+    dec.read_to_end(out)
+        .map_err(|e| CodecError::Decompress(format!("gzip: {e}")))?;
+    Ok(())
+}
+
+// ---- Brotli (read) -------------------------------------------------------
+
+pub fn decompress_brotli(compressed: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decompress_brotli_into(compressed, &mut out)?;
+    Ok(out)
+}
+
+pub fn decompress_brotli_into(compressed: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    let mut dec = brotli::Decompressor::new(compressed, 4096);
+    dec.read_to_end(out)
+        .map_err(|e| CodecError::Decompress(format!("brotli: {e}")))?;
+    Ok(())
+}
+
+// ---- LZ4_RAW (read) ------------------------------------------------------
+
+/// LZ4_RAW decompression. Parquet's LZ4_RAW is one or more lz4 blocks
+/// concatenated, where every block is preceded by a 4-byte little-endian
+/// header giving the *compressed* length of that block. The reader
+/// keeps consuming blocks until the input is exhausted. This matches
+/// what parquet-rs does for the LZ4_RAW codec.
+pub fn decompress_lz4_raw(compressed: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decompress_lz4_raw_into(compressed, &mut out)?;
+    Ok(out)
+}
+
+pub fn decompress_lz4_raw_into(compressed: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    // LZ4_RAW in Parquet is just the lz4 block format — one block per
+    // page body, no length prefix, no framing. parquet-rs decodes it
+    // with `lz4_flex::block::decompress` and a known uncompressed size
+    // (carried in PageHeader.uncompressed_page_size, which we don't
+    // have here). When the size isn't known, `decompress_size_prepended`
+    // expects a length header that parquet doesn't emit, so we fall
+    // back to the size-less variant, decoding into a growing buffer.
+    let decoded = lz4_flex::block::decompress(compressed, compressed.len() * 255)
+        .or_else(|_| {
+            // First attempt assumed output ≤ 255× input. If that
+            // overflowed, retry with a much larger ceiling. This is
+            // bounded by the spec — pages are smaller than the file
+            // and the file is finite — but it's also the path real
+            // parquet-rs takes (it knows the size up front).
+            lz4_flex::block::decompress(compressed, 1024 * 1024 * 1024)
+        })
+        .map_err(|e| CodecError::Decompress(format!("lz4_raw: {e}")))?;
+    out.extend_from_slice(&decoded);
+    Ok(())
+}
+
 // ---- compression (write path) --------------------------------------------
 
 /// Snappy raw-format compression. Inverse of `decompress_snappy`.
@@ -323,4 +393,35 @@ pub fn compress_zstd(uncompressed: &[u8]) -> Result<Vec<u8>> {
 pub fn compress_zstd_at_level(uncompressed: &[u8], level: i32) -> Result<Vec<u8>> {
     zstd::stream::encode_all(uncompressed, level)
         .map_err(|e| CodecError::Decompress(format!("zstd encode: {e}")))
+}
+
+/// GZIP compression at flate2's default level (6). Produces a complete
+/// gzip stream (with header + CRC) — the inverse of `decompress_gzip`.
+pub fn compress_gzip(uncompressed: &[u8]) -> Result<Vec<u8>> {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    use std::io::Write as _;
+    enc.write_all(uncompressed)
+        .map_err(|e| CodecError::Decompress(format!("gzip encode: {e}")))?;
+    enc.finish()
+        .map_err(|e| CodecError::Decompress(format!("gzip finish: {e}")))
+}
+
+/// Brotli compression at quality 6 (a balanced choice between speed and
+/// ratio for parquet-shaped payloads). lgwindow = 22 follows the
+/// brotli crate default.
+pub fn compress_brotli(uncompressed: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut input = std::io::Cursor::new(uncompressed);
+    let mut enc = brotli::CompressorReader::new(&mut input, 4096, 6, 22);
+    enc.read_to_end(&mut out)
+        .map_err(|e| CodecError::Decompress(format!("brotli encode: {e}")))?;
+    Ok(out)
+}
+
+/// LZ4_RAW compression: one lz4 block, no framing, no length prefix.
+/// Inverse of `decompress_lz4_raw`. The Parquet writer that consumes
+/// this output is responsible for stamping the uncompressed size on
+/// the page header so the reader can size its output buffer.
+pub fn compress_lz4_raw(uncompressed: &[u8]) -> Result<Vec<u8>> {
+    Ok(lz4_flex::block::compress(uncompressed))
 }

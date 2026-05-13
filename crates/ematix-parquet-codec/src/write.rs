@@ -37,7 +37,9 @@ use ematix_parquet_format::types::{
     CompressionCodec, Encoding, FieldRepetitionType, PageType, ParquetType,
 };
 
-use crate::compression::{compress_snappy, compress_zstd};
+use crate::compression::{
+    compress_brotli, compress_gzip, compress_lz4_raw, compress_snappy, compress_zstd,
+};
 use crate::error::{CodecError, Result};
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -639,6 +641,9 @@ fn compress_body(body: &[u8], codec: CompressionCodec) -> Result<Vec<u8>> {
         CompressionCodec::Uncompressed => Ok(body.to_vec()),
         CompressionCodec::Snappy => compress_snappy(body),
         CompressionCodec::Zstd => compress_zstd(body),
+        CompressionCodec::Gzip => compress_gzip(body),
+        CompressionCodec::Brotli => compress_brotli(body),
+        CompressionCodec::Lz4Raw => compress_lz4_raw(body),
         other => Err(CodecError::Unsupported(format!(
             "compression codec not yet supported on the write path: {other:?}"
         ))),

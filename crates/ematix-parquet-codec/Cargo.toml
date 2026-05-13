@@ -32,10 +32,18 @@ snap = "1"
 # in some polars output paths. The `zstd` crate wraps the upstream C
 # library — fast, well-tested, and what parquet-rs uses too.
 zstd = "0.13"
+# GZIP: common for older parquet files (Hive era). `flate2` is the
+# pure-Rust DEFLATE/GZIP impl Rust ecosystem standardises on.
+flate2 = "1"
+# Brotli: rare but in the spec; `brotli` is pure-Rust.
+brotli = "8"
+# LZ4_RAW: parquet's frameless lz4 variant (the newer codec; the
+# older `Lz4` enum value is deprecated). lz4_flex is pure-Rust.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 
 [dev-dependencies]
 ematix-parquet-io = { path = "../ematix-parquet-io" }
-parquet = { version = "58", default-features = false, features = ["snap", "zstd", "experimental"] }
+parquet = { version = "58", default-features = false, features = ["snap", "zstd", "flate2", "flate2-rust_backened", "brotli", "lz4", "experimental"] }
 # Third-party comparator in the three-way bench. Polars's
 # `LazyFrame::scan_parquet` is what real polars users pay, so we
 # time it directly. Pulls in a heavy dep tree (only for bench

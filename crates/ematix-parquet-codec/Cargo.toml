@@ -21,6 +21,14 @@ snap = "1"
 [dev-dependencies]
 ematix-parquet-io = { path = "../ematix-parquet-io" }
 parquet = { version = "58", default-features = false, features = ["snap"] }
+# Third-party comparator in the three-way bench. Polars's
+# `LazyFrame::scan_parquet` is what real polars users pay, so we
+# time it directly. Pulls in a heavy dep tree (only for bench
+# examples — library consumers don't see it).
+polars = { version = "0.53", default-features = false, features = ["parquet", "lazy"] }
+# polars-io's eager ParquetReader bypasses LazyFrame plan overhead;
+# fairer per-column timing for the three-way bench.
+polars-io = { version = "0.53", default-features = false, features = ["parquet"] }
 
 # Release-built single-process bench against parquet-rs. Not a
 # Criterion harness — plain std::Instant in a loop is enough for the

@@ -32,6 +32,9 @@ use parquet::column::reader::ColumnReader;
 use parquet::data_type::ByteArray;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
+use polars::prelude::*;
+use polars_io::prelude::*;
+
 const WARMUPS: usize = 3;
 const ITERS: usize = 12;
 
@@ -234,6 +237,48 @@ fn pr_decode_i32(path: &Path, col_idx: usize) -> Vec<i32> {
     out
 }
 
+// -------- polars (eager ParquetReader from polars-io) -----------------------
+//
+// `ParquetReader::new(file).finish()` bypasses LazyFrame's plan-builder /
+// optimizer overhead — pure decode + DataFrame construction. This is the
+// closest apples-to-apples comparison with parquet-rs's
+// `read_records`-into-Vec.
+
+fn polars_decode_i64(path: &Path, col_name: &str) -> Vec<i64> {
+    let file = std::fs::File::open(path).unwrap();
+    let df = ParquetReader::new(file)
+        .with_columns(Some(vec![col_name.into()]))
+        .finish()
+        .unwrap();
+    let s = df.column(col_name).unwrap().as_materialized_series();
+    s.i64().unwrap().into_no_null_iter().collect()
+}
+
+fn polars_decode_i32(path: &Path, col_name: &str) -> Vec<i32> {
+    let file = std::fs::File::open(path).unwrap();
+    let df = ParquetReader::new(file)
+        .with_columns(Some(vec![col_name.into()]))
+        .finish()
+        .unwrap();
+    let s = df.column(col_name).unwrap().as_materialized_series();
+    let cast = s.cast(&DataType::Int32).unwrap();
+    cast.i32().unwrap().into_no_null_iter().collect()
+}
+
+fn polars_decode_byte_array(path: &Path, col_name: &str) -> Vec<Vec<u8>> {
+    let file = std::fs::File::open(path).unwrap();
+    let df = ParquetReader::new(file)
+        .with_columns(Some(vec![col_name.into()]))
+        .finish()
+        .unwrap();
+    let s = df.column(col_name).unwrap().as_materialized_series();
+    s.str()
+        .unwrap()
+        .into_no_null_iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect()
+}
+
 fn pr_decode_byte_array(path: &Path, col_idx: usize) -> Vec<Vec<u8>> {
     let r = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
     let total = r.metadata().row_group(0).column(col_idx).num_values() as usize;
@@ -297,23 +342,31 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!("== ematix-parquet vs parquet-rs ({WARMUPS} warmups + {ITERS} iters) ==");
+    println!(
+        "== ematix-parquet vs parquet-rs vs polars ({WARMUPS} warmups + {ITERS} iters) =="
+    );
     println!("data: {}\n", path.display());
 
     println!("l_orderkey  INT64  (dict + plain mix, 1,048,576 values)");
     let (o_med, _, _) = bench("ours", || ours_decode_i64(&path, 0));
-    let (t_med, _, _) = bench("parquet-rs", || pr_decode_i64(&path, 0));
-    compare("l_orderkey", o_med, t_med);
+    let (pr_med, _, _) = bench("parquet-rs", || pr_decode_i64(&path, 0));
+    let (po_med, _, _) = bench("polars (eager)", || polars_decode_i64(&path, "l_orderkey"));
+    compare("ours vs parquet-rs", o_med, pr_med);
+    compare("ours vs polars    ", o_med, po_med);
     println!();
 
     println!("l_shipdate  INT32  (dict, 1,048,576 values)");
     let (o_med, _, _) = bench("ours", || ours_decode_i32(&path, 10));
-    let (t_med, _, _) = bench("parquet-rs", || pr_decode_i32(&path, 10));
-    compare("l_shipdate", o_med, t_med);
+    let (pr_med, _, _) = bench("parquet-rs", || pr_decode_i32(&path, 10));
+    let (po_med, _, _) = bench("polars (eager)", || polars_decode_i32(&path, "l_shipdate"));
+    compare("ours vs parquet-rs", o_med, pr_med);
+    compare("ours vs polars    ", o_med, po_med);
     println!();
 
     println!("l_returnflag  BYTE_ARRAY  (3 distinct, all dict, 1,048,576 values)");
     let (o_med, _, _) = bench("ours", || ours_decode_byte_array(&path, 8));
-    let (t_med, _, _) = bench("parquet-rs", || pr_decode_byte_array(&path, 8));
-    compare("l_returnflag", o_med, t_med);
+    let (pr_med, _, _) = bench("parquet-rs", || pr_decode_byte_array(&path, 8));
+    let (po_med, _, _) = bench("polars (eager)", || polars_decode_byte_array(&path, "l_returnflag"));
+    compare("ours vs parquet-rs", o_med, pr_med);
+    compare("ours vs polars    ", o_med, po_med);
 }

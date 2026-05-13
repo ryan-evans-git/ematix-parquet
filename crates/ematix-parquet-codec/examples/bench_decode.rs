@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ematix_parquet_codec::compression::decompress_snappy;
-use ematix_parquet_codec::dict::decode_rle_dictionary_indices;
+use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_into};
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_byte_array_n, decode_plain_f64, decode_plain_i32,
     decode_plain_i64,
@@ -83,10 +83,7 @@ fn ours_decode_i64(path: &Path, col_idx: usize) -> Vec<i64> {
         let decompressed = decompress_snappy(body).unwrap();
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let indices = decode_rle_dictionary_indices(&decompressed, n).unwrap();
-                for &idx in &indices {
-                    out.push(dict[idx as usize]);
-                }
+                decode_rle_dictionary_into(&decompressed, &dict, n, &mut out).unwrap();
             }
             Encoding::Plain => {
                 out.extend(decode_plain_i64(&decompressed).unwrap());
@@ -116,10 +113,7 @@ fn ours_decode_i32(path: &Path, col_idx: usize) -> Vec<i32> {
         let decompressed = decompress_snappy(body).unwrap();
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let indices = decode_rle_dictionary_indices(&decompressed, n).unwrap();
-                for &idx in &indices {
-                    out.push(dict[idx as usize]);
-                }
+                decode_rle_dictionary_into(&decompressed, &dict, n, &mut out).unwrap();
             }
             Encoding::Plain => {
                 out.extend(decode_plain_i32(&decompressed).unwrap());
@@ -154,10 +148,7 @@ fn ours_decode_f64(path: &Path, col_idx: usize) -> Vec<f64> {
         let decompressed = decompress_snappy(body).unwrap();
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let indices = decode_rle_dictionary_indices(&decompressed, n).unwrap();
-                for &idx in &indices {
-                    out.push(dict[idx as usize]);
-                }
+                decode_rle_dictionary_into(&decompressed, &dict, n, &mut out).unwrap();
             }
             Encoding::Plain => {
                 out.extend(decode_plain_f64(&decompressed).unwrap());

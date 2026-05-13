@@ -10,7 +10,8 @@ use crate::compact::{
 };
 use crate::error::{FormatError, Result};
 use crate::types::{
-    CompressionCodec, EdgeInterpolationAlgorithm, Encoding, PageType, ParquetType, ThriftEnum,
+    CompressionCodec, ConvertedType, EdgeInterpolationAlgorithm, Encoding, FieldRepetitionType,
+    PageType, ParquetType, ThriftEnum,
 };
 
 /// Per-page or per-column-chunk statistics, as produced by writers
@@ -389,6 +390,73 @@ pub fn read_logical_type<'a>(cur: &mut Cursor<'a>) -> Result<LogicalType<'a>> {
     }
     chosen.ok_or(FormatError::EmptyUnion {
         union_name: "LogicalType",
+    })
+}
+
+// ---- SchemaElement --------------------------------------------------------
+
+/// One node in Parquet's depth-first-flattened schema list.
+///
+/// Group nodes (the root, struct fields, list/map nodes) carry only
+/// `name` + `num_children` + repetition. Leaf nodes carry `column_type`
+/// plus optional annotations (`converted_type`, `scale`, `precision`,
+/// `logical_type`).
+///
+/// Field name `column_type` instead of `type` to avoid shadowing the
+/// Rust keyword.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SchemaElement<'a> {
+    pub column_type: Option<ParquetType>,
+    pub type_length: Option<i32>,
+    pub repetition_type: Option<FieldRepetitionType>,
+    pub name: &'a [u8],
+    pub num_children: Option<i32>,
+    pub converted_type: Option<ConvertedType>,
+    pub scale: Option<i32>,
+    pub precision: Option<i32>,
+    pub field_id: Option<i32>,
+    pub logical_type: Option<LogicalType<'a>>,
+}
+
+pub fn read_schema_element<'a>(cur: &mut Cursor<'a>) -> Result<SchemaElement<'a>> {
+    let mut column_type = None;
+    let mut type_length = None;
+    let mut repetition_type = None;
+    let mut name: Option<&[u8]> = None;
+    let mut num_children = None;
+    let mut converted_type = None;
+    let mut scale = None;
+    let mut precision = None;
+    let mut field_id = None;
+    let mut logical_type = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::I32) => column_type = Some(ParquetType::read(cur)?),
+            (2, FieldType::I32) => type_length = Some(read_zigzag_i32(cur)?),
+            (3, FieldType::I32) => repetition_type = Some(FieldRepetitionType::read(cur)?),
+            (4, FieldType::Binary) => name = Some(read_binary(cur)?),
+            (5, FieldType::I32) => num_children = Some(read_zigzag_i32(cur)?),
+            (6, FieldType::I32) => converted_type = Some(ConvertedType::read(cur)?),
+            (7, FieldType::I32) => scale = Some(read_zigzag_i32(cur)?),
+            (8, FieldType::I32) => precision = Some(read_zigzag_i32(cur)?),
+            (9, FieldType::I32) => field_id = Some(read_zigzag_i32(cur)?),
+            (10, FieldType::Struct) => logical_type = Some(read_logical_type(cur)?),
+            _ => return Err(unknown("SchemaElement", h.id)),
+        }
+    }
+    Ok(SchemaElement {
+        column_type,
+        type_length,
+        repetition_type,
+        name: name.ok_or_else(|| missing("SchemaElement", 4))?,
+        num_children,
+        converted_type,
+        scale,
+        precision,
+        field_id,
+        logical_type,
     })
 }
 

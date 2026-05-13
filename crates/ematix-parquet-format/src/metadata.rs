@@ -538,6 +538,83 @@ pub fn read_schema_element<'a>(cur: &mut Cursor<'a>) -> Result<SchemaElement<'a>
     })
 }
 
+// ---- ColumnOrder union + FileMetaData -------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnOrder {
+    /// Sort order is implied by the column's physical or logical type.
+    TypeDefinedOrder,
+}
+
+pub fn read_column_order(cur: &mut Cursor<'_>) -> Result<ColumnOrder> {
+    let mut chosen = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Struct) => {
+                read_empty_struct(cur, "TypeDefinedOrder")?;
+                chosen = Some(ColumnOrder::TypeDefinedOrder);
+            }
+            _ => return Err(unknown("ColumnOrder", h.id)),
+        }
+    }
+    chosen.ok_or(FormatError::EmptyUnion {
+        union_name: "ColumnOrder",
+    })
+}
+
+/// Top-level Parquet footer struct. Fields 8 (encryption_algorithm
+/// union) and 9 (footer_signing_key_metadata) are not yet modeled —
+/// they error strictly via `UnknownStructField`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FileMetaData<'a> {
+    pub version: i32,
+    pub schema: Vec<SchemaElement<'a>>,
+    pub num_rows: i64,
+    pub row_groups: Vec<RowGroup<'a>>,
+    pub key_value_metadata: Option<Vec<KeyValue<'a>>>,
+    pub created_by: Option<&'a [u8]>,
+    pub column_orders: Option<Vec<ColumnOrder>>,
+}
+
+pub fn read_file_metadata<'a>(cur: &mut Cursor<'a>) -> Result<FileMetaData<'a>> {
+    let mut version = None;
+    let mut schema = None;
+    let mut num_rows = None;
+    let mut row_groups = None;
+    let mut key_value_metadata = None;
+    let mut created_by = None;
+    let mut column_orders = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::I32) => version = Some(read_zigzag_i32(cur)?),
+            (2, FieldType::List) => schema = Some(read_list_struct(cur, read_schema_element)?),
+            (3, FieldType::I64) => num_rows = Some(read_zigzag_i64(cur)?),
+            (4, FieldType::List) => row_groups = Some(read_list_struct(cur, read_row_group)?),
+            (5, FieldType::List) => {
+                key_value_metadata = Some(read_list_struct(cur, read_key_value)?);
+            }
+            (6, FieldType::Binary) => created_by = Some(read_binary(cur)?),
+            (7, FieldType::List) => {
+                column_orders = Some(read_list_struct(cur, |c| read_column_order(c))?);
+            }
+            _ => return Err(unknown("FileMetaData", h.id)),
+        }
+    }
+    Ok(FileMetaData {
+        version: version.ok_or_else(|| missing("FileMetaData", 1))?,
+        schema: schema.ok_or_else(|| missing("FileMetaData", 2))?,
+        num_rows: num_rows.ok_or_else(|| missing("FileMetaData", 3))?,
+        row_groups: row_groups.ok_or_else(|| missing("FileMetaData", 4))?,
+        key_value_metadata,
+        created_by,
+        column_orders,
+    })
+}
+
 /// Per-(page_type, encoding) page count, used for read-side stats
 /// even though `encoding_stats` itself is optional on `ColumnMetaData`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

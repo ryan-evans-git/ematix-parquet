@@ -21,3 +21,11 @@ snap = "1"
 [dev-dependencies]
 ematix-parquet-io = { path = "../ematix-parquet-io" }
 parquet = { version = "58", default-features = false, features = ["snap"] }
+
+# Release-built single-process bench against parquet-rs. Not a
+# Criterion harness — plain std::Instant in a loop is enough for the
+# coarse "are we within striking distance" comparison the project
+# needs right now. Run with `cargo run --release --example bench_decode`.
+[[example]]
+name = "bench_decode"
+path = "examples/bench_decode.rs"

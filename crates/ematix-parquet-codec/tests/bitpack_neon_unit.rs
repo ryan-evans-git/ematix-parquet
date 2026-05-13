@@ -9,7 +9,9 @@
 #![cfg(target_arch = "aarch64")]
 
 use ematix_parquet_codec::bitpack::unpack_indices_into;
-use ematix_parquet_codec::bitpack_neon::unpack_indices_into_neon_bw12;
+use ematix_parquet_codec::bitpack_neon::{
+    unpack_indices_into_neon_bw12, unpack_indices_into_neon_bw17,
+};
 
 /// Pack `n` u32 values of `bit_width` bits each (LSB-first) into a
 /// fresh byte buffer. Mirrors the parquet bit-packed format and the
@@ -113,6 +115,87 @@ fn neon_bw12_matches_scalar_short_lengths() {
         let s = unpack_scalar(&packed, n, 12);
         let nv = unpack_neon_bw12(&packed, n);
         assert_eq!(nv, s, "mismatch at n={n}");
+    }
+}
+
+fn unpack_neon_bw17(packed: &[u8], n: usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(n);
+    unpack_indices_into_neon_bw17(packed, n, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn neon_bw17_matches_scalar_known_pattern() {
+    // 16 values: 0..16, easy to verify by eye.
+    let values: Vec<u32> = (0..16).collect();
+    let packed = pack(&values, 17);
+    let s = unpack_scalar(&packed, 16, 17);
+    let n = unpack_neon_bw17(&packed, 16);
+    assert_eq!(s, values);
+    assert_eq!(n, s);
+}
+
+#[test]
+fn neon_bw17_matches_scalar_full_width_values() {
+    // Cover the full 17-bit range — flushes off-by-one mask errors.
+    let n_total: usize = 1 << 17;
+    let values: Vec<u32> = (0..n_total as u32).collect();
+    let packed = pack(&values, 17);
+    let s = unpack_scalar(&packed, n_total, 17);
+    let nv = unpack_neon_bw17(&packed, n_total);
+    assert_eq!(nv, s);
+}
+
+#[test]
+fn neon_bw17_matches_scalar_random_large() {
+    let n: usize = 1_000_000;
+    let mut seed: u32 = 0xC0DEBEEF;
+    let values: Vec<u32> = (0..n)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & 0x1FFFF
+        })
+        .collect();
+    let packed = pack(&values, 17);
+    let s = unpack_scalar(&packed, n, 17);
+    let nv = unpack_neon_bw17(&packed, n);
+    assert_eq!(nv.len(), n);
+    assert_eq!(nv, s);
+}
+
+#[test]
+fn neon_bw17_matches_scalar_short_lengths() {
+    let mut seed: u32 = 0xFADE;
+    let max_n = 200;
+    let values: Vec<u32> = (0..max_n)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & 0x1FFFF
+        })
+        .collect();
+    let packed = pack(&values, 17);
+    for n in [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 128, 199] {
+        let s = unpack_scalar(&packed, n, 17);
+        let nv = unpack_neon_bw17(&packed, n);
+        assert_eq!(nv, s, "mismatch at n={n}");
+    }
+}
+
+#[test]
+fn neon_bw17_matches_scalar_edge_values() {
+    let cases: Vec<Vec<u32>> = vec![
+        vec![0; 64],
+        vec![0x1FFFF; 64],
+        (0..64).map(|i| if i % 2 == 0 { 0x1FFFF } else { 0 }).collect(),
+        (0..64u32).collect(),
+        (0..64u32).rev().collect(),
+    ];
+    for vals in &cases {
+        let packed = pack(vals, 17);
+        let s = unpack_scalar(&packed, vals.len(), 17);
+        let nv = unpack_neon_bw17(&packed, vals.len());
+        assert_eq!(nv, s, "mismatch for {vals:?}");
+        assert_eq!(nv, *vals);
     }
 }
 

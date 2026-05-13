@@ -100,12 +100,15 @@ pub fn unpack_indices_into(
     out.reserve(num_values);
 
     // NEON specializations. Profiled at ~10× scalar on M-series for
-    // bw=12 (the width l_shipdate / l_commitdate / l_receiptdate hit
-    // in TPC-H lineitem). Other widths fall through to scalar.
+    // bw=12 (l_shipdate / l_commitdate / l_receiptdate) and bw=17
+    // (l_extendedprice 43%, l_partkey 67%, l_orderkey 51%). Other
+    // widths fall through to scalar.
     #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
     {
-        if bit_width == 12 {
-            return crate::bitpack_neon::unpack_indices_into_neon_bw12(packed, num_values, out);
+        match bit_width {
+            12 => return crate::bitpack_neon::unpack_indices_into_neon_bw12(packed, num_values, out),
+            17 => return crate::bitpack_neon::unpack_indices_into_neon_bw17(packed, num_values, out),
+            _ => {}
         }
     }
 

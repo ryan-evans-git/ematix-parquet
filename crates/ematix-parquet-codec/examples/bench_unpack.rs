@@ -16,7 +16,9 @@ use std::time::Instant;
 
 use ematix_parquet_codec::bitpack::unpack_indices_into;
 #[cfg(target_arch = "aarch64")]
-use ematix_parquet_codec::bitpack_neon::unpack_indices_into_neon_bw12;
+use ematix_parquet_codec::bitpack_neon::{
+    unpack_indices_into_neon_bw12, unpack_indices_into_neon_bw17,
+};
 
 const N_VALUES: usize = 1_000_000;
 const ITERS: usize = 50;
@@ -164,6 +166,47 @@ fn run_predicate_fused_bw12() {
 }
 
 #[cfg(target_arch = "aarch64")]
+fn run_neon_bw17() {
+    let mask: u32 = 0x1FFFF;
+    let mut seed: u32 = 0xC0FFEE ^ 17u32;
+    let values: Vec<u32> = (0..N_VALUES)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & mask
+        })
+        .collect();
+    let packed = pack(&values, 17);
+
+    let mut out: Vec<u32> = Vec::with_capacity(N_VALUES);
+    for _ in 0..3 {
+        out.clear();
+        unpack_indices_into_neon_bw17(black_box(&packed), N_VALUES, &mut out).unwrap();
+    }
+    assert_eq!(&out[..16], &values[..16]);
+
+    let mut best: f64 = f64::INFINITY;
+    for _ in 0..ITERS {
+        out.clear();
+        let t0 = Instant::now();
+        unpack_indices_into_neon_bw17(black_box(&packed), N_VALUES, &mut out).unwrap();
+        let dt = t0.elapsed().as_secs_f64();
+        if dt < best {
+            best = dt;
+        }
+    }
+    let ns_per_value = best * 1e9 / N_VALUES as f64;
+    let gbps_out = (N_VALUES * 4) as f64 / best / 1e9;
+    let gbps_in = packed.len() as f64 / best / 1e9;
+    println!(
+        "  bw=17 NEON: {:>7.3} ms  {:>5.2} ns/val  in={:>5.2} GB/s  out={:>5.2} GB/s",
+        best * 1e3,
+        ns_per_value,
+        gbps_in,
+        gbps_out
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
 fn run_neon_bw12() {
     let mask: u32 = 0xFFF;
     let mut seed: u32 = 0xC0FFEE ^ 12u32;
@@ -217,6 +260,8 @@ fn main() {
     }
     #[cfg(target_arch = "aarch64")]
     run_neon_bw12();
+    #[cfg(target_arch = "aarch64")]
+    run_neon_bw17();
     #[cfg(target_arch = "aarch64")]
     run_predicate_fused_bw12();
 }

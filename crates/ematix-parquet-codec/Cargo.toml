@@ -52,3 +52,17 @@ path = "examples/bench_decode.rs"
 [[example]]
 name = "bench_late_mat"
 path = "examples/bench_late_mat.rs"
+
+# Bit-unpack microbench across hot bit widths. Used to decide whether
+# SIMD work over the scalar const-generic unpacker is worthwhile.
+# Run: cargo run --release --example bench_unpack
+[[example]]
+name = "bench_unpack"
+path = "examples/bench_unpack.rs"
+
+# Probe actual bit_widths used by RLE_DICTIONARY pages in a real
+# parquet file. Tells us which widths a SIMD specialization should
+# target. Run: cargo run --release --example probe_bitwidths -- <path>
+[[example]]
+name = "probe_bitwidths"
+path = "examples/probe_bitwidths.rs"

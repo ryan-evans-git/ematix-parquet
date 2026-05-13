@@ -18,4 +18,5 @@ pub mod compact;
 pub mod compact_writer;
 pub mod error;
 pub mod metadata;
+pub mod metadata_writer;
 pub mod types;

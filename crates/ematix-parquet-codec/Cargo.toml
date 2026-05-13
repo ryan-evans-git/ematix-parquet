@@ -1,0 +1,23 @@
+[package]
+name = "ematix-parquet-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Page-body decompression + per-(encoding, physical type) decoders for Apache Parquet. The crate that owns the actual decode-speed work."
+
+[lib]
+name = "ematix_parquet_codec"
+
+[dependencies]
+ematix-parquet-format = { path = "../ematix-parquet-format" }
+# Snappy is the default codec for almost every parquet writer in the
+# wild (and the one TPC-H data uses). Pinning to a known-stable cut
+# of `snap` until benchmarks tell us we want a hand-rolled one.
+snap = "1"
+
+[dev-dependencies]
+ematix-parquet-io = { path = "../ematix-parquet-io" }
+parquet = { version = "58", default-features = false, features = ["snap"] }

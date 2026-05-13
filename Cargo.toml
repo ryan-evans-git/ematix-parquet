@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/ematix-parquet-format", "crates/ematix-parquet-io"]
+members = [
+    "crates/ematix-parquet-format",
+    "crates/ematix-parquet-io",
+    "crates/ematix-parquet-codec",
+]
 
 [workspace.package]
 version = "0.0.1"

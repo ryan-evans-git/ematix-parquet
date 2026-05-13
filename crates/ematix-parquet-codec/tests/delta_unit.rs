@@ -1,6 +1,6 @@
 //! Unit + oracle tests for DELTA_BINARY_PACKED INT32 decoding.
 
-use ematix_parquet_codec::delta::decode_delta_i32;
+use ematix_parquet_codec::delta::{decode_delta_i32, decode_delta_i64};
 
 /// Hand-built bytes for the sequence [5, 8, 10, 12, 14].
 ///
@@ -50,7 +50,7 @@ fn hand_built_zero_values() {
 
 // ---- Roundtrip oracle via parquet-rs's encoder -----------------------------
 
-use parquet::data_type::Int32Type;
+use parquet::data_type::{Int32Type, Int64Type};
 use parquet::encodings::encoding::{DeltaBitPackEncoder, Encoder};
 
 fn pr_encode_delta(values: &[i32]) -> Vec<u8> {
@@ -59,10 +59,22 @@ fn pr_encode_delta(values: &[i32]) -> Vec<u8> {
     enc.flush_buffer().unwrap().to_vec()
 }
 
+fn pr_encode_delta_i64(values: &[i64]) -> Vec<u8> {
+    let mut enc = DeltaBitPackEncoder::<Int64Type>::new();
+    enc.put(values).unwrap();
+    enc.flush_buffer().unwrap().to_vec()
+}
+
 fn roundtrip_check(values: &[i32]) {
     let bytes = pr_encode_delta(values);
     let decoded = decode_delta_i32(&bytes).unwrap();
     assert_eq!(decoded, values, "roundtrip mismatch for {values:?}");
+}
+
+fn roundtrip_check_i64(values: &[i64]) {
+    let bytes = pr_encode_delta_i64(values);
+    let decoded = decode_delta_i64(&bytes).unwrap();
+    assert_eq!(decoded, values, "i64 roundtrip mismatch for {values:?}");
 }
 
 #[test]
@@ -114,4 +126,36 @@ fn roundtrip_many_random_values() {
         })
         .collect();
     roundtrip_check(&v);
+}
+
+// ---- i64 roundtrips --------------------------------------------------------
+
+#[test]
+fn i64_roundtrip_single_value() {
+    roundtrip_check_i64(&[42_000_000_000i64]);
+}
+
+#[test]
+fn i64_roundtrip_monotonic() {
+    let v: Vec<i64> = (0..1000i64).collect();
+    roundtrip_check_i64(&v);
+}
+
+#[test]
+fn i64_roundtrip_clustered_large_values() {
+    // Values that need full i64 magnitude but small deltas — typical
+    // shape for sorted timestamp or sequence columns.
+    let base = 1_700_000_000_000_000_000i64; // ~ unix nanos for 2023
+    let v: Vec<i64> = (0..500).map(|i| base + (i as i64) * 1_000_000).collect();
+    roundtrip_check_i64(&v);
+}
+
+#[test]
+fn i64_roundtrip_mixed_signs() {
+    roundtrip_check_i64(&[-1_000_000i64, -100, 0, 100, 1_000_000, -5_000_000, 7]);
+}
+
+#[test]
+fn i64_roundtrip_constant() {
+    roundtrip_check_i64(&[12345i64; 256]);
 }

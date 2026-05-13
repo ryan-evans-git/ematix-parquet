@@ -5,8 +5,9 @@
 
 use ematix_parquet_codec::error::CodecError;
 use ematix_parquet_codec::plain::{
-    decode_plain_f32, decode_plain_f64, decode_plain_f64_n, decode_plain_i32, decode_plain_i32_n,
-    decode_plain_i64, decode_plain_i64_n,
+    decode_plain_byte_array, decode_plain_byte_array_n, decode_plain_f32, decode_plain_f64,
+    decode_plain_f64_n, decode_plain_i32, decode_plain_i32_n, decode_plain_i64,
+    decode_plain_i64_n,
 };
 
 #[test]
@@ -147,4 +148,63 @@ fn decode_plain_f64_n_truncates() {
         decode_plain_f64_n(&bytes, 3).unwrap(),
         vec![1.0f64, 2.0, 3.0]
     );
+}
+
+// ---- ByteArray ------------------------------------------------------------
+
+fn ba(len: u32, data: &[u8]) -> Vec<u8> {
+    let mut v = len.to_le_bytes().to_vec();
+    v.extend_from_slice(data);
+    v
+}
+
+#[test]
+fn decode_plain_byte_array_empty_input() {
+    let bytes: &[u8] = &[];
+    let out = decode_plain_byte_array(bytes).unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn decode_plain_byte_array_single_empty_value() {
+    // u32-LE length 0, no body bytes.
+    let bytes = ba(0, &[]);
+    let out = decode_plain_byte_array(&bytes).unwrap();
+    assert_eq!(out, vec![&[][..]]);
+}
+
+#[test]
+fn decode_plain_byte_array_multiple_values() {
+    let mut bytes = ba(3, b"foo");
+    bytes.extend(ba(1, b"!"));
+    bytes.extend(ba(5, b"hello"));
+    let out = decode_plain_byte_array(&bytes).unwrap();
+    assert_eq!(out, vec![&b"foo"[..], &b"!"[..], &b"hello"[..]]);
+}
+
+#[test]
+fn decode_plain_byte_array_n_stops_early() {
+    let mut bytes = ba(3, b"foo");
+    bytes.extend(ba(1, b"!"));
+    bytes.extend(ba(5, b"trash"));
+    let out = decode_plain_byte_array_n(&bytes, 2).unwrap();
+    assert_eq!(out, vec![&b"foo"[..], &b"!"[..]]);
+}
+
+#[test]
+fn decode_plain_byte_array_truncated_value_errors() {
+    // Says len=10 but only 3 bytes of payload available.
+    let bytes = ba(10, b"foo");
+    let err = decode_plain_byte_array(&bytes).unwrap_err();
+    // The error path here goes through Cursor::take → FormatError →
+    // CodecError::Wire. Just check that it's an error of *some* kind.
+    let _ = err;
+}
+
+#[test]
+fn decode_plain_byte_array_truncated_length_prefix_errors() {
+    // Only 2 bytes — can't even read the 4-byte length prefix.
+    let bytes = [0u8, 0u8];
+    let err = decode_plain_byte_array(&bytes).unwrap_err();
+    let _ = err;
 }

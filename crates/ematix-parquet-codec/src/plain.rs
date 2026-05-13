@@ -13,6 +13,8 @@
 //! the data pages that reference them use RLE_DICTIONARY (indices),
 //! which lands in `dict.rs` once that module exists.
 
+use ematix_parquet_format::compact::Cursor;
+
 use crate::error::{CodecError, Result};
 
 /// Decode a PLAIN-encoded byte buffer as i64 values. The buffer length
@@ -146,4 +148,37 @@ pub fn decode_plain_f64_n(bytes: &[u8], n: usize) -> Result<Vec<f64>> {
         out.push(f64::from_le_bytes(chunk.try_into().unwrap()));
     }
     Ok(out)
+}
+
+/// PLAIN-encoded BYTE_ARRAY — each value is a `u32-LE` length prefix
+/// followed by that many raw bytes. Zero-copy: the returned slices
+/// borrow from `bytes`. Consumes the whole buffer.
+pub fn decode_plain_byte_array<'a>(bytes: &'a [u8]) -> Result<Vec<&'a [u8]>> {
+    let mut out = Vec::new();
+    let mut cur = Cursor::new(bytes);
+    while !cur.is_empty() {
+        let len = read_u32_le(&mut cur)? as usize;
+        let value = cur.take(len)?;
+        out.push(value);
+    }
+    Ok(out)
+}
+
+/// Same as `decode_plain_byte_array` but stops after `n` values. Any
+/// trailing bytes are left untouched — useful when the buffer carries
+/// more than just the values (e.g. dict-followed-by-padding).
+pub fn decode_plain_byte_array_n<'a>(bytes: &'a [u8], n: usize) -> Result<Vec<&'a [u8]>> {
+    let mut out = Vec::with_capacity(n);
+    let mut cur = Cursor::new(bytes);
+    for _ in 0..n {
+        let len = read_u32_le(&mut cur)? as usize;
+        let value = cur.take(len)?;
+        out.push(value);
+    }
+    Ok(out)
+}
+
+fn read_u32_le(cur: &mut Cursor<'_>) -> Result<u32> {
+    let bytes = cur.take(4)?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }

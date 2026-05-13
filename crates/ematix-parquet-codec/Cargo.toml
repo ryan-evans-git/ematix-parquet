@@ -17,10 +17,14 @@ ematix-parquet-format = { path = "../ematix-parquet-format" }
 # wild (and the one TPC-H data uses). Pinning to a known-stable cut
 # of `snap` until benchmarks tell us we want a hand-rolled one.
 snap = "1"
+# ZSTD: Spark's default for high-compression writes; also the default
+# in some polars output paths. The `zstd` crate wraps the upstream C
+# library — fast, well-tested, and what parquet-rs uses too.
+zstd = "0.13"
 
 [dev-dependencies]
 ematix-parquet-io = { path = "../ematix-parquet-io" }
-parquet = { version = "58", default-features = false, features = ["snap", "experimental"] }
+parquet = { version = "58", default-features = false, features = ["snap", "zstd", "experimental"] }
 # Third-party comparator in the three-way bench. Polars's
 # `LazyFrame::scan_parquet` is what real polars users pay, so we
 # time it directly. Pulls in a heavy dep tree (only for bench

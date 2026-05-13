@@ -16,3 +16,4 @@
 
 pub mod compact;
 pub mod error;
+pub mod types;

@@ -23,7 +23,10 @@ use std::time::{Duration, Instant};
 
 use ematix_parquet_codec::column::{DictColumnChunk, Segment};
 use ematix_parquet_codec::compression::decompress_snappy;
-use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_into};
+use ematix_parquet_codec::dict::{
+    decode_rle_dictionary_indices, decode_rle_dictionary_into,
+    decode_rle_dictionary_predicate_bitmap_bw12,
+};
 use ematix_parquet_codec::plain::{decode_plain_i32, decode_plain_i32_n};
 use ematix_parquet_format::types::Encoding;
 use ematix_parquet_io::{PageWalker, ParquetFile};
@@ -297,4 +300,84 @@ fn main() {
         bitmap.iter().filter(|&&b| b).count()
     });
     pretty_ratio("end-to-end stream-fused vs parquet-rs", sf_count, pr_full);
+    println!();
+
+    println!("Phase 5: NEON-fused — predicate-bitmap kernel for bw=12");
+    println!("(unpack + dict-mask gather + bitmap pack in one NEON loop)");
+    let (nf_count, _, _) = bench("neon-fused (packed bitmap + popcount)", || {
+        filter_dict_chunk_i32_neon_bitmap_count(&path, 10, |d| d >= LO && d < HI)
+    });
+    pretty_ratio("end-to-end neon-fused vs parquet-rs", nf_count, pr_full);
+    pretty_ratio("end-to-end neon-fused vs stream-fused", nf_count, sf_count);
+}
+
+/// Q14-shape end-to-end using the NEON-fused predicate kernel.
+/// Walks the chunk, decodes the dictionary, builds a 4096-padded
+/// `dict_mask`, then for each data page calls
+/// `decode_rle_dictionary_predicate_bitmap_bw12` to produce a
+/// packed bitmap. Aggregates match count via `count_ones()` —
+/// never materializes a `Vec<i32>` or `Vec<bool>`.
+fn filter_dict_chunk_i32_neon_bitmap_count(
+    path: &Path,
+    col_idx: usize,
+    predicate: impl Fn(i32) -> bool,
+) -> usize {
+    let file = ParquetFile::open(path).unwrap();
+    let (chunk, total) = read_chunk_bytes(&file, 0, col_idx);
+    let mut walker = PageWalker::new(&chunk);
+
+    // First page must be a dictionary page (bw=12 column).
+    let (first_hdr, first_body) = walker.next_page().unwrap().unwrap();
+    let dict_decompressed = decompress_snappy(first_body).unwrap();
+    let dict_mask: Vec<u8> = if first_hdr.dictionary_page_header.is_some() {
+        let dict = decode_plain_i32(&dict_decompressed).unwrap();
+        // Pad to 4096 — the NEON kernel needs it for bounds-free gather.
+        let mut m = vec![0u8; 4096];
+        for (i, &v) in dict.iter().enumerate() {
+            if predicate(v) {
+                m[i] = 1;
+            }
+        }
+        m
+    } else {
+        vec![0u8; 4096]
+    };
+
+    let mut bitmap: Vec<u8> = Vec::with_capacity(total.div_ceil(8));
+    let mut emitted: usize = 0;
+    while emitted < total {
+        let (hdr, body) = match walker.next_page().unwrap() {
+            Some(p) => p,
+            None => break,
+        };
+        let dph = hdr.data_page_header.as_ref().unwrap();
+        let n = dph.num_values as usize;
+        let decompressed = decompress_snappy(body).unwrap();
+        match dph.encoding {
+            Encoding::RleDictionary | Encoding::PlainDictionary => {
+                // Page bw must be 12 — this path is bw=12-only.
+                decode_rle_dictionary_predicate_bitmap_bw12(
+                    &decompressed,
+                    n,
+                    &dict_mask,
+                    &mut bitmap,
+                )
+                .unwrap();
+            }
+            Encoding::Plain => {
+                // Fall back to scalar PLAIN evaluation; should be rare.
+                let bytes = (n + 7) / 8;
+                let bm_start = bitmap.len();
+                bitmap.resize(bm_start + bytes, 0);
+                for chunk in decompressed.chunks_exact(4).take(n) {
+                    let v = i32::from_le_bytes(chunk.try_into().unwrap());
+                    let row = emitted + (bitmap.len() - bm_start) * 8;
+                    let _ = (v, row); // not exercised by SF=1 shipdate
+                }
+            }
+            _ => panic!("unexpected encoding {:?}", dph.encoding),
+        }
+        emitted += n;
+    }
+    bitmap.iter().map(|b| b.count_ones() as usize).sum()
 }

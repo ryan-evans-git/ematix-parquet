@@ -23,6 +23,7 @@ pub mod delta;
 pub mod dict;
 pub mod error;
 pub mod levels;
+pub mod page_index;
 pub mod plain;
 pub mod rle;
 

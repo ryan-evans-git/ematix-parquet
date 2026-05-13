@@ -1,4 +1,4 @@
-//! TDD pin for the first real Parquet metadata struct: `Statistics`.
+//! TDD pin for `Statistics` (Parquet's per-page / per-chunk stats struct).
 //!
 //! From parquet.thrift:
 //!   struct Statistics {
@@ -9,76 +9,13 @@
 //!     5: optional binary max_value;
 //!     6: optional binary min_value;
 //!   }
-//!
-//! Tests build wire bytes via a small `CompactBuilder` helper. The
-//! helper itself is pinned by `builder_matches_hand_derived_bytes`
-//! against a fully spelled-out byte sequence so we trust it for the
-//! rest of the tests.
 
+#[path = "common/mod.rs"]
+mod common;
+
+use common::CompactBuilder;
 use ematix_parquet_format::compact::Cursor;
 use ematix_parquet_format::metadata::{read_statistics, Statistics};
-
-/// Mirror of the thrift-compact writer, just enough for tests.
-struct CompactBuilder {
-    buf: Vec<u8>,
-    prev_id: i16,
-}
-
-impl CompactBuilder {
-    fn new() -> Self {
-        Self { buf: Vec::new(), prev_id: 0 }
-    }
-
-    fn header(&mut self, id: i16, type_nibble: u8) {
-        let delta = id - self.prev_id;
-        if delta >= 1 && delta <= 15 {
-            self.buf.push(((delta as u8) << 4) | type_nibble);
-        } else {
-            self.buf.push(type_nibble);
-            // long-form id: zigzag i16
-            let mut u = (((id as i32) << 1) ^ ((id as i32) >> 31)) as u32;
-            loop {
-                if u < 0x80 {
-                    self.buf.push(u as u8);
-                    break;
-                }
-                self.buf.push(((u & 0x7F) | 0x80) as u8);
-                u >>= 7;
-            }
-        }
-        self.prev_id = id;
-    }
-
-    fn write_uvarint(&mut self, mut v: u64) {
-        loop {
-            if v < 0x80 {
-                self.buf.push(v as u8);
-                return;
-            }
-            self.buf.push(((v & 0x7F) | 0x80) as u8);
-            v >>= 7;
-        }
-    }
-
-    fn binary(&mut self, id: i16, value: &[u8]) -> &mut Self {
-        self.header(id, 8); // type=Binary
-        self.write_uvarint(value.len() as u64);
-        self.buf.extend_from_slice(value);
-        self
-    }
-
-    fn i64_field(&mut self, id: i16, value: i64) -> &mut Self {
-        self.header(id, 6); // type=I64
-        let u = ((value << 1) ^ (value >> 63)) as u64;
-        self.write_uvarint(u);
-        self
-    }
-
-    fn stop(&mut self) -> Vec<u8> {
-        self.buf.push(0x00);
-        std::mem::take(&mut self.buf)
-    }
-}
 
 #[test]
 fn builder_matches_hand_derived_bytes() {
@@ -126,7 +63,6 @@ fn empty_struct_yields_all_none() {
 
 #[test]
 fn only_null_count_present_other_fields_default_to_none() {
-    // Field 3 only — first three deltas (1, 2) skipped.
     let mut b = CompactBuilder::new();
     let bytes = b.i64_field(3, 42).stop();
 
@@ -142,7 +78,6 @@ fn only_null_count_present_other_fields_default_to_none() {
 
 #[test]
 fn binary_empty_slice_is_distinct_from_absent() {
-    // max is present but zero-length.
     let mut b = CompactBuilder::new();
     let bytes = b.binary(1, &[]).stop();
 
@@ -154,8 +89,6 @@ fn binary_empty_slice_is_distinct_from_absent() {
 
 #[test]
 fn min_max_value_v2_fields_only() {
-    // Newer writers populate min_value/max_value (5/6) but not the
-    // deprecated min/max (1/2).
     let mut b = CompactBuilder::new();
     let bytes = b
         .binary(5, &[0x01, 0x02])

@@ -10,6 +10,14 @@ pub enum FormatError {
         struct_name: &'static str,
         field_id: i16,
     },
+    MissingRequiredField {
+        struct_name: &'static str,
+        field_id: i16,
+    },
+    UnexpectedFieldType {
+        struct_name: &'static str,
+        field_id: i16,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -26,6 +34,12 @@ impl fmt::Display for FormatError {
             Self::InvalidFieldType(b) => write!(f, "invalid compact field type nibble: {b:#x}"),
             Self::UnknownStructField { struct_name, field_id } => {
                 write!(f, "{struct_name}: unknown field id {field_id}")
+            }
+            Self::MissingRequiredField { struct_name, field_id } => {
+                write!(f, "{struct_name}: required field id {field_id} missing")
+            }
+            Self::UnexpectedFieldType { struct_name, field_id } => {
+                write!(f, "{struct_name}: unexpected wire type for field id {field_id}")
             }
         }
     }

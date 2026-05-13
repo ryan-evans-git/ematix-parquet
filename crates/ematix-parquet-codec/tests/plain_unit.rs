@@ -5,8 +5,8 @@
 
 use ematix_parquet_codec::error::CodecError;
 use ematix_parquet_codec::plain::{
-    decode_plain_byte_array, decode_plain_byte_array_n, decode_plain_f32, decode_plain_f64,
-    decode_plain_f64_n, decode_plain_i32, decode_plain_i32_n, decode_plain_i64,
+    decode_plain_bool, decode_plain_byte_array, decode_plain_byte_array_n, decode_plain_f32,
+    decode_plain_f64, decode_plain_f64_n, decode_plain_i32, decode_plain_i32_n, decode_plain_i64,
     decode_plain_i64_n,
 };
 
@@ -207,4 +207,63 @@ fn decode_plain_byte_array_truncated_length_prefix_errors() {
     let bytes = [0u8, 0u8];
     let err = decode_plain_byte_array(&bytes).unwrap_err();
     let _ = err;
+}
+
+// ---- Boolean --------------------------------------------------------------
+
+#[test]
+fn decode_plain_bool_empty_request() {
+    let bytes: &[u8] = &[];
+    assert_eq!(decode_plain_bool(bytes, 0).unwrap(), Vec::<bool>::new());
+}
+
+#[test]
+fn decode_plain_bool_eight_alternating_lsb_first() {
+    // values [T,F,T,F,T,F,T,F]
+    // bit packing LSB-first: bit0=val0=1, bit1=val1=0, ... bit7=val7=0
+    // byte = 0b01010101 = 0x55
+    let bytes = [0x55u8];
+    assert_eq!(
+        decode_plain_bool(&bytes, 8).unwrap(),
+        vec![true, false, true, false, true, false, true, false]
+    );
+}
+
+#[test]
+fn decode_plain_bool_ten_values_across_two_bytes() {
+    // [T,F,T,F,T,F,T,F | T,T]
+    // byte 0: 0x55 (as above)
+    // byte 1: bit0=val8=1, bit1=val9=1, rest padding = 0b00000011 = 0x03
+    let bytes = [0x55u8, 0x03];
+    assert_eq!(
+        decode_plain_bool(&bytes, 10).unwrap(),
+        vec![true, false, true, false, true, false, true, false, true, true]
+    );
+}
+
+#[test]
+fn decode_plain_bool_partial_byte_consumed_correctly() {
+    // 5 values [T,T,F,T,F] → byte 0b00001011 = 0x0B (low 5 bits)
+    let bytes = [0x0Bu8];
+    assert_eq!(
+        decode_plain_bool(&bytes, 5).unwrap(),
+        vec![true, true, false, true, false]
+    );
+}
+
+#[test]
+fn decode_plain_bool_truncated_buffer_errors() {
+    // Asking for 9 values but only 1 byte (enough for 8) supplied.
+    let bytes = [0xFFu8];
+    let err = decode_plain_bool(&bytes, 9).unwrap_err();
+    let _ = err;
+}
+
+#[test]
+fn decode_plain_bool_padding_bits_ignored() {
+    // Buffer has trailing 1s in the padding region; result must be
+    // exactly num_values long and not include the padding.
+    let bytes = [0xFFu8]; // all 8 bits = 1
+    let out = decode_plain_bool(&bytes, 3).unwrap();
+    assert_eq!(out, vec![true, true, true]);
 }

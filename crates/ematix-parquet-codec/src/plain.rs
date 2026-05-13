@@ -237,6 +237,30 @@ pub fn decode_plain_f64_n(bytes: &[u8], n: usize) -> Result<Vec<f64>> {
     }
 }
 
+/// PLAIN-encoded BOOLEAN — 1 bit per value, LSB-first within each
+/// byte. The wire form holds `ceil(num_values / 8)` bytes; any
+/// trailing bits in the last byte are padding and must be ignored.
+///
+/// Unlike the fixed-width numeric types, the count is needed
+/// up-front because the padding makes the buffer ambiguous on its
+/// own (5 values pack into the same 1 byte as 8 values).
+pub fn decode_plain_bool(bytes: &[u8], num_values: usize) -> Result<Vec<bool>> {
+    let needed = (num_values + 7) / 8;
+    if bytes.len() < needed {
+        return Err(CodecError::UnderflowingPlainBuffer {
+            value_width: 1,
+            buffer_len: bytes.len(),
+            requested_values: num_values,
+        });
+    }
+    let mut out = Vec::with_capacity(num_values);
+    for i in 0..num_values {
+        let byte = bytes[i / 8];
+        out.push((byte >> (i % 8)) & 1 == 1);
+    }
+    Ok(out)
+}
+
 /// PLAIN-encoded BYTE_ARRAY — each value is a `u32-LE` length prefix
 /// followed by that many raw bytes. Zero-copy: the returned slices
 /// borrow from `bytes`. Consumes the whole buffer.

@@ -16,6 +16,7 @@
 //!                       DELTA_BYTE_ARRAY. (Not yet.)
 //!   5. `byte_stream_split` — Parquet v2 numeric encoding. (Not yet.)
 
+pub mod column;
 pub mod compression;
 pub mod dict;
 pub mod error;

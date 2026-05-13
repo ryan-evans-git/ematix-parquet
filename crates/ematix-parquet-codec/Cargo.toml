@@ -29,3 +29,11 @@ parquet = { version = "58", default-features = false, features = ["snap"] }
 [[example]]
 name = "bench_decode"
 path = "examples/bench_decode.rs"
+
+# Q14-shape filter bench: l_shipdate in [1995-09-01, 1995-10-01).
+# Three paths timed: late-mat (predicate on dict), eager (decode-
+# then-scan), parquet-rs typed read + scan.
+# Run: cargo run --release --example bench_late_mat
+[[example]]
+name = "bench_late_mat"
+path = "examples/bench_late_mat.rs"

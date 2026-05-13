@@ -293,3 +293,76 @@ fn read_u32_le(cur: &mut Cursor<'_>) -> Result<u32> {
     let bytes = cur.take(4)?;
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
+
+// ---- INT96 ---------------------------------------------------------
+
+/// 96-bit value. Legacy Parquet timestamp encoding (deprecated in
+/// favour of INT64 micros / nanos, but still common in pre-2018 Hive
+/// output). Wire form: three little-endian `u32`s, 12 bytes total.
+///
+/// We mirror parquet-rs's accessor shape (`data() -> [u32; 3]`) so
+/// consumers can copy-paste timestamp-conversion logic between the
+/// two libraries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Int96(pub [u32; 3]);
+
+impl Int96 {
+    pub fn new(a: u32, b: u32, c: u32) -> Self {
+        Self([a, b, c])
+    }
+    pub fn data(&self) -> [u32; 3] {
+        self.0
+    }
+}
+
+/// PLAIN-encoded INT96 — 12 bytes per value, three little-endian u32s.
+pub fn decode_plain_int96(bytes: &[u8]) -> Result<Vec<Int96>> {
+    if bytes.len() % 12 != 0 {
+        return Err(CodecError::UnalignedPlainBuffer {
+            value_width: 12,
+            buffer_len: bytes.len(),
+        });
+    }
+    let n = bytes.len() / 12;
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(12) {
+        let a = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        let b = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+        let c = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+        out.push(Int96([a, b, c]));
+    }
+    Ok(out)
+}
+
+// ---- FIXED_LEN_BYTE_ARRAY ------------------------------------------
+
+/// PLAIN-encoded FIXED_LEN_BYTE_ARRAY — `type_length` raw bytes per
+/// value, no length prefix. Zero-copy: returned slices borrow from
+/// `bytes`. The caller knows `type_length` from the schema element.
+///
+/// Common usage: UUIDs (`type_length` = 16), DECIMAL(N, S) (binary
+/// two's-complement of fixed byte width), arbitrary opaque BLOBs.
+pub fn decode_plain_fixed_len_byte_array<'a>(
+    bytes: &'a [u8],
+    type_length: i32,
+) -> Result<Vec<&'a [u8]>> {
+    if type_length <= 0 {
+        return Err(CodecError::InvalidInput(format!(
+            "FIXED_LEN_BYTE_ARRAY requires type_length > 0, got {type_length}"
+        )));
+    }
+    let stride = type_length as usize;
+    if bytes.len() % stride != 0 {
+        return Err(CodecError::UnalignedPlainBuffer {
+            value_width: stride,
+            buffer_len: bytes.len(),
+        });
+    }
+    let n = bytes.len() / stride;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = i * stride;
+        out.push(&bytes[start..start + stride]);
+    }
+    Ok(out)
+}

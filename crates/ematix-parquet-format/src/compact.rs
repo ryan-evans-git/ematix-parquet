@@ -78,3 +78,73 @@ pub fn read_zigzag_i64(cur: &mut Cursor<'_>) -> Result<i64> {
     let u = read_uvarint(cur)?;
     Ok(((u >> 1) as i64) ^ -((u & 1) as i64))
 }
+
+/// Thrift compact struct field type codes (low nibble of field header).
+///
+/// The set is fixed by the protocol spec. Code 0 is STOP (terminator),
+/// represented separately as `None` from `read_field_header`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FieldType {
+    BoolTrue = 1,
+    BoolFalse = 2,
+    Byte = 3,
+    I16 = 4,
+    I32 = 5,
+    I64 = 6,
+    Double = 7,
+    Binary = 8,
+    List = 9,
+    Set = 10,
+    Map = 11,
+    Struct = 12,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldHeader {
+    pub id: i16,
+    pub field_type: FieldType,
+}
+
+/// Read one field header from a struct stream.
+///
+/// `prev_id` is the id of the previously decoded field (0 for the
+/// first call). Returns `None` when the STOP byte (0x00) is reached.
+///
+/// For embedded booleans (`BoolTrue`/`BoolFalse`) the value is in the
+/// header itself — callers must not read a body.
+pub fn read_field_header(cur: &mut Cursor<'_>, prev_id: i16) -> Result<Option<FieldHeader>> {
+    let header = cur.read_u8()?;
+    if header == 0x00 {
+        return Ok(None);
+    }
+    let type_nibble = header & 0x0F;
+    let delta = (header & 0xF0) >> 4;
+    let field_type = decode_field_type(type_nibble)?;
+    let id = if delta == 0 {
+        // Long form: explicit zigzag i16 follows.
+        let z = read_zigzag_i32(cur)?;
+        z as i16
+    } else {
+        prev_id + delta as i16
+    };
+    Ok(Some(FieldHeader { id, field_type }))
+}
+
+fn decode_field_type(nibble: u8) -> Result<FieldType> {
+    Ok(match nibble {
+        1 => FieldType::BoolTrue,
+        2 => FieldType::BoolFalse,
+        3 => FieldType::Byte,
+        4 => FieldType::I16,
+        5 => FieldType::I32,
+        6 => FieldType::I64,
+        7 => FieldType::Double,
+        8 => FieldType::Binary,
+        9 => FieldType::List,
+        10 => FieldType::Set,
+        11 => FieldType::Map,
+        12 => FieldType::Struct,
+        other => return Err(FormatError::InvalidFieldType(other)),
+    })
+}

@@ -21,6 +21,7 @@ pub mod column;
 pub mod compression;
 pub mod dict;
 pub mod error;
+pub mod levels;
 pub mod plain;
 pub mod rle;
 

@@ -127,6 +127,17 @@ thrift_enum! {
 }
 
 thrift_enum! {
+    /// Edge interpolation for `GeographyType` (used inside `LogicalType`).
+    pub enum EdgeInterpolationAlgorithm {
+        Spherical = 0,
+        Vincenty = 1,
+        Thomas = 2,
+        Andoyer = 3,
+        Karney = 4,
+    }
+}
+
+thrift_enum! {
     /// Legacy logical-type annotation. Newer files prefer the
     /// `LogicalType` union, but this enum is still required for
     /// backward compatibility.

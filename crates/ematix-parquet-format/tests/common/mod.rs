@@ -84,6 +84,19 @@ impl CompactBuilder {
         self
     }
 
+    /// I8 / BYTE field: type nibble 3, single raw byte body.
+    pub fn i8_field(&mut self, id: i16, value: i8) -> &mut Self {
+        self.header(id, 3);
+        self.buf.push(value as u8);
+        self
+    }
+
+    /// Emit a fully-formed empty nested struct (just a STOP byte).
+    /// Convenient for building union variants whose payload is `{}`.
+    pub fn empty_struct() -> Vec<u8> {
+        vec![0x00]
+    }
+
     /// Push a nested struct: field header (type=12) followed by the
     /// nested struct's bytes (which must already include the inner
     /// STOP byte).

@@ -23,6 +23,9 @@ pub enum FormatError {
         expected: FieldType,
         actual: FieldType,
     },
+    EmptyUnion {
+        union_name: &'static str,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -48,6 +51,9 @@ impl fmt::Display for FormatError {
             }
             Self::UnexpectedListElementType { expected, actual } => {
                 write!(f, "list element type: expected {expected:?}, got {actual:?}")
+            }
+            Self::EmptyUnion { union_name } => {
+                write!(f, "union {union_name} had no variant set")
             }
         }
     }

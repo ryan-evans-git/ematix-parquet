@@ -5,11 +5,13 @@
 //! need owned data can `.to_vec()` the slices.
 
 use crate::compact::{
-    read_binary, read_field_header, read_list_i32, read_list_binary, read_list_struct,
+    read_binary, read_field_header, read_i8, read_list_i32, read_list_binary, read_list_struct,
     read_zigzag_i32, read_zigzag_i64, Cursor, FieldType,
 };
 use crate::error::{FormatError, Result};
-use crate::types::{CompressionCodec, Encoding, PageType, ParquetType, ThriftEnum};
+use crate::types::{
+    CompressionCodec, EdgeInterpolationAlgorithm, Encoding, PageType, ParquetType, ThriftEnum,
+};
 
 /// Per-page or per-column-chunk statistics, as produced by writers
 /// that support the deprecated (min/max) and/or current
@@ -93,6 +95,301 @@ fn missing(struct_name: &'static str, field_id: i16) -> FormatError {
 
 fn unknown(struct_name: &'static str, field_id: i16) -> FormatError {
     FormatError::UnknownStructField { struct_name, field_id }
+}
+
+/// Consume an empty thrift struct (just the STOP byte). Used as the
+/// payload reader for marker variants of `LogicalType` (StringType,
+/// UUIDType, …) and `TimeUnit` (MilliSeconds, MicroSeconds, NanoSeconds).
+fn read_empty_struct(cur: &mut Cursor<'_>, name: &'static str) -> Result<()> {
+    if let Some(h) = read_field_header(cur, 0)? {
+        return Err(unknown(name, h.id));
+    }
+    Ok(())
+}
+
+// ---- LogicalType payload structs ----------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecimalType {
+    pub scale: i32,
+    pub precision: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntType {
+    pub bit_width: i8,
+    pub is_signed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeUnit {
+    Millis,
+    Micros,
+    Nanos,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampType {
+    pub is_adjusted_to_utc: bool,
+    pub unit: TimeUnit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeType {
+    pub is_adjusted_to_utc: bool,
+    pub unit: TimeUnit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariantType {
+    pub specification_version: Option<i8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeometryType<'a> {
+    pub crs: Option<&'a [u8]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeographyType<'a> {
+    pub crs: Option<&'a [u8]>,
+    pub algorithm: Option<EdgeInterpolationAlgorithm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicalType<'a> {
+    String,
+    Map,
+    List,
+    Enum,
+    Decimal(DecimalType),
+    Date,
+    Time(TimeType),
+    Timestamp(TimestampType),
+    Integer(IntType),
+    /// `UNKNOWN` in the spec — payload is `NullType{}`.
+    Null,
+    Json,
+    Bson,
+    Uuid,
+    Float16,
+    Variant(VariantType),
+    Geometry(GeometryType<'a>),
+    Geography(GeographyType<'a>),
+}
+
+// ---- TimeUnit union -------------------------------------------------------
+
+pub fn read_time_unit(cur: &mut Cursor<'_>) -> Result<TimeUnit> {
+    let mut chosen: Option<TimeUnit> = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Struct) => {
+                read_empty_struct(cur, "MilliSeconds")?;
+                chosen = Some(TimeUnit::Millis);
+            }
+            (2, FieldType::Struct) => {
+                read_empty_struct(cur, "MicroSeconds")?;
+                chosen = Some(TimeUnit::Micros);
+            }
+            (3, FieldType::Struct) => {
+                read_empty_struct(cur, "NanoSeconds")?;
+                chosen = Some(TimeUnit::Nanos);
+            }
+            _ => return Err(unknown("TimeUnit", h.id)),
+        }
+    }
+    chosen.ok_or(FormatError::EmptyUnion {
+        union_name: "TimeUnit",
+    })
+}
+
+// ---- LogicalType union payload readers ------------------------------------
+
+fn read_decimal_type(cur: &mut Cursor<'_>) -> Result<DecimalType> {
+    let mut scale = None;
+    let mut precision = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::I32) => scale = Some(read_zigzag_i32(cur)?),
+            (2, FieldType::I32) => precision = Some(read_zigzag_i32(cur)?),
+            _ => return Err(unknown("DecimalType", h.id)),
+        }
+    }
+    Ok(DecimalType {
+        scale: scale.ok_or_else(|| missing("DecimalType", 1))?,
+        precision: precision.ok_or_else(|| missing("DecimalType", 2))?,
+    })
+}
+
+fn read_int_type(cur: &mut Cursor<'_>) -> Result<IntType> {
+    let mut bit_width = None;
+    let mut is_signed = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Byte) => bit_width = Some(read_i8(cur)?),
+            (2, FieldType::BoolTrue) => is_signed = Some(true),
+            (2, FieldType::BoolFalse) => is_signed = Some(false),
+            _ => return Err(unknown("IntType", h.id)),
+        }
+    }
+    Ok(IntType {
+        bit_width: bit_width.ok_or_else(|| missing("IntType", 1))?,
+        is_signed: is_signed.ok_or_else(|| missing("IntType", 2))?,
+    })
+}
+
+fn read_timestamp_type(cur: &mut Cursor<'_>) -> Result<TimestampType> {
+    let mut is_utc = None;
+    let mut unit = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::BoolTrue) => is_utc = Some(true),
+            (1, FieldType::BoolFalse) => is_utc = Some(false),
+            (2, FieldType::Struct) => unit = Some(read_time_unit(cur)?),
+            _ => return Err(unknown("TimestampType", h.id)),
+        }
+    }
+    Ok(TimestampType {
+        is_adjusted_to_utc: is_utc.ok_or_else(|| missing("TimestampType", 1))?,
+        unit: unit.ok_or_else(|| missing("TimestampType", 2))?,
+    })
+}
+
+fn read_time_type(cur: &mut Cursor<'_>) -> Result<TimeType> {
+    let mut is_utc = None;
+    let mut unit = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::BoolTrue) => is_utc = Some(true),
+            (1, FieldType::BoolFalse) => is_utc = Some(false),
+            (2, FieldType::Struct) => unit = Some(read_time_unit(cur)?),
+            _ => return Err(unknown("TimeType", h.id)),
+        }
+    }
+    Ok(TimeType {
+        is_adjusted_to_utc: is_utc.ok_or_else(|| missing("TimeType", 1))?,
+        unit: unit.ok_or_else(|| missing("TimeType", 2))?,
+    })
+}
+
+fn read_variant_type(cur: &mut Cursor<'_>) -> Result<VariantType> {
+    let mut spec = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Byte) => spec = Some(read_i8(cur)?),
+            _ => return Err(unknown("VariantType", h.id)),
+        }
+    }
+    Ok(VariantType {
+        specification_version: spec,
+    })
+}
+
+fn read_geometry_type<'a>(cur: &mut Cursor<'a>) -> Result<GeometryType<'a>> {
+    let mut crs = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Binary) => crs = Some(read_binary(cur)?),
+            _ => return Err(unknown("GeometryType", h.id)),
+        }
+    }
+    Ok(GeometryType { crs })
+}
+
+fn read_geography_type<'a>(cur: &mut Cursor<'a>) -> Result<GeographyType<'a>> {
+    let mut crs = None;
+    let mut algorithm = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Binary) => crs = Some(read_binary(cur)?),
+            (2, FieldType::I32) => algorithm = Some(EdgeInterpolationAlgorithm::read(cur)?),
+            _ => return Err(unknown("GeographyType", h.id)),
+        }
+    }
+    Ok(GeographyType { crs, algorithm })
+}
+
+// ---- LogicalType union ----------------------------------------------------
+
+pub fn read_logical_type<'a>(cur: &mut Cursor<'a>) -> Result<LogicalType<'a>> {
+    let mut chosen: Option<LogicalType<'a>> = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        let variant = match (h.id, &h.field_type) {
+            (1, FieldType::Struct) => {
+                read_empty_struct(cur, "StringType")?;
+                LogicalType::String
+            }
+            (2, FieldType::Struct) => {
+                read_empty_struct(cur, "MapType")?;
+                LogicalType::Map
+            }
+            (3, FieldType::Struct) => {
+                read_empty_struct(cur, "ListType")?;
+                LogicalType::List
+            }
+            (4, FieldType::Struct) => {
+                read_empty_struct(cur, "EnumType")?;
+                LogicalType::Enum
+            }
+            (5, FieldType::Struct) => LogicalType::Decimal(read_decimal_type(cur)?),
+            (6, FieldType::Struct) => {
+                read_empty_struct(cur, "DateType")?;
+                LogicalType::Date
+            }
+            (7, FieldType::Struct) => LogicalType::Time(read_time_type(cur)?),
+            (8, FieldType::Struct) => LogicalType::Timestamp(read_timestamp_type(cur)?),
+            (10, FieldType::Struct) => LogicalType::Integer(read_int_type(cur)?),
+            (11, FieldType::Struct) => {
+                read_empty_struct(cur, "NullType")?;
+                LogicalType::Null
+            }
+            (12, FieldType::Struct) => {
+                read_empty_struct(cur, "JsonType")?;
+                LogicalType::Json
+            }
+            (13, FieldType::Struct) => {
+                read_empty_struct(cur, "BsonType")?;
+                LogicalType::Bson
+            }
+            (14, FieldType::Struct) => {
+                read_empty_struct(cur, "UUIDType")?;
+                LogicalType::Uuid
+            }
+            (15, FieldType::Struct) => {
+                read_empty_struct(cur, "Float16Type")?;
+                LogicalType::Float16
+            }
+            (16, FieldType::Struct) => LogicalType::Variant(read_variant_type(cur)?),
+            (17, FieldType::Struct) => LogicalType::Geometry(read_geometry_type(cur)?),
+            (18, FieldType::Struct) => LogicalType::Geography(read_geography_type(cur)?),
+            // id 9 is reserved in the spec; anything else is genuinely
+            // unknown.
+            _ => return Err(unknown("LogicalType", h.id)),
+        };
+        chosen = Some(variant);
+    }
+    chosen.ok_or(FormatError::EmptyUnion {
+        union_name: "LogicalType",
+    })
 }
 
 /// Per-(page_type, encoding) page count, used for read-side stats

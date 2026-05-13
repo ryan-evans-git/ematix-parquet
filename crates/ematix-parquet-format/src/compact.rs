@@ -92,6 +92,11 @@ pub fn read_zigzag_i64(cur: &mut Cursor<'_>) -> Result<i64> {
     Ok(((u >> 1) as i64) ^ -((u & 1) as i64))
 }
 
+/// Read a thrift `i8` / `byte` — single raw signed byte, not zigzag.
+pub fn read_i8(cur: &mut Cursor<'_>) -> Result<i8> {
+    Ok(cur.read_u8()? as i8)
+}
+
 /// Thrift compact struct field type codes (low nibble of field header).
 ///
 /// The set is fixed by the protocol spec. Code 0 is STOP (terminator),

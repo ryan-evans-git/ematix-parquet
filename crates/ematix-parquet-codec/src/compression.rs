@@ -300,3 +300,27 @@ pub fn decompress_zstd_into(compressed: &[u8], out: &mut Vec<u8>) -> Result<()> 
         .map_err(|e| CodecError::Decompress(format!("zstd: {e}")))?;
     Ok(())
 }
+
+// ---- compression (write path) --------------------------------------------
+
+/// Snappy raw-format compression. Inverse of `decompress_snappy`.
+/// Parquet uses the framed-less raw variant — no Snappy framing
+/// header is added.
+pub fn compress_snappy(uncompressed: &[u8]) -> Result<Vec<u8>> {
+    let mut enc = snap::raw::Encoder::new();
+    enc.compress_vec(uncompressed)
+        .map_err(|e| CodecError::Decompress(format!("snappy encode: {e}")))
+}
+
+/// ZSTD compression at the default level (matches most parquet writers).
+/// One complete frame per call. Inverse of `decompress_zstd`.
+pub fn compress_zstd(uncompressed: &[u8]) -> Result<Vec<u8>> {
+    compress_zstd_at_level(uncompressed, zstd::DEFAULT_COMPRESSION_LEVEL)
+}
+
+/// ZSTD compression at an explicit level. Higher → smaller output,
+/// slower encode. Range matches the upstream `zstd` crate (1..=22).
+pub fn compress_zstd_at_level(uncompressed: &[u8], level: i32) -> Result<Vec<u8>> {
+    zstd::stream::encode_all(uncompressed, level)
+        .map_err(|e| CodecError::Decompress(format!("zstd encode: {e}")))
+}

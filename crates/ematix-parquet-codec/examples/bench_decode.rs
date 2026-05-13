@@ -19,7 +19,7 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ematix_parquet_codec::compression::decompress_snappy;
+use ematix_parquet_codec::compression::decompress_snappy_into;
 use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_into};
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_byte_array_n, decode_plain_f64, decode_plain_i32,
@@ -75,21 +75,25 @@ fn ours_decode_i64(path: &Path, col_idx: usize) -> Vec<i64> {
     let (chunk, total) = read_chunk_bytes(&file, 0, col_idx);
     let mut walker = PageWalker::new(&chunk);
 
+    // Reused across all pages — grows to max page size on first
+    // resize then stays at that capacity.
+    let mut decomp: Vec<u8> = Vec::new();
+
     let (_first_hdr, first_body) = walker.next_page().unwrap().unwrap();
-    let dict_decompressed = decompress_snappy(first_body).unwrap();
-    let dict: Vec<i64> = decode_plain_i64(&dict_decompressed).unwrap();
+    decompress_snappy_into(first_body, &mut decomp).unwrap();
+    let dict: Vec<i64> = decode_plain_i64(&decomp).unwrap();
 
     let mut out: Vec<i64> = Vec::with_capacity(total);
     while let Some((hdr, body)) = walker.next_page().unwrap() {
         let dph = hdr.data_page_header.as_ref().unwrap();
         let n = dph.num_values as usize;
-        let decompressed = decompress_snappy(body).unwrap();
+        decompress_snappy_into(body, &mut decomp).unwrap();
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                decode_rle_dictionary_into(&decompressed, &dict, n, &mut out).unwrap();
+                decode_rle_dictionary_into(&decomp, &dict, n, &mut out).unwrap();
             }
             Encoding::Plain => {
-                out.extend(decode_plain_i64(&decompressed).unwrap());
+                out.extend(decode_plain_i64(&decomp).unwrap());
             }
             _ => panic!(),
         }
@@ -105,21 +109,23 @@ fn ours_decode_i32(path: &Path, col_idx: usize) -> Vec<i32> {
     let (chunk, total) = read_chunk_bytes(&file, 0, col_idx);
     let mut walker = PageWalker::new(&chunk);
 
+    let mut decomp: Vec<u8> = Vec::new();
+
     let (_first_hdr, first_body) = walker.next_page().unwrap().unwrap();
-    let dict_decompressed = decompress_snappy(first_body).unwrap();
-    let dict: Vec<i32> = decode_plain_i32(&dict_decompressed).unwrap();
+    decompress_snappy_into(first_body, &mut decomp).unwrap();
+    let dict: Vec<i32> = decode_plain_i32(&decomp).unwrap();
 
     let mut out: Vec<i32> = Vec::with_capacity(total);
     while let Some((hdr, body)) = walker.next_page().unwrap() {
         let dph = hdr.data_page_header.as_ref().unwrap();
         let n = dph.num_values as usize;
-        let decompressed = decompress_snappy(body).unwrap();
+        decompress_snappy_into(body, &mut decomp).unwrap();
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                decode_rle_dictionary_into(&decompressed, &dict, n, &mut out).unwrap();
+                decode_rle_dictionary_into(&decomp, &dict, n, &mut out).unwrap();
             }
             Encoding::Plain => {
-                out.extend(decode_plain_i32(&decompressed).unwrap());
+                out.extend(decode_plain_i32(&decomp).unwrap());
             }
             _ => panic!(),
         }
@@ -136,10 +142,12 @@ fn ours_decode_f64(path: &Path, col_idx: usize) -> Vec<f64> {
     let (chunk, total) = read_chunk_bytes(&file, 0, col_idx);
     let mut walker = PageWalker::new(&chunk);
 
+    let mut decomp: Vec<u8> = Vec::new();
+
     let (first_hdr, first_body) = walker.next_page().unwrap().unwrap();
-    let dict_decompressed = decompress_snappy(first_body).unwrap();
+    decompress_snappy_into(first_body, &mut decomp).unwrap();
     let dict: Vec<f64> = if first_hdr.dictionary_page_header.is_some() {
-        decode_plain_f64(&dict_decompressed).unwrap()
+        decode_plain_f64(&decomp).unwrap()
     } else {
         Vec::new()
     };
@@ -148,13 +156,13 @@ fn ours_decode_f64(path: &Path, col_idx: usize) -> Vec<f64> {
     while let Some((hdr, body)) = walker.next_page().unwrap() {
         let dph = hdr.data_page_header.as_ref().unwrap();
         let n = dph.num_values as usize;
-        let decompressed = decompress_snappy(body).unwrap();
+        decompress_snappy_into(body, &mut decomp).unwrap();
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                decode_rle_dictionary_into(&decompressed, &dict, n, &mut out).unwrap();
+                decode_rle_dictionary_into(&decomp, &dict, n, &mut out).unwrap();
             }
             Encoding::Plain => {
-                out.extend(decode_plain_f64(&decompressed).unwrap());
+                out.extend(decode_plain_f64(&decomp).unwrap());
             }
             _ => panic!(),
         }
@@ -170,10 +178,12 @@ fn ours_decode_byte_array(path: &Path, col_idx: usize) -> Vec<Vec<u8>> {
     let (chunk, total) = read_chunk_bytes(&file, 0, col_idx);
     let mut walker = PageWalker::new(&chunk);
 
+    let mut decomp: Vec<u8> = Vec::new();
+
     let (first_hdr, first_body) = walker.next_page().unwrap().unwrap();
-    let dict_decompressed = decompress_snappy(first_body).unwrap();
+    decompress_snappy_into(first_body, &mut decomp).unwrap();
     let dict: Vec<Vec<u8>> = if first_hdr.dictionary_page_header.is_some() {
-        decode_plain_byte_array(&dict_decompressed)
+        decode_plain_byte_array(&decomp)
             .unwrap()
             .into_iter()
             .map(|s| s.to_vec())
@@ -186,16 +196,16 @@ fn ours_decode_byte_array(path: &Path, col_idx: usize) -> Vec<Vec<u8>> {
     while let Some((hdr, body)) = walker.next_page().unwrap() {
         let dph = hdr.data_page_header.as_ref().unwrap();
         let n = dph.num_values as usize;
-        let decompressed = decompress_snappy(body).unwrap();
+        decompress_snappy_into(body, &mut decomp).unwrap();
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let indices = decode_rle_dictionary_indices(&decompressed, n).unwrap();
+                let indices = decode_rle_dictionary_indices(&decomp, n).unwrap();
                 for &idx in &indices {
                     out.push(dict[idx as usize].clone());
                 }
             }
             Encoding::Plain => {
-                let values = decode_plain_byte_array_n(&decompressed, n).unwrap();
+                let values = decode_plain_byte_array_n(&decomp, n).unwrap();
                 for v in values {
                     out.push(v.to_vec());
                 }

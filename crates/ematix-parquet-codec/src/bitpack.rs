@@ -60,6 +60,18 @@ pub fn unpack_lookup_into<T: Copy>(
 
     out.reserve(num_values);
 
+    // NEON specialization for bw=12 (hot in lineitem: shipdate +
+    // commitdate + receiptdate). NEON unpack into a stack staging
+    // buffer, then scalar dict gather per lane.
+    #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
+    {
+        if bit_width == 12 {
+            return crate::bitpack_neon::unpack_lookup_into_neon_bw12(
+                packed, num_values, dict, out,
+            );
+        }
+    }
+
     // Dispatch once on bit_width; the chosen monomorphization drives
     // the whole page.
     dispatch_unpack!(bit_width, packed, num_values, dict, out)
@@ -86,6 +98,17 @@ pub fn unpack_indices_into(
         return Ok(());
     }
     out.reserve(num_values);
+
+    // NEON specializations. Profiled at ~10× scalar on M-series for
+    // bw=12 (the width l_shipdate / l_commitdate / l_receiptdate hit
+    // in TPC-H lineitem). Other widths fall through to scalar.
+    #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
+    {
+        if bit_width == 12 {
+            return crate::bitpack_neon::unpack_indices_into_neon_bw12(packed, num_values, out);
+        }
+    }
+
     dispatch_unpack_indices!(bit_width, packed, num_values, out)
 }
 

@@ -11,6 +11,12 @@ description = "Page-body decompression + per-(encoding, physical type) decoders 
 [lib]
 name = "ematix_parquet_codec"
 
+[features]
+# A/B switch: disable NEON specializations to compare scalar vs NEON
+# end-to-end on the same binary. Default: NEON enabled where the host
+# target supports it.
+no-neon = []
+
 [dependencies]
 ematix-parquet-format = { path = "../ematix-parquet-format" }
 # Snappy is the default codec for almost every parquet writer in the

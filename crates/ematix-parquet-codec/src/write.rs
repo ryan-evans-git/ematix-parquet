@@ -42,6 +42,236 @@ use crate::error::{CodecError, Result};
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 
+// ---- Multi-column table writer -------------------------------------
+
+/// Type-erased column payload for `write_table_to_path` / `write_table`.
+/// Each variant borrows the caller's slice for the duration of the
+/// write; nothing is copied except into the on-disk page body.
+pub enum ColumnData<'a> {
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+    F64(&'a [f64]),
+    Bool(&'a [bool]),
+    ByteArray(&'a [&'a [u8]]),
+}
+
+impl<'a> ColumnData<'a> {
+    fn row_count(&self) -> usize {
+        match self {
+            ColumnData::I32(v) => v.len(),
+            ColumnData::I64(v) => v.len(),
+            ColumnData::F64(v) => v.len(),
+            ColumnData::Bool(v) => v.len(),
+            ColumnData::ByteArray(v) => v.len(),
+        }
+    }
+
+    fn parquet_type(&self) -> ParquetType {
+        match self {
+            ColumnData::I32(_) => ParquetType::Int32,
+            ColumnData::I64(_) => ParquetType::Int64,
+            ColumnData::F64(_) => ParquetType::Double,
+            ColumnData::Bool(_) => ParquetType::Boolean,
+            ColumnData::ByteArray(_) => ParquetType::ByteArray,
+        }
+    }
+
+    fn encode_plain(&self) -> Vec<u8> {
+        match self {
+            ColumnData::I32(v) => encode_plain_i32(v),
+            ColumnData::I64(v) => encode_plain_i64(v),
+            ColumnData::F64(v) => encode_plain_f64(v),
+            ColumnData::Bool(v) => encode_plain_bool(v),
+            ColumnData::ByteArray(v) => encode_plain_byte_array(v),
+        }
+    }
+}
+
+/// Write a multi-column single-row-group Parquet file.
+///
+/// All columns must have the same row count. Each column is written
+/// as one uncompressed-or-compressed PLAIN-encoded data page. The
+/// row group's columns appear in the same order as `columns`.
+///
+/// `codec` applies to every column. Per-column codec selection lands
+/// later — for now, the common case (one writer = one codec) is the
+/// only thing wired.
+pub fn write_table_to_path<P: AsRef<Path>>(
+    path: P,
+    columns: &[(&str, ColumnData<'_>)],
+    codec: CompressionCodec,
+) -> Result<()> {
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_table(&mut w, columns, codec)?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+/// Same as `write_table_to_path` but writes to an arbitrary `Write` sink.
+pub fn write_table<W: Write>(
+    out: &mut W,
+    columns: &[(&str, ColumnData<'_>)],
+    codec: CompressionCodec,
+) -> Result<()> {
+    if columns.is_empty() {
+        return Err(CodecError::InvalidInput(
+            "write_table requires at least one column".into(),
+        ));
+    }
+    let num_rows = columns[0].1.row_count();
+    for (name, c) in &columns[1..] {
+        if c.row_count() != num_rows {
+            return Err(CodecError::InvalidInput(format!(
+                "column {name:?} has row count {} but first column has {}",
+                c.row_count(),
+                num_rows
+            )));
+        }
+    }
+
+    out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
+    let mut written: u64 = 4;
+
+    // For each column: encode body, compress, write page header + body,
+    // remember the data_page_offset and the byte sizes for the footer.
+    struct PreparedColumn {
+        data_page_offset: i64,
+        total_uncompressed_size: i64,
+        total_compressed_size: i64,
+    }
+
+    let mut prepared: Vec<PreparedColumn> = Vec::with_capacity(columns.len());
+
+    for (_name, col) in columns {
+        let body = col.encode_plain();
+        let uncompressed_size = body.len();
+        let compressed_body = compress_body(&body, codec)?;
+        let compressed_size = compressed_body.len();
+
+        let header = PageHeader {
+            page_type: PageType::DataPage,
+            uncompressed_page_size: uncompressed_size as i32,
+            compressed_page_size: compressed_size as i32,
+            crc: None,
+            data_page_header: Some(DataPageHeader {
+                num_values: num_rows as i32,
+                encoding: Encoding::Plain,
+                definition_level_encoding: Encoding::Rle,
+                repetition_level_encoding: Encoding::Rle,
+                statistics: None,
+            }),
+            index_page_header: None,
+            dictionary_page_header: None,
+            data_page_header_v2: None,
+        };
+        let header_bytes = write_page_header(&header);
+
+        let data_page_offset = written as i64;
+        out.write_all(&header_bytes).map_err(io_to_codec)?;
+        written += header_bytes.len() as u64;
+        out.write_all(&compressed_body).map_err(io_to_codec)?;
+        written += compressed_body.len() as u64;
+
+        prepared.push(PreparedColumn {
+            data_page_offset,
+            total_uncompressed_size: (header_bytes.len() + uncompressed_size) as i64,
+            total_compressed_size: (header_bytes.len() + compressed_size) as i64,
+        });
+    }
+
+    // ---- Build the footer schema + row group ----
+    let root = SchemaElement {
+        column_type: None,
+        type_length: None,
+        repetition_type: None,
+        name: b"schema",
+        num_children: Some(columns.len() as i32),
+        converted_type: None,
+        scale: None,
+        precision: None,
+        field_id: None,
+        logical_type: None,
+    };
+
+    let mut schema: Vec<SchemaElement<'_>> = Vec::with_capacity(columns.len() + 1);
+    schema.push(root);
+    for (name, col) in columns {
+        schema.push(SchemaElement {
+            column_type: Some(col.parquet_type()),
+            type_length: None,
+            repetition_type: Some(FieldRepetitionType::Required),
+            name: name.as_bytes(),
+            num_children: None,
+            converted_type: None,
+            scale: None,
+            precision: None,
+            field_id: None,
+            logical_type: None,
+        });
+    }
+
+    let mut row_group_columns: Vec<ColumnChunk<'_>> = Vec::with_capacity(columns.len());
+    let mut total_byte_size: i64 = 0;
+    for ((name, col), prep) in columns.iter().zip(prepared.iter()) {
+        let cm = ColumnMetaData {
+            column_type: col.parquet_type(),
+            encodings: vec![Encoding::Plain, Encoding::Rle],
+            path_in_schema: vec![name.as_bytes()],
+            codec,
+            num_values: num_rows as i64,
+            total_uncompressed_size: prep.total_uncompressed_size,
+            total_compressed_size: prep.total_compressed_size,
+            key_value_metadata: None,
+            data_page_offset: prep.data_page_offset,
+            index_page_offset: None,
+            dictionary_page_offset: None,
+            statistics: None,
+            encoding_stats: None,
+            bloom_filter_offset: None,
+            bloom_filter_length: None,
+            size_statistics: None,
+        };
+        row_group_columns.push(ColumnChunk {
+            file_path: None,
+            file_offset: prep.data_page_offset,
+            meta_data: Some(cm),
+            offset_index_offset: None,
+            offset_index_length: None,
+            column_index_offset: None,
+            column_index_length: None,
+        });
+        total_byte_size += prep.total_uncompressed_size;
+    }
+
+    let rg = RowGroup {
+        columns: row_group_columns,
+        total_byte_size,
+        num_rows: num_rows as i64,
+        sorting_columns: None,
+        file_offset: None,
+        total_compressed_size: None,
+        ordinal: None,
+    };
+
+    let md = FileMetaData {
+        version: 1,
+        schema,
+        num_rows: num_rows as i64,
+        row_groups: vec![rg],
+        key_value_metadata: None,
+        created_by: Some(b"ematix-parquet 0.0.1"),
+        column_orders: None,
+    };
+    let footer = write_file_metadata(&md);
+    let footer_len = footer.len() as u32;
+    out.write_all(&footer).map_err(io_to_codec)?;
+    out.write_all(&footer_len.to_le_bytes()).map_err(io_to_codec)?;
+    out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
+
+    Ok(())
+}
+
 // ---- Public per-type entry points (uncompressed defaults) ----------
 
 /// Write a single-column INT64 file (PLAIN, uncompressed, REQUIRED).

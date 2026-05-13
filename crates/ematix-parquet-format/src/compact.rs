@@ -97,6 +97,11 @@ pub fn read_i8(cur: &mut Cursor<'_>) -> Result<i8> {
     Ok(cur.read_u8()? as i8)
 }
 
+/// Thrift signed-16. Wire-identical to a zigzag i32 that fits in 16 bits.
+pub fn read_zigzag_i16(cur: &mut Cursor<'_>) -> Result<i16> {
+    Ok(read_zigzag_i32(cur)? as i16)
+}
+
 /// Thrift compact struct field type codes (low nibble of field header).
 ///
 /// The set is fixed by the protocol spec. Code 0 is STOP (terminator),

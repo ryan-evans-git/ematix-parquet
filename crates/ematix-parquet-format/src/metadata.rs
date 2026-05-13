@@ -6,7 +6,7 @@
 
 use crate::compact::{
     read_binary, read_field_header, read_i8, read_list_i32, read_list_binary, read_list_struct,
-    read_zigzag_i32, read_zigzag_i64, Cursor, FieldType,
+    read_zigzag_i16, read_zigzag_i32, read_zigzag_i64, Cursor, FieldType,
 };
 use crate::error::{FormatError, Result};
 use crate::types::{
@@ -390,6 +390,84 @@ pub fn read_logical_type<'a>(cur: &mut Cursor<'a>) -> Result<LogicalType<'a>> {
     }
     chosen.ok_or(FormatError::EmptyUnion {
         union_name: "LogicalType",
+    })
+}
+
+// ---- SortingColumn + RowGroup ---------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortingColumn {
+    pub column_idx: i32,
+    pub descending: bool,
+    pub nulls_first: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RowGroup<'a> {
+    pub columns: Vec<ColumnChunk<'a>>,
+    pub total_byte_size: i64,
+    pub num_rows: i64,
+    pub sorting_columns: Option<Vec<SortingColumn>>,
+    pub file_offset: Option<i64>,
+    pub total_compressed_size: Option<i64>,
+    pub ordinal: Option<i16>,
+}
+
+pub fn read_sorting_column(cur: &mut Cursor<'_>) -> Result<SortingColumn> {
+    let mut column_idx = None;
+    let mut descending = None;
+    let mut nulls_first = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::I32) => column_idx = Some(read_zigzag_i32(cur)?),
+            (2, FieldType::BoolTrue) => descending = Some(true),
+            (2, FieldType::BoolFalse) => descending = Some(false),
+            (3, FieldType::BoolTrue) => nulls_first = Some(true),
+            (3, FieldType::BoolFalse) => nulls_first = Some(false),
+            _ => return Err(unknown("SortingColumn", h.id)),
+        }
+    }
+    Ok(SortingColumn {
+        column_idx: column_idx.ok_or_else(|| missing("SortingColumn", 1))?,
+        descending: descending.ok_or_else(|| missing("SortingColumn", 2))?,
+        nulls_first: nulls_first.ok_or_else(|| missing("SortingColumn", 3))?,
+    })
+}
+
+pub fn read_row_group<'a>(cur: &mut Cursor<'a>) -> Result<RowGroup<'a>> {
+    let mut columns = None;
+    let mut total_byte_size = None;
+    let mut num_rows = None;
+    let mut sorting_columns = None;
+    let mut file_offset = None;
+    let mut total_compressed_size = None;
+    let mut ordinal = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::List) => columns = Some(read_list_struct(cur, read_column_chunk)?),
+            (2, FieldType::I64) => total_byte_size = Some(read_zigzag_i64(cur)?),
+            (3, FieldType::I64) => num_rows = Some(read_zigzag_i64(cur)?),
+            (4, FieldType::List) => {
+                sorting_columns = Some(read_list_struct(cur, |c| read_sorting_column(c))?);
+            }
+            (5, FieldType::I64) => file_offset = Some(read_zigzag_i64(cur)?),
+            (6, FieldType::I64) => total_compressed_size = Some(read_zigzag_i64(cur)?),
+            (7, FieldType::I16) => ordinal = Some(read_zigzag_i16(cur)?),
+            _ => return Err(unknown("RowGroup", h.id)),
+        }
+    }
+    Ok(RowGroup {
+        columns: columns.ok_or_else(|| missing("RowGroup", 1))?,
+        total_byte_size: total_byte_size.ok_or_else(|| missing("RowGroup", 2))?,
+        num_rows: num_rows.ok_or_else(|| missing("RowGroup", 3))?,
+        sorting_columns,
+        file_offset,
+        total_compressed_size,
+        ordinal,
     })
 }
 

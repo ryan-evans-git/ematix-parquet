@@ -63,6 +63,14 @@ impl CompactBuilder {
         self
     }
 
+    pub fn i16_field(&mut self, id: i16, value: i16) -> &mut Self {
+        self.header(id, 4);
+        let v = value as i32;
+        let u = ((v << 1) ^ (v >> 31)) as u32 as u64;
+        self.write_uvarint(u);
+        self
+    }
+
     pub fn i32_field(&mut self, id: i16, value: i32) -> &mut Self {
         self.header(id, 5);
         let u = ((value << 1) ^ (value >> 31)) as u32 as u64;

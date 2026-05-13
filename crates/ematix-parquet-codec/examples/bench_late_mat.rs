@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use ematix_parquet_codec::column::{DictColumnChunk, Segment};
 use ematix_parquet_codec::compression::decompress_snappy;
-use ematix_parquet_codec::dict::decode_rle_dictionary_indices;
+use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_into};
 use ematix_parquet_codec::plain::{decode_plain_i32, decode_plain_i32_n};
 use ematix_parquet_format::types::Encoding;
 use ematix_parquet_io::{PageWalker, ParquetFile};
@@ -104,6 +104,61 @@ fn build_dict_column_chunk_i32(path: &Path, col_idx: usize) -> DictColumnChunk<i
         }
     }
     DictColumnChunk::new(Some(dict), segments, total)
+}
+
+/// Stream-fused chunk filter for INT32 columns: walks pages,
+/// decompresses, and writes `dict_mask[idx]` (or `predicate(plain)`)
+/// directly into a `Vec<bool>` bitmap. No intermediate `Vec<u32>`
+/// indices, no `DictColumnChunk` materialization.
+///
+/// This is the "Phase 4" target — Q14's filter without the chunk-
+/// build cost.
+fn filter_dict_chunk_i32_into_bitmap(
+    path: &Path,
+    col_idx: usize,
+    predicate: impl Fn(i32) -> bool,
+) -> Vec<bool> {
+    let file = ParquetFile::open(path).unwrap();
+    let (chunk, total) = read_chunk_bytes(&file, 0, col_idx);
+    let mut walker = PageWalker::new(&chunk);
+
+    // First page: dict.
+    let (first_hdr, first_body) = walker.next_page().unwrap().unwrap();
+    let dict_decompressed = decompress_snappy(first_body).unwrap();
+    let (dict_mask, _has_dict): (Vec<bool>, bool) = if first_hdr.dictionary_page_header.is_some() {
+        let dict = decode_plain_i32(&dict_decompressed).unwrap();
+        (dict.iter().copied().map(&predicate).collect(), true)
+    } else {
+        (Vec::new(), false)
+    };
+
+    let mut out: Vec<bool> = Vec::with_capacity(total);
+    while let Some((hdr, body)) = walker.next_page().unwrap() {
+        let dph = hdr.data_page_header.as_ref().unwrap();
+        let n = dph.num_values as usize;
+        let decompressed = decompress_snappy(body).unwrap();
+        match dph.encoding {
+            Encoding::RleDictionary | Encoding::PlainDictionary => {
+                // decode_rle_dictionary_into handles the RLE/bit-
+                // packed framing AND the dict lookup. By passing
+                // `dict_mask: &[bool]` as the dict, the output is
+                // dict_mask[idx] per row — i.e. the filter bitmap
+                // for this page. No Vec<u32> indices materialized.
+                decode_rle_dictionary_into(&decompressed, &dict_mask, n, &mut out).unwrap();
+            }
+            Encoding::Plain => {
+                for chunk in decompressed.chunks_exact(4).take(n) {
+                    let v = i32::from_le_bytes(chunk.try_into().unwrap());
+                    out.push(predicate(v));
+                }
+            }
+            _ => panic!(),
+        }
+        if out.len() >= total {
+            break;
+        }
+    }
+    out
 }
 
 fn parquet_rs_decode_i32(path: &Path, col_idx: usize) -> Vec<i32> {
@@ -233,4 +288,13 @@ fn main() {
             .count()
     });
     pretty_ratio("end-to-end late-mat vs parquet-rs", lm_full, pr_full);
+    println!();
+
+    println!("Phase 4: stream-fused — open + page-walk + dict-mask → bitmap");
+    println!("(no DictColumnChunk, no Vec<u32> indices, direct to Vec<bool>)");
+    let (sf_count, _, _) = bench("stream-fused (bitmap + count)", || {
+        let bitmap = filter_dict_chunk_i32_into_bitmap(&path, 10, |d| d >= LO && d < HI);
+        bitmap.iter().filter(|&&b| b).count()
+    });
+    pretty_ratio("end-to-end stream-fused vs parquet-rs", sf_count, pr_full);
 }

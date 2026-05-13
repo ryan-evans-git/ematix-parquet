@@ -26,6 +26,9 @@ pub enum FormatError {
     EmptyUnion {
         union_name: &'static str,
     },
+    /// In a `list<bool>`, each element byte must be 0x01 (true) or
+    /// 0x02 (false). Anything else is a wire-format violation.
+    InvalidBoolByte(u8),
 }
 
 impl fmt::Display for FormatError {
@@ -55,6 +58,7 @@ impl fmt::Display for FormatError {
             Self::EmptyUnion { union_name } => {
                 write!(f, "union {union_name} had no variant set")
             }
+            Self::InvalidBoolByte(b) => write!(f, "invalid list<bool> element byte {b:#x}"),
         }
     }
 }

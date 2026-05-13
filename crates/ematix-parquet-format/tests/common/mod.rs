@@ -164,6 +164,29 @@ impl CompactBuilder {
         self
     }
 
+    /// Field that is a list<bool>. Elem type nibble = 2 (canonical
+    /// "bool" code for list elements per thrift compact spec); each
+    /// element body is one byte: 0x01 for true, 0x02 for false.
+    pub fn list_bool_field(&mut self, id: i16, values: &[bool]) -> &mut Self {
+        self.header(id, 9);
+        self.list_header(values.len(), 2);
+        for &v in values {
+            self.buf.push(if v { 0x01 } else { 0x02 });
+        }
+        self
+    }
+
+    /// Field that is a list<i64>.
+    pub fn list_i64_field(&mut self, id: i16, values: &[i64]) -> &mut Self {
+        self.header(id, 9);
+        self.list_header(values.len(), 6);
+        for &v in values {
+            let u = ((v << 1) ^ (v >> 63)) as u64;
+            self.write_uvarint(u);
+        }
+        self
+    }
+
     pub fn stop(&mut self) -> Vec<u8> {
         self.buf.push(0x00);
         std::mem::take(&mut self.buf)

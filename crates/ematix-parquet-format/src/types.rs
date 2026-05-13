@@ -126,6 +126,12 @@ thrift_enum! {
     }
 }
 
+impl Default for BoundaryOrder {
+    fn default() -> Self {
+        Self::Unordered
+    }
+}
+
 thrift_enum! {
     /// Edge interpolation for `GeographyType` (used inside `LogicalType`).
     pub enum EdgeInterpolationAlgorithm {

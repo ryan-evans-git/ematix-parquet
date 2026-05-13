@@ -209,6 +209,31 @@ pub fn read_list_i64(cur: &mut Cursor<'_>) -> Result<Vec<i64>> {
     (0..n).map(|_| read_zigzag_i64(cur)).collect()
 }
 
+/// Decode a `list<bool>`. Per the thrift compact spec, boolean lists
+/// use elem type code 1 *or* 2 in the list header (both are valid
+/// — different writers do different things). Each element body is a
+/// single byte: 0x01 for true, 0x02 for false.
+pub fn read_list_bool(cur: &mut Cursor<'_>) -> Result<Vec<bool>> {
+    let (n, et) = read_list_header(cur)?;
+    if !matches!(et, FieldType::BoolTrue | FieldType::BoolFalse) {
+        return Err(FormatError::UnexpectedListElementType {
+            expected: FieldType::BoolTrue,
+            actual: et,
+        });
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let b = cur.read_u8()?;
+        let v = match b {
+            0x01 => true,
+            0x02 => false,
+            other => return Err(FormatError::InvalidBoolByte(other)),
+        };
+        out.push(v);
+    }
+    Ok(out)
+}
+
 /// Decode a `list<binary>` (also `list<string>` — wire-identical).
 pub fn read_list_binary<'a>(cur: &mut Cursor<'a>) -> Result<Vec<&'a [u8]>> {
     let (n, et) = read_list_header(cur)?;

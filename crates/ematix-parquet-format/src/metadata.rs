@@ -5,13 +5,14 @@
 //! need owned data can `.to_vec()` the slices.
 
 use crate::compact::{
-    read_binary, read_field_header, read_i8, read_list_i32, read_list_binary, read_list_struct,
-    read_zigzag_i16, read_zigzag_i32, read_zigzag_i64, Cursor, FieldType,
+    read_binary, read_field_header, read_i8, read_list_binary, read_list_bool, read_list_i32,
+    read_list_i64, read_list_struct, read_zigzag_i16, read_zigzag_i32, read_zigzag_i64, Cursor,
+    FieldType,
 };
 use crate::error::{FormatError, Result};
 use crate::types::{
-    CompressionCodec, ConvertedType, EdgeInterpolationAlgorithm, Encoding, FieldRepetitionType,
-    PageType, ParquetType, ThriftEnum,
+    BoundaryOrder, CompressionCodec, ConvertedType, EdgeInterpolationAlgorithm, Encoding,
+    FieldRepetitionType, PageType, ParquetType, ThriftEnum,
 };
 
 /// Per-page or per-column-chunk statistics, as produced by writers
@@ -535,6 +536,103 @@ pub fn read_schema_element<'a>(cur: &mut Cursor<'a>) -> Result<SchemaElement<'a>
         precision,
         field_id,
         logical_type,
+    })
+}
+
+// ---- Page-index types -----------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageLocation {
+    pub offset: i64,
+    pub compressed_page_size: i32,
+    pub first_row_index: i64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OffsetIndex {
+    pub page_locations: Vec<PageLocation>,
+    /// Per-page unencoded size for BYTE_ARRAY columns. Required when
+    /// any column in the file is BYTE_ARRAY; absent otherwise.
+    pub unencoded_byte_array_data_bytes: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ColumnIndex<'a> {
+    /// Per-page null marker. `null_pages[i]==true` means
+    /// `min_values[i]`/`max_values[i]` are not meaningful (all rows
+    /// in that page were null).
+    pub null_pages: Vec<bool>,
+    pub min_values: Vec<&'a [u8]>,
+    pub max_values: Vec<&'a [u8]>,
+    pub boundary_order: BoundaryOrder,
+    pub null_counts: Option<Vec<i64>>,
+}
+
+pub fn read_page_location(cur: &mut Cursor<'_>) -> Result<PageLocation> {
+    let mut offset = None;
+    let mut compressed = None;
+    let mut first_row = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::I64) => offset = Some(read_zigzag_i64(cur)?),
+            (2, FieldType::I32) => compressed = Some(read_zigzag_i32(cur)?),
+            (3, FieldType::I64) => first_row = Some(read_zigzag_i64(cur)?),
+            _ => return Err(unknown("PageLocation", h.id)),
+        }
+    }
+    Ok(PageLocation {
+        offset: offset.ok_or_else(|| missing("PageLocation", 1))?,
+        compressed_page_size: compressed.ok_or_else(|| missing("PageLocation", 2))?,
+        first_row_index: first_row.ok_or_else(|| missing("PageLocation", 3))?,
+    })
+}
+
+pub fn read_offset_index(cur: &mut Cursor<'_>) -> Result<OffsetIndex> {
+    let mut page_locations = None;
+    let mut unencoded = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::List) => {
+                page_locations = Some(read_list_struct(cur, read_page_location)?);
+            }
+            (2, FieldType::List) => unencoded = Some(read_list_i64(cur)?),
+            _ => return Err(unknown("OffsetIndex", h.id)),
+        }
+    }
+    Ok(OffsetIndex {
+        page_locations: page_locations.ok_or_else(|| missing("OffsetIndex", 1))?,
+        unencoded_byte_array_data_bytes: unencoded,
+    })
+}
+
+pub fn read_column_index<'a>(cur: &mut Cursor<'a>) -> Result<ColumnIndex<'a>> {
+    let mut null_pages = None;
+    let mut min_values = None;
+    let mut max_values = None;
+    let mut boundary_order = None;
+    let mut null_counts = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::List) => null_pages = Some(read_list_bool(cur)?),
+            (2, FieldType::List) => min_values = Some(read_list_binary(cur)?),
+            (3, FieldType::List) => max_values = Some(read_list_binary(cur)?),
+            (4, FieldType::I32) => boundary_order = Some(BoundaryOrder::read(cur)?),
+            (5, FieldType::List) => null_counts = Some(read_list_i64(cur)?),
+            _ => return Err(unknown("ColumnIndex", h.id)),
+        }
+    }
+    Ok(ColumnIndex {
+        null_pages: null_pages.ok_or_else(|| missing("ColumnIndex", 1))?,
+        min_values: min_values.ok_or_else(|| missing("ColumnIndex", 2))?,
+        max_values: max_values.ok_or_else(|| missing("ColumnIndex", 3))?,
+        boundary_order: boundary_order.ok_or_else(|| missing("ColumnIndex", 4))?,
+        null_counts,
     })
 }
 

@@ -1,51 +1,104 @@
 # ematix-parquet
 
-A hand-rolled Parquet decoder in Rust, built for AArch64 (NEON) and
-focused on **fused predicate evaluation** — the decode loop produces a
-match-bitmap in the same pass that unpacks bit-packed values, instead
-of materialising every value and filtering afterwards.
+A hand-rolled Apache Parquet decoder in Rust, optimised for AArch64
+(NEON) and analytical query workloads. Goal: a self-contained read
+(soon also write) path that competes with `parquet-rs` on the shapes
+where most analytical queries actually live.
 
 Sibling project to [ematix-flow](https://github.com/ryan-evans-git/ematix-flow);
-designed to be a clean drop-in alternative to `parquet-rs` for
-analytical workloads where most pages are predicate-filtered before
-they reach a downstream aggregator.
+designed to be a clean drop-in alternative for high-throughput
+columnar scans.
 
 ## Status
 
-Experimental. API is moving. Pinned by SHA from downstream consumers
-until the bridge surface settles.
+`v0.0.1` — pre-1.0, API still moving. Read path is feature-complete
+for the most common Parquet shapes; write path is the headline open
+item for v1.0. Downstream consumers should pin by SHA.
 
-Coverage today:
+## What's implemented
 
-- **Reader**: file footer + row-group + column-chunk + page-header parse
-  (Thrift compact protocol, hand-written varint readers).
-- **Decoders**: PLAIN, RLE/bit-packed hybrid (definition + repetition
-  levels and dictionary indices), DELTA_BINARY_PACKED,
-  DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY.
-- **Compression**: Snappy, Zstd, Uncompressed.
-- **Bit-unpackers**: NEON kernels for bw=12 (date-shaped columns) and
-  bw=17 (price/key-shaped columns), with a generic scalar fallback for
-  all other widths.
-- **Predicate-fused decode**: `decode_rle_dictionary_predicate_bitmap_bw12`
-  performs RLE-walk + dict-index gather + dictionary value comparison +
-  bitmap pack in a single NEON loop.
-- **Sparse gather**: `gather_dict_at_bitmap_into<T>` reads only the
-  dictionary entries selected by an upstream bitmap, with 8-row
-  bitmap-byte skip for cold selectivity.
-- **Page index / column index**: parsed; pruning is wired but
-  workload-dependent (uniform-distribution columns won't benefit).
+### Read path
 
-Not implemented:
+**Physical types** — INT32, INT64, FLOAT, DOUBLE, BOOLEAN, BYTE_ARRAY
+(INT96 and FIXED_LEN_BYTE_ARRAY parsed in metadata but not yet
+decoded).
 
-- Writers. This is a read path only.
-- DELTA_LENGTH_BYTE_ARRAY writes, BYTE_STREAM_SPLIT, BROTLI/LZ4_RAW,
-  encrypted modules, Bloom filters.
-- Non-NEON SIMD targets (x86 AVX2/AVX-512). Scalar fallback works on
-  any target.
+**Encodings** — PLAIN, PLAIN_DICTIONARY, RLE_DICTIONARY (with the RLE +
+bit-pack hybrid for dictionary indices and definition / repetition
+levels), DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY.
 
-## Crates
+**Compression** — Snappy (hand-rolled fast path + `snap` fallback),
+Zstd, Uncompressed. Gzip / Brotli / LZ4 are stubs for v1.0.
 
-The workspace publishes three crates with sharp boundaries:
+**Metadata** — Thrift compact-protocol parse of file footer, row
+groups, column chunks, page headers, schema (logical + converted
+types), statistics (min / max / null count). Page index + column
+index parsed; pruning is wired but only fires when stats are tight
+enough to skip pages.
+
+### Performance
+
+**SIMD bit-unpackers (NEON, AArch64)** —
+- bw=12: hot for date columns (`l_shipdate`, `l_commitdate`,
+  `l_receiptdate`) — ~10× the scalar baseline.
+- bw=17: hot for price / key columns (`l_extendedprice`,
+  `l_partkey`, `l_orderkey`) — ~11× on the dominant gather width.
+
+**Scalar fallback** — const-generic per-bit-width macro-unrolled
+unpacker covers every bit-width from 1 to 32 on every target.
+Compiles to per-width inlined loops; benefits from LLVM
+auto-vectorisation on a wide range of widths even without hand-rolled
+SIMD.
+
+**Predicate-fused decode** —
+`decode_rle_dictionary_predicate_bitmap_bw12` performs the RLE
+walk + dict-index gather + dictionary-value comparison + bitmap
+pack in a single NEON loop. The point is to never materialise the
+~98% of values a selective predicate is going to throw away.
+
+**Sparse gather** — `gather_dict_at_bitmap_into<T>` reads only the
+dictionary entries selected by an upstream bitmap, with an 8-row
+bitmap-byte skip for cold selectivity. Pairs with the fused decode
+to keep the slow path off the hot loop.
+
+### Test coverage
+
+Oracle tests compare every decoder against `parquet-rs` on real
+TPC-H SF=1 lineitem.parquet (and synthetic round-trips written by
+`parquet-rs`):
+
+- `lineitem_full_column_oracle` — INT64 full column-chunk parity
+- `lineitem_dict_oracle` — dictionary-encoded column parity
+- `lineitem_byte_array_oracle` — BYTE_ARRAY parity
+- `lineitem_multi_column_oracle` — Q14-shape end-to-end parity
+- `delta_real_file_oracle` — `parquet-rs` writes DELTA_BINARY_PACKED →
+  ours reads
+- `zstd_real_file_oracle` — `parquet-rs` writes Zstd → ours reads
+- `page_index_real_file_oracle` — column-index range selection parity
+
+Plus ~20 unit tests across compression, dict, delta, bitpack, levels,
+page index, predicate fusion.
+
+### Benchmarks
+
+Under `crates/ematix-parquet-codec/examples/`:
+
+| Example              | What it shows                                                           |
+| -------------------- | ----------------------------------------------------------------------- |
+| `bench_decode`       | End-to-end column decode vs `parquet-rs` and `polars` for i64/i32/utf8 |
+| `bench_late_mat`     | Q14 predicate via late materialisation: ~14.6 ms end-to-end (TPC-H SF=1) |
+| `bench_unpack`       | Bit-unpack microbench across widths 1–32 (drives SIMD ROI calls)        |
+| `bench_snappy`       | Snappy decompression vs `snap` crate                                    |
+| `probe_bitwidths`    | Reports actual bit-widths per column on a given Parquet file            |
+
+The Q14 win comes from the fused decode path: a single NEON loop
+unpacks + filters + packs a bitmap, then a sparse gather visits only
+the matching rows. Same techniques apply to any selective scan, not
+just Q14 — but Q14 is what we've benchmarked end-to-end so far.
+
+## Crate layout
+
+Three crates with sharp boundaries:
 
 | Crate                    | Purpose                                                |
 | ------------------------ | ------------------------------------------------------ |
@@ -53,44 +106,51 @@ The workspace publishes three crates with sharp boundaries:
 | `ematix-parquet-io`      | File / page-header reading on top of `std::io::Read`   |
 | `ematix-parquet-codec`   | Column decoders, bit-unpackers, compression, NEON kernels |
 
-`format` has no dependencies beyond `std`. `io` depends on `format`.
-`codec` depends on `format` (for types) but not `io` (so it can be
-fed bytes from any source — mmap, network, in-memory test buffer).
+`format` has no deps beyond `std`. `io` depends on `format`. `codec`
+depends on `format` (for types) but not `io` — so codec can be fed
+bytes from any source (mmap, network, in-memory test buffer).
 
 ## Using it
 
-Right now, as a git dependency:
+As a git dependency (pin to a SHA; the API is moving):
 
 ```toml
 [dependencies]
-ematix-parquet-codec = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "<sha>" }
+ematix-parquet-codec  = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "<sha>" }
 ematix-parquet-format = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "<sha>" }
-ematix-parquet-io = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "<sha>" }
+ematix-parquet-io     = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "<sha>" }
 ```
 
-Pin to a specific SHA — the API is not yet stable. crates.io
-publishing is planned once the surface settles.
+Today the public surface is low-level: `ParquetFile::open` → iterate
+row groups → iterate column chunks → `PageWalker` over the chunk →
+match encoding → decompress → decode. A higher-level façade
+(`read_column<T>(file, rg, col) -> Iter<T>`) lands in v1.0.
 
-The canonical integration example is `ematix-flow`'s
+The canonical integration example is ematix-flow's
 [`ematix_parquet_bridge.rs`](https://github.com/ryan-evans-git/ematix-flow/blob/main/crates/ematix-flow-core/src/ematix_parquet_bridge.rs),
 which produces Arrow `RecordBatch`es from ematix-parquet column chunks
 without going through `parquet-rs`'s `ParquetRecordBatchReader`.
 
-## Why another Parquet library
+## Roadmap to v1.0
 
-`parquet-rs` is mature, complete, and the right default. ematix-parquet
-exists for one specific shape of workload: **predicate-heavy analytical
-scans on AArch64 where the predicate is cheap relative to dictionary
-materialisation**. The Q14 lever in ematix-flow ran:
+| Item                                                               | Status   |
+| ------------------------------------------------------------------ | -------- |
+| Read: numeric + bool + byte_array, PLAIN + dict + DELTA, Snappy + Zstd | Done     |
+| NEON kernels for hot bit-widths (12, 17)                           | Done     |
+| Oracle test suite vs `parquet-rs` on real TPC-H lineitem            | Done     |
+| Predicate-fused decode + sparse gather                             | Done     |
+| **High-level `read_column<T>` façade**                             | Open     |
+| **Write path (PLAIN + dict + Snappy + footer write)**              | Open     |
+| Round-trip oracle (ours writes → ours reads, parity vs `parquet-rs`) | Open     |
+| GZIP / Brotli / LZ4 / LZ4_RAW compression                          | Open     |
+| INT96 + FIXED_LEN_BYTE_ARRAY decoders                              | Open     |
+| BYTE_STREAM_SPLIT encoding                                         | Open     |
+| Bloom-filter decoder                                               | Open     |
+| NEON kernels for mid-range widths (1, 4, 5, 8, 18, 20, 21)          | Open     |
 
-- parquet-rs (decode → arrow → filter): ~31 ms
-- ematix-parquet (fused decode-and-filter, sparse gather): ~14.6 ms
-  end-to-end on TPC-H SF=1 lineitem (~6M rows, ~1.26% selectivity)
-
-The win comes from never materialising the 98.74% of values that the
-predicate is going to throw out. There's no magic — it's just that a
-fused loop avoids two passes over the data and lets the bitmap pack
-inline with the unpack.
+Not on the v1.0 path: encrypted modules, async / object-store
+integration (the `io` crate is sync over `Read`), x86 SIMD targets
+(scalar fallback works on any target; NEON is the only hand-tuned path).
 
 ## Build
 
@@ -100,7 +160,7 @@ cargo test
 ```
 
 Requires AArch64 for the NEON kernels; on other targets the scalar
-fallback is used.
+fallback is used and tests still pass.
 
 ## License
 

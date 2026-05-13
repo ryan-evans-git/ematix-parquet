@@ -10,3 +10,9 @@ description = "Hand-rolled Apache Thrift compact-protocol decoder and Parquet fo
 
 [lib]
 name = "ematix_parquet_format"
+
+[dev-dependencies]
+# Byte-identical correctness oracle. Used only by tests/oracle.rs to
+# decode the same parquet footer via parquet-rs and assert field-by-
+# field equality with our decoder. Lib consumers do not see this.
+parquet = { version = "58", default-features = false }

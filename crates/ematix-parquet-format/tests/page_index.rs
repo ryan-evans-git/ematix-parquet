@@ -12,8 +12,7 @@ use common::CompactBuilder;
 use ematix_parquet_format::compact::{read_list_bool, Cursor, FieldType};
 use ematix_parquet_format::error::FormatError;
 use ematix_parquet_format::metadata::{
-    read_column_index, read_offset_index, read_page_location, ColumnIndex, OffsetIndex,
-    PageLocation,
+    read_column_index, read_offset_index, read_page_location, PageLocation,
 };
 use ematix_parquet_format::types::BoundaryOrder;
 

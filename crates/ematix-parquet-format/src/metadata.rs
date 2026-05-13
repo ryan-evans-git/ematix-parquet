@@ -35,6 +35,12 @@ pub struct Statistics<'a> {
     pub distinct_count: Option<i64>,
     pub max_value: Option<&'a [u8]>,
     pub min_value: Option<&'a [u8]>,
+    /// Whether the stored `max_value` is the exact maximum (true) or
+    /// a truncated/approximate upper bound (false). Added in parquet
+    /// 2.9. Absent for older writers.
+    pub is_max_value_exact: Option<bool>,
+    /// Same idea for `min_value`.
+    pub is_min_value_exact: Option<bool>,
 }
 
 /// File-level user-defined metadata entry. `value` is optional per spec.
@@ -722,10 +728,18 @@ pub struct PageEncodingStats {
     pub count: i32,
 }
 
-/// Per-column-chunk descriptor. Fields 16/17 (SizeStatistics,
-/// GeospatialStatistics) from newer spec revisions are not yet
-/// modeled and will error as `UnknownStructField`. Bloom-filter
-/// fields are present.
+/// Per-page byte/level-histogram size statistics. Optional add-on
+/// to `ColumnMetaData` (field 16) and `OffsetIndex` (subset).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SizeStatistics {
+    pub unencoded_byte_array_data_bytes: Option<i64>,
+    pub repetition_level_histogram: Option<Vec<i64>>,
+    pub definition_level_histogram: Option<Vec<i64>>,
+}
+
+/// Per-column-chunk descriptor. Field 17 (GeospatialStatistics) and
+/// the ColumnCryptoMetaData union are not yet modeled and will error
+/// as `UnknownStructField`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnMetaData<'a> {
     pub column_type: ParquetType,
@@ -743,6 +757,7 @@ pub struct ColumnMetaData<'a> {
     pub encoding_stats: Option<Vec<PageEncodingStats>>,
     pub bloom_filter_offset: Option<i64>,
     pub bloom_filter_length: Option<i32>,
+    pub size_statistics: Option<SizeStatistics>,
 }
 
 /// Top-level chunk descriptor in `RowGroup.columns`. Fields 8/9
@@ -757,6 +772,27 @@ pub struct ColumnChunk<'a> {
     pub offset_index_length: Option<i32>,
     pub column_index_offset: Option<i64>,
     pub column_index_length: Option<i32>,
+}
+
+pub fn read_size_statistics(cur: &mut Cursor<'_>) -> Result<SizeStatistics> {
+    let mut unencoded = None;
+    let mut rep_hist = None;
+    let mut def_hist = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::I64) => unencoded = Some(read_zigzag_i64(cur)?),
+            (2, FieldType::List) => rep_hist = Some(read_list_i64(cur)?),
+            (3, FieldType::List) => def_hist = Some(read_list_i64(cur)?),
+            _ => return Err(unknown("SizeStatistics", h.id)),
+        }
+    }
+    Ok(SizeStatistics {
+        unencoded_byte_array_data_bytes: unencoded,
+        repetition_level_histogram: rep_hist,
+        definition_level_histogram: def_hist,
+    })
 }
 
 pub fn read_page_encoding_stats(cur: &mut Cursor<'_>) -> Result<PageEncodingStats> {
@@ -796,6 +832,7 @@ pub fn read_column_metadata<'a>(cur: &mut Cursor<'a>) -> Result<ColumnMetaData<'
     let mut encoding_stats = None;
     let mut bloom_offset = None;
     let mut bloom_length = None;
+    let mut size_statistics = None;
     let mut prev = 0;
     while let Some(h) = read_field_header(cur, prev)? {
         prev = h.id;
@@ -824,6 +861,7 @@ pub fn read_column_metadata<'a>(cur: &mut Cursor<'a>) -> Result<ColumnMetaData<'
             }
             (14, FieldType::I64) => bloom_offset = Some(read_zigzag_i64(cur)?),
             (15, FieldType::I32) => bloom_length = Some(read_zigzag_i32(cur)?),
+            (16, FieldType::Struct) => size_statistics = Some(read_size_statistics(cur)?),
             _ => return Err(unknown("ColumnMetaData", h.id)),
         }
     }
@@ -844,6 +882,7 @@ pub fn read_column_metadata<'a>(cur: &mut Cursor<'a>) -> Result<ColumnMetaData<'
         encoding_stats,
         bloom_filter_offset: bloom_offset,
         bloom_filter_length: bloom_length,
+        size_statistics,
     })
 }
 
@@ -1039,6 +1078,10 @@ pub fn read_statistics<'a>(cur: &mut Cursor<'a>) -> Result<Statistics<'a>> {
             (4, FieldType::I64) => stats.distinct_count = Some(read_zigzag_i64(cur)?),
             (5, FieldType::Binary) => stats.max_value = Some(read_binary(cur)?),
             (6, FieldType::Binary) => stats.min_value = Some(read_binary(cur)?),
+            (7, FieldType::BoolTrue) => stats.is_max_value_exact = Some(true),
+            (7, FieldType::BoolFalse) => stats.is_max_value_exact = Some(false),
+            (8, FieldType::BoolTrue) => stats.is_min_value_exact = Some(true),
+            (8, FieldType::BoolFalse) => stats.is_min_value_exact = Some(false),
             _ => {
                 return Err(FormatError::UnknownStructField {
                     struct_name: "Statistics",

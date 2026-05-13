@@ -144,6 +144,26 @@ pub fn read_field_header(cur: &mut Cursor<'_>, prev_id: i16) -> Result<Option<Fi
     Ok(Some(FieldHeader { id, field_type }))
 }
 
+/// Read a thrift compact list header.
+///
+/// Wire form: one header byte `(size_or_F << 4) | element_type`.
+/// If the high nibble is `0xF` the count overflows 4 bits and follows
+/// as a `uvarint`. Returns `(count, element_type)`. The caller is
+/// responsible for decoding `count` elements of the matching type —
+/// list elements carry no per-element headers.
+pub fn read_list_header(cur: &mut Cursor<'_>) -> Result<(usize, FieldType)> {
+    let header = cur.read_u8()?;
+    let type_nibble = header & 0x0F;
+    let high = (header & 0xF0) >> 4;
+    let element_type = decode_field_type(type_nibble)?;
+    let count = if high < 0x0F {
+        high as usize
+    } else {
+        read_uvarint(cur)? as usize
+    };
+    Ok((count, element_type))
+}
+
 /// Read a length-prefixed byte string from the cursor.
 ///
 /// Compact protocol encodes Binary (and String) as `uvarint(len)` then

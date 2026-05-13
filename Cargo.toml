@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/ematix-parquet-format"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/ryan-evans-git/ematix-parquet"
+authors = ["Ryan Evans <ryanevans23@gmail.com>"]
+
+[workspace.dependencies]

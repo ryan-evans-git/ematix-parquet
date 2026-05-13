@@ -6,6 +6,10 @@ pub enum FormatError {
     VarintOverflow,
     InvalidEnumValue { type_name: &'static str, value: i32 },
     InvalidFieldType(u8),
+    UnknownStructField {
+        struct_name: &'static str,
+        field_id: i16,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -20,6 +24,9 @@ impl fmt::Display for FormatError {
                 write!(f, "invalid {type_name} discriminant: {value}")
             }
             Self::InvalidFieldType(b) => write!(f, "invalid compact field type nibble: {b:#x}"),
+            Self::UnknownStructField { struct_name, field_id } => {
+                write!(f, "{struct_name}: unknown field id {field_id}")
+            }
         }
     }
 }

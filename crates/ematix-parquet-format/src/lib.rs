@@ -16,4 +16,5 @@
 
 pub mod compact;
 pub mod error;
+pub mod metadata;
 pub mod types;

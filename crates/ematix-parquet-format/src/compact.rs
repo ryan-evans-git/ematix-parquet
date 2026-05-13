@@ -43,6 +43,19 @@ impl<'a> Cursor<'a> {
         self.pos += 1;
         Ok(b)
     }
+
+    /// Take a zero-copy slice of `n` bytes and advance past them.
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.remaining() < n {
+            return Err(FormatError::UnexpectedEof {
+                needed: n,
+                remaining: self.remaining(),
+            });
+        }
+        let s = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
 }
 
 /// Read an unsigned LEB128 varint. Caller chooses the result width.
@@ -129,6 +142,16 @@ pub fn read_field_header(cur: &mut Cursor<'_>, prev_id: i16) -> Result<Option<Fi
         prev_id + delta as i16
     };
     Ok(Some(FieldHeader { id, field_type }))
+}
+
+/// Read a length-prefixed byte string from the cursor.
+///
+/// Compact protocol encodes Binary (and String) as `uvarint(len)` then
+/// `len` raw bytes. Zero-copy: the returned slice borrows from the
+/// cursor's buffer.
+pub fn read_binary<'a>(cur: &mut Cursor<'a>) -> Result<&'a [u8]> {
+    let len = read_uvarint(cur)? as usize;
+    cur.take(len)
 }
 
 fn decode_field_type(nibble: u8) -> Result<FieldType> {

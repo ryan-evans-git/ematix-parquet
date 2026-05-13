@@ -45,10 +45,18 @@ use crate::error::{CodecError, Result};
 /// range; downcast back to i32 on emit.
 pub fn decode_delta_i32(bytes: &[u8]) -> Result<Vec<i32>> {
     let mut cur = Cursor::new(bytes);
-    let block_size = read_uvarint(&mut cur)? as usize;
-    let mini_blocks_per_block = read_uvarint(&mut cur)? as usize;
-    let num_values = read_uvarint(&mut cur)? as usize;
-    let first_value = read_zigzag_i32(&mut cur)?;
+    decode_delta_i32_from(&mut cur)
+}
+
+/// Cursor-driven variant. Reads a single DELTA_BINARY_PACKED stream
+/// from the current position and leaves the cursor pointing one past
+/// the last consumed byte. Useful when the DELTA stream is embedded
+/// in a larger payload (e.g. DELTA_LENGTH_BYTE_ARRAY).
+pub fn decode_delta_i32_from(cur: &mut Cursor<'_>) -> Result<Vec<i32>> {
+    let block_size = read_uvarint(cur)? as usize;
+    let mini_blocks_per_block = read_uvarint(cur)? as usize;
+    let num_values = read_uvarint(cur)? as usize;
+    let first_value = read_zigzag_i32(cur)?;
 
     if num_values == 0 {
         return Ok(Vec::new());
@@ -71,7 +79,7 @@ pub fn decode_delta_i32(bytes: &[u8]) -> Result<Vec<i32>> {
     let mut unpack_buf: Vec<u32> = Vec::with_capacity(mini_block_size);
 
     while remaining > 0 {
-        let block_min_delta = read_zigzag_i64(&mut cur)?;
+        let block_min_delta = read_zigzag_i64(cur)?;
 
         // Read mini_blocks_per_block bit_width bytes up front; readers
         // need them all to know how far to jump per mini-block.
@@ -119,10 +127,15 @@ pub fn decode_delta_i32(bytes: &[u8]) -> Result<Vec<i32>> {
 /// would need a u64-output unpacker (TODO).
 pub fn decode_delta_i64(bytes: &[u8]) -> Result<Vec<i64>> {
     let mut cur = Cursor::new(bytes);
-    let block_size = read_uvarint(&mut cur)? as usize;
-    let mini_blocks_per_block = read_uvarint(&mut cur)? as usize;
-    let num_values = read_uvarint(&mut cur)? as usize;
-    let first_value = read_zigzag_i64(&mut cur)?;
+    decode_delta_i64_from(&mut cur)
+}
+
+/// Cursor-driven variant of [`decode_delta_i64`].
+pub fn decode_delta_i64_from(cur: &mut Cursor<'_>) -> Result<Vec<i64>> {
+    let block_size = read_uvarint(cur)? as usize;
+    let mini_blocks_per_block = read_uvarint(cur)? as usize;
+    let num_values = read_uvarint(cur)? as usize;
+    let first_value = read_zigzag_i64(cur)?;
 
     if num_values == 0 {
         return Ok(Vec::new());
@@ -145,7 +158,7 @@ pub fn decode_delta_i64(bytes: &[u8]) -> Result<Vec<i64>> {
     let mut unpack_buf: Vec<u32> = Vec::with_capacity(mini_block_size);
 
     while remaining > 0 {
-        let block_min_delta = read_zigzag_i64(&mut cur)? as i128;
+        let block_min_delta = read_zigzag_i64(cur)? as i128;
 
         let mut bit_widths: [u8; 64] = [0u8; 64];
         if mini_blocks_per_block > bit_widths.len() {
@@ -188,4 +201,75 @@ pub fn decode_delta_i64(bytes: &[u8]) -> Result<Vec<i64>> {
 
 fn delta_err(msg: &str) -> CodecError {
     CodecError::Decompress(format!("DELTA_BINARY_PACKED: {msg}"))
+}
+
+/// Decode a DELTA_LENGTH_BYTE_ARRAY stream.
+///
+/// Wire format:
+///   <lengths: DELTA_BINARY_PACKED INT32 stream of value lengths>
+///   <data:    concatenated value bytes, in order>
+///
+/// Returns owned bytes per value (the caller usually pushes these
+/// into a column buffer; we don't try to borrow from `bytes` because
+/// callers typically own a decompressed Vec<u8> and want owned output
+/// to avoid lifetime entanglement with the page buffer).
+pub fn decode_delta_length_byte_array(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut cur = Cursor::new(bytes);
+    let lengths = decode_delta_i32_from(&mut cur)?;
+
+    let mut out = Vec::with_capacity(lengths.len());
+    for len in lengths {
+        if len < 0 {
+            return Err(delta_byte_err("negative length"));
+        }
+        let slice = cur.take(len as usize)?;
+        out.push(slice.to_vec());
+    }
+    Ok(out)
+}
+
+/// Decode a DELTA_BYTE_ARRAY stream (incremental / shared-prefix
+/// string encoding).
+///
+/// Wire format:
+///   <prefix_lengths: DELTA_BINARY_PACKED INT32>
+///   <suffix_lengths: DELTA_BINARY_PACKED INT32>
+///   <suffix_bytes:   concatenated suffix bytes, in order>
+///
+/// Reconstruction: value[i] = prev[..prefix_len[i]] ++ suffix_bytes[i].
+/// `prev` starts empty.
+pub fn decode_delta_byte_array(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut cur = Cursor::new(bytes);
+    let prefix_lengths = decode_delta_i32_from(&mut cur)?;
+    let suffix_lengths = decode_delta_i32_from(&mut cur)?;
+
+    if prefix_lengths.len() != suffix_lengths.len() {
+        return Err(delta_byte_err(
+            "prefix_lengths and suffix_lengths length mismatch",
+        ));
+    }
+
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(prefix_lengths.len());
+    let mut prev: Vec<u8> = Vec::new();
+    for (pfx, sfx) in prefix_lengths.into_iter().zip(suffix_lengths.into_iter()) {
+        if pfx < 0 || sfx < 0 {
+            return Err(delta_byte_err("negative length"));
+        }
+        let pfx = pfx as usize;
+        let sfx = sfx as usize;
+        if pfx > prev.len() {
+            return Err(delta_byte_err("prefix_length exceeds prior value length"));
+        }
+        let suffix = cur.take(sfx)?;
+        let mut value = Vec::with_capacity(pfx + sfx);
+        value.extend_from_slice(&prev[..pfx]);
+        value.extend_from_slice(suffix);
+        prev = value.clone();
+        out.push(value);
+    }
+    Ok(out)
+}
+
+fn delta_byte_err(msg: &str) -> CodecError {
+    CodecError::Decompress(format!("DELTA_BYTE_ARRAY: {msg}"))
 }

@@ -1,27 +1,28 @@
 //! Minimum-viable Parquet writer.
 //!
-//! `write_i64_column_to_path(path, name, values)` produces a complete
-//! `.parquet` file with one row group, one column, uncompressed PLAIN
-//! encoding, no dictionary, no rep/def levels (required column).
+//! `write_{i32,i64,f64,bool,byte_array}_column_to_path(path, name, values)`
+//! each produce a complete `.parquet` file with one row group, one
+//! column, uncompressed PLAIN encoding, no dictionary, no rep/def
+//! levels (REQUIRED column).
 //!
 //! Layout produced:
 //!
 //! ```text
 //!   [PAR1]                       4 bytes
 //!   [DataPage Header (thrift)]   variable
-//!   [DataPage Body (PLAIN i64)]  values.len() * 8 bytes
+//!   [DataPage Body (PLAIN T)]    variable
 //!   [FileMetaData (thrift)]      variable
 //!   [footer length (u32 LE)]     4 bytes
 //!   [PAR1]                       4 bytes
 //! ```
 //!
-//! Round-trip oracle: write a known `Vec<i64>` → read back with
-//! `parquet-rs` → assert byte-for-byte equality. See `tests/write_*`.
+//! Round-trip oracle: write a known `Vec<T>` → read back with
+//! `parquet-rs` AND with our own Π.1 façade → assert equality.
+//! See `tests/write_*_oracle`.
 //!
-//! Π.2a focuses on the smallest shape that proves the protocol-level
-//! machinery is correct. Compression, dictionary encoding, multiple
-//! columns, multiple row groups, and the f64 / i32 / bool / byte_array
-//! variants follow as additive work in Π.2b / Π.2c.
+//! Π.2a/Π.2b focus on the smallest shape that proves the protocol-
+//! level machinery is correct. Compression (Snappy/Zstd), dictionary
+//! encoding, and multi-column writes follow in Π.2c+.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -40,53 +41,130 @@ use crate::error::{CodecError, Result};
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 
-/// Write a single-column Parquet file containing `values` as a
-/// REQUIRED INT64 column named `column_name`. PLAIN encoding,
-/// uncompressed, no dictionary, single row group.
+// ---- Public per-type entry points -----------------------------------
+
+/// Write a single-column INT64 file (PLAIN, uncompressed, REQUIRED).
 pub fn write_i64_column_to_path(
     path: impl AsRef<Path>,
     column_name: &str,
     values: &[i64],
 ) -> Result<()> {
+    let body = encode_plain_i64(values);
+    write_to_path(path, column_name, ParquetType::Int64, values.len(), body)
+}
+
+/// Write a single-column INT32 file (PLAIN, uncompressed, REQUIRED).
+pub fn write_i32_column_to_path(
+    path: impl AsRef<Path>,
+    column_name: &str,
+    values: &[i32],
+) -> Result<()> {
+    let body = encode_plain_i32(values);
+    write_to_path(path, column_name, ParquetType::Int32, values.len(), body)
+}
+
+/// Write a single-column DOUBLE file (PLAIN, uncompressed, REQUIRED).
+pub fn write_f64_column_to_path(
+    path: impl AsRef<Path>,
+    column_name: &str,
+    values: &[f64],
+) -> Result<()> {
+    let body = encode_plain_f64(values);
+    write_to_path(path, column_name, ParquetType::Double, values.len(), body)
+}
+
+/// Write a single-column BOOLEAN file (PLAIN bit-packed, uncompressed,
+/// REQUIRED).
+pub fn write_bool_column_to_path(
+    path: impl AsRef<Path>,
+    column_name: &str,
+    values: &[bool],
+) -> Result<()> {
+    let body = encode_plain_bool(values);
+    write_to_path(path, column_name, ParquetType::Boolean, values.len(), body)
+}
+
+/// Write a single-column BYTE_ARRAY file (PLAIN length-prefixed,
+/// uncompressed, REQUIRED). Each value is `u32_le length || bytes`.
+pub fn write_byte_array_column_to_path(
+    path: impl AsRef<Path>,
+    column_name: &str,
+    values: &[&[u8]],
+) -> Result<()> {
+    let body = encode_plain_byte_array(values);
+    write_to_path(path, column_name, ParquetType::ByteArray, values.len(), body)
+}
+
+// ---- Public `Write`-sink variants (in-memory friendly) --------------
+
+pub fn write_i64_column<W: Write>(out: &mut W, name: &str, values: &[i64]) -> Result<()> {
+    let body = encode_plain_i64(values);
+    write_single_column(out, name, ParquetType::Int64, values.len(), body)
+}
+
+pub fn write_i32_column<W: Write>(out: &mut W, name: &str, values: &[i32]) -> Result<()> {
+    let body = encode_plain_i32(values);
+    write_single_column(out, name, ParquetType::Int32, values.len(), body)
+}
+
+pub fn write_f64_column<W: Write>(out: &mut W, name: &str, values: &[f64]) -> Result<()> {
+    let body = encode_plain_f64(values);
+    write_single_column(out, name, ParquetType::Double, values.len(), body)
+}
+
+pub fn write_bool_column<W: Write>(out: &mut W, name: &str, values: &[bool]) -> Result<()> {
+    let body = encode_plain_bool(values);
+    write_single_column(out, name, ParquetType::Boolean, values.len(), body)
+}
+
+pub fn write_byte_array_column<W: Write>(out: &mut W, name: &str, values: &[&[u8]]) -> Result<()> {
+    let body = encode_plain_byte_array(values);
+    write_single_column(out, name, ParquetType::ByteArray, values.len(), body)
+}
+
+// ---- File-path wrapper ----------------------------------------------
+
+fn write_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    parquet_type: ParquetType,
+    num_values: usize,
+    body: Vec<u8>,
+) -> Result<()> {
     let f = File::create(path.as_ref()).map_err(io_to_codec)?;
     let mut w = BufWriter::new(f);
-    write_i64_column(&mut w, column_name, values)?;
+    write_single_column(&mut w, name, parquet_type, num_values, body)?;
     w.flush().map_err(io_to_codec)?;
     Ok(())
 }
 
-/// Same as `write_i64_column_to_path` but writes to an arbitrary
-/// `Write` sink. Useful for in-memory round-trip tests.
-pub fn write_i64_column<W: Write>(
+// ---- Shared file-skeleton writer ------------------------------------
+
+/// Stamps PAR1 + one DataPage + footer + footer-len + PAR1 into `out`.
+/// Type-agnostic: callers pass the encoded PLAIN body and the
+/// matching `ParquetType` for the schema leaf.
+fn write_single_column<W: Write>(
     out: &mut W,
     column_name: &str,
-    values: &[i64],
+    parquet_type: ParquetType,
+    num_values: usize,
+    body: Vec<u8>,
 ) -> Result<()> {
-    // ---- 1) Magic header ----
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
     let mut written: u64 = 4;
 
-    // ---- 2) Data page ----
-    // Body: PLAIN i64 = each value as little-endian 8 bytes.
-    let mut body = Vec::with_capacity(values.len() * 8);
-    for &v in values {
-        body.extend_from_slice(&v.to_le_bytes());
-    }
     let body_len = body.len() as i32;
 
-    // Header for the data page. Encodings on rep/def levels are
-    // declared as RLE per spec even when no levels are emitted; the
-    // body simply has zero bytes of level data ahead of the value
-    // stream. For a REQUIRED column, parquet-rs accepts the body
-    // beginning directly with values.
     let data_page_header = PageHeader {
         page_type: PageType::DataPage,
         uncompressed_page_size: body_len,
         compressed_page_size: body_len,
         crc: None,
         data_page_header: Some(DataPageHeader {
-            num_values: values.len() as i32,
+            num_values: num_values as i32,
             encoding: Encoding::Plain,
+            // Rep/def encodings are declared as RLE per spec, even for
+            // REQUIRED columns where no level bytes are emitted.
             definition_level_encoding: Encoding::Rle,
             repetition_level_encoding: Encoding::Rle,
             statistics: None,
@@ -103,10 +181,8 @@ pub fn write_i64_column<W: Write>(
     out.write_all(&body).map_err(io_to_codec)?;
     written += body.len() as u64;
 
-    // ---- 3) FileMetaData ----
     let total_uncompressed_size = (header_bytes.len() + body.len()) as i64;
     let total_compressed_size = total_uncompressed_size;
-
     let column_name_bytes = column_name.as_bytes();
 
     let root = SchemaElement {
@@ -122,7 +198,7 @@ pub fn write_i64_column<W: Write>(
         logical_type: None,
     };
     let leaf = SchemaElement {
-        column_type: Some(ParquetType::Int64),
+        column_type: Some(parquet_type),
         type_length: None,
         repetition_type: Some(FieldRepetitionType::Required),
         name: column_name_bytes,
@@ -134,11 +210,11 @@ pub fn write_i64_column<W: Write>(
         logical_type: None,
     };
     let cm = ColumnMetaData {
-        column_type: ParquetType::Int64,
+        column_type: parquet_type,
         encodings: vec![Encoding::Plain, Encoding::Rle],
         path_in_schema: vec![column_name_bytes],
         codec: CompressionCodec::Uncompressed,
-        num_values: values.len() as i64,
+        num_values: num_values as i64,
         total_uncompressed_size,
         total_compressed_size,
         key_value_metadata: None,
@@ -163,7 +239,7 @@ pub fn write_i64_column<W: Write>(
     let rg = RowGroup {
         columns: vec![cc],
         total_byte_size: total_uncompressed_size,
-        num_rows: values.len() as i64,
+        num_rows: num_values as i64,
         sorting_columns: None,
         file_offset: None,
         total_compressed_size: None,
@@ -172,7 +248,7 @@ pub fn write_i64_column<W: Write>(
     let md = FileMetaData {
         version: 1,
         schema: vec![root, leaf],
-        num_rows: values.len() as i64,
+        num_rows: num_values as i64,
         row_groups: vec![rg],
         key_value_metadata: None,
         created_by: Some(b"ematix-parquet 0.0.1"),
@@ -183,13 +259,62 @@ pub fn write_i64_column<W: Write>(
     out.write_all(&footer).map_err(io_to_codec)?;
     written += footer.len() as u64;
 
-    // ---- 4) Footer length (LE u32) + trailing magic ----
     out.write_all(&footer_len.to_le_bytes()).map_err(io_to_codec)?;
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
     written += 8;
 
     let _ = written;
     Ok(())
+}
+
+// ---- PLAIN body encoders --------------------------------------------
+
+fn encode_plain_i64(values: &[i64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 8);
+    for &v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+fn encode_plain_i32(values: &[i32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for &v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+fn encode_plain_f64(values: &[f64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 8);
+    for &v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// PLAIN boolean: bit-packed, LSB-first within each byte, padded to
+/// `ceil(n / 8)` bytes. Matches `decode_plain_bool`.
+fn encode_plain_bool(values: &[bool]) -> Vec<u8> {
+    let n_bytes = values.len().div_ceil(8);
+    let mut out = vec![0u8; n_bytes];
+    for (i, &v) in values.iter().enumerate() {
+        if v {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
+}
+
+/// PLAIN byte_array: each value is `u32_le length` + raw bytes.
+fn encode_plain_byte_array(values: &[&[u8]]) -> Vec<u8> {
+    let total: usize = 4 * values.len() + values.iter().map(|v| v.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    for v in values {
+        out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        out.extend_from_slice(v);
+    }
+    out
 }
 
 fn io_to_codec(e: std::io::Error) -> CodecError {

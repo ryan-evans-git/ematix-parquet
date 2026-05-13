@@ -13,21 +13,62 @@
 
 use ematix_parquet_format::compact::{read_uvarint, Cursor};
 
+use crate::bitpack::{unpack_indices_into, unpack_lookup_into};
 use crate::error::{CodecError, Result};
-use crate::rle::decode_rle_bit_packed;
 
 /// Decode `num_values` u32 indices from a data-page body that uses
 /// RLE_DICTIONARY (or the legacy PLAIN_DICTIONARY) encoding.
+///
+/// Uses the const-generic per-bit-width unpacker for bit-packed runs;
+/// RLE runs emit a single value repeated. This is the path used by
+/// `DictColumnChunk` construction.
 pub fn decode_rle_dictionary_indices(body: &[u8], num_values: usize) -> Result<Vec<u32>> {
     if body.is_empty() {
         return Err(CodecError::EmptyDictPageBody);
     }
     let bit_width = body[0];
-    let decoded = decode_rle_bit_packed(&body[1..], bit_width, num_values)?;
-    // Spec caps dict indices at 32 bits. Truncating from u64 here is
-    // safe; the caller chose i64 only because the underlying RLE
-    // primitive emits u64 to stay general.
-    Ok(decoded.into_iter().map(|v| v as u32).collect())
+    if bit_width > 32 {
+        return Err(CodecError::BitWidthOutOfRange(bit_width));
+    }
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<u32> = Vec::with_capacity(num_values);
+    if bit_width == 0 {
+        out.resize(num_values, 0);
+        return Ok(out);
+    }
+
+    let value_bytes = (bit_width as usize + 7) / 8;
+    let mut cur = Cursor::new(&body[1..]);
+    let mut emitted = 0usize;
+
+    while emitted < num_values {
+        let header = read_uvarint(&mut cur)?;
+        let is_bit_packed = (header & 1) == 1;
+        let count = (header >> 1) as usize;
+
+        if is_bit_packed {
+            let total = count * 8;
+            let needed = (total * bit_width as usize + 7) / 8;
+            let chunk = cur.take(needed)?;
+            let to_emit = (num_values - emitted).min(total);
+            unpack_indices_into(chunk, to_emit, bit_width, &mut out)?;
+            emitted += to_emit;
+        } else {
+            let value_chunk = cur.take(value_bytes)?;
+            let mut idx: u32 = 0;
+            for j in 0..value_bytes {
+                idx |= (value_chunk[j] as u32) << (j * 8);
+            }
+            let to_emit = (num_values - emitted).min(count);
+            for _ in 0..to_emit {
+                out.push(idx);
+            }
+            emitted += to_emit;
+        }
+    }
+    Ok(out)
 }
 
 /// Fused dict-decode: walk the RLE/bit-packed index stream and look
@@ -76,11 +117,6 @@ pub fn decode_rle_dictionary_into<T: Copy>(
     }
 
     let value_bytes = (bit_width as usize + 7) / 8;
-    let mask: u32 = if bit_width == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bit_width) - 1
-    };
     let mut cur = Cursor::new(&body[1..]);
     let mut emitted = 0usize;
 
@@ -94,52 +130,11 @@ pub fn decode_rle_dictionary_into<T: Copy>(
             let needed = (total * bit_width as usize + 7) / 8;
             let chunk = cur.take(needed)?;
             let to_emit = (num_values - emitted).min(total);
-
-            // Streaming bit buffer: each input byte is read exactly
-            // once, then drained value-by-value via shift+mask. Tight
-            // inner loop, no per-value byte_offset recomputation.
-            let bw = bit_width as u32;
-            let mask64 = mask as u64;
-            let mut buf: u64 = 0;
-            let mut bits: u32 = 0;
-            let mut byte_idx: usize = 0;
-
-            // When the dict covers the full index range (`dict_size >=
-            // 2^bit_width`), the bit mask itself guarantees every
-            // extracted index is in-bounds. Hoist the bounds check
-            // out of the hot loop in that case.
-            let bounds_safe = (mask as usize) < dict_size;
-            if bounds_safe {
-                for _ in 0..to_emit {
-                    while bits < bw {
-                        buf |= (chunk[byte_idx] as u64) << bits;
-                        byte_idx += 1;
-                        bits += 8;
-                    }
-                    let idx = (buf & mask64) as usize;
-                    buf >>= bw;
-                    bits -= bw;
-                    out.push(dict[idx]);
-                }
-            } else {
-                for _ in 0..to_emit {
-                    while bits < bw {
-                        buf |= (chunk[byte_idx] as u64) << bits;
-                        byte_idx += 1;
-                        bits += 8;
-                    }
-                    let idx = (buf & mask64) as usize;
-                    buf >>= bw;
-                    bits -= bw;
-                    if idx >= dict_size {
-                        return Err(CodecError::DictIndexOutOfRange {
-                            index: idx as u32,
-                            dict_size,
-                        });
-                    }
-                    out.push(dict[idx]);
-                }
-            }
+            // Hand off to the const-generic unpacker. For typical
+            // pages (full-page bit-packed run, no truncation needed),
+            // `to_emit == total` and the unpacker processes the
+            // entire run in 32-value chunks with NUM_BITS const-known.
+            unpack_lookup_into(chunk, to_emit, bit_width, dict, out)?;
             emitted += to_emit;
         } else {
             // RLE run: one index repeated `count` times.

@@ -1,0 +1,20 @@
+[package]
+name = "ematix-parquet-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "File handles, byte-range reads, and page-header iteration over Apache Parquet — the I/O layer that sits between ematix-parquet-format (pure decoding) and the page-body codecs."
+
+[lib]
+name = "ematix_parquet_io"
+
+[dependencies]
+ematix-parquet-format = { path = "../ematix-parquet-format" }
+
+[dev-dependencies]
+# `snap` so parquet-rs can fully iterate snappy-compressed pages in
+# the lineitem oracle (lineitem uses snappy by default).
+parquet = { version = "58", default-features = false, features = ["snap"] }

@@ -28,6 +28,15 @@ pub enum CodecError {
     EmptyDictPageBody,
     /// A dictionary index referenced a slot beyond the dict.
     DictIndexOutOfRange { index: u32, dict_size: usize },
+    /// A required input was malformed in a way the lower-level decoder
+    /// errors don't already cover (e.g. row group index out of range,
+    /// page-header missing, file metadata absent).
+    InvalidInput(String),
+    /// The façade hit a code path that isn't yet wired (e.g. an
+    /// encoding or compression codec the dispatcher doesn't handle).
+    /// The lower-level decoder for it may still exist; this just
+    /// means the high-level entry point can't reach it yet.
+    Unsupported(String),
 }
 
 impl fmt::Display for CodecError {
@@ -57,6 +66,8 @@ impl fmt::Display for CodecError {
                 f,
                 "dictionary index {index} ≥ dict size {dict_size}"
             ),
+            Self::InvalidInput(s) => write!(f, "invalid input: {s}"),
+            Self::Unsupported(s) => write!(f, "unsupported: {s}"),
         }
     }
 }

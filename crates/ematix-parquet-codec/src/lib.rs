@@ -27,6 +27,7 @@ pub mod error;
 pub mod levels;
 pub mod page_index;
 pub mod plain;
+pub mod read;
 pub mod rle;
 
 pub use error::{CodecError, Result};

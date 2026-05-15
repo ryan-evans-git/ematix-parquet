@@ -29,13 +29,15 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use ematix_parquet_format::metadata::{
-    ColumnChunk, ColumnMetaData, DataPageHeader, FileMetaData, PageHeader, RowGroup,
-    SchemaElement, Statistics,
+    ColumnChunk, ColumnMetaData, DataPageHeader, DictionaryPageHeader, FileMetaData, PageHeader,
+    RowGroup, SchemaElement, Statistics,
 };
 use ematix_parquet_format::metadata_writer::{write_file_metadata, write_page_header};
 use ematix_parquet_format::types::{
     CompressionCodec, Encoding, FieldRepetitionType, PageType, ParquetType,
 };
+
+use crate::rle::{encode_rle_bit_packed_single_run, min_bit_width_for_dict};
 
 use crate::compression::{
     compress_brotli, compress_gzip, compress_lz4_raw, compress_snappy, compress_zstd,
@@ -945,4 +947,350 @@ fn compress_body(body: &[u8], codec: CompressionCodec) -> Result<Vec<u8>> {
             "compression codec not yet supported on the write path: {other:?}"
         ))),
     }
+}
+
+// ---- Dictionary encoding (Π.4c) -------------------------------------
+//
+// Layout produced for a dict-encoded single-column file:
+//
+//   [PAR1]
+//   [DictPage Header]    page_type=DictionaryPage, encoding=PLAIN
+//   [DictPage Body]      PLAIN-encoded unique values
+//   [DataPage Header]    page_type=DataPage, encoding=PLAIN_DICTIONARY
+//   [DataPage Body]      [bit_width: u8] [RLE/bit-pack indices]
+//   [FileMetaData]       ColumnMetaData.dictionary_page_offset set,
+//                        encodings = [Plain, Rle, PlainDictionary]
+//   [footer length]
+//   [PAR1]
+//
+// Matches what parquet-rs writes for low-cardinality columns. The
+// data-page encoding `PLAIN_DICTIONARY` (id=2) is the legacy id;
+// modern readers (including ours) accept both `PLAIN_DICTIONARY` and
+// `RLE_DICTIONARY` for the data page. We pick the legacy id for
+// maximum reader compatibility.
+
+/// Build a unique-value dictionary preserving first-occurrence order
+/// + per-input indices. Same shape used by every per-type dict
+/// builder below; the closure converts each input element to a
+/// hashable key.
+fn build_dict_with<T, K>(values: &[T], key_of: impl Fn(&T) -> K) -> (Vec<usize>, Vec<u32>)
+where
+    K: Eq + std::hash::Hash,
+{
+    let mut map: std::collections::HashMap<K, u32> = std::collections::HashMap::new();
+    let mut dict_positions: Vec<usize> = Vec::new();
+    let mut indices: Vec<u32> = Vec::with_capacity(values.len());
+    for (ix, v) in values.iter().enumerate() {
+        let key = key_of(v);
+        if let Some(&existing) = map.get(&key) {
+            indices.push(existing);
+        } else {
+            let new_ix = dict_positions.len() as u32;
+            dict_positions.push(ix);
+            map.insert(key, new_ix);
+            indices.push(new_ix);
+        }
+    }
+    (dict_positions, indices)
+}
+
+fn build_dict_i64(values: &[i64]) -> (Vec<i64>, Vec<u32>) {
+    let (positions, indices) = build_dict_with(values, |&x| x);
+    (positions.iter().map(|&p| values[p]).collect(), indices)
+}
+fn build_dict_i32(values: &[i32]) -> (Vec<i32>, Vec<u32>) {
+    let (positions, indices) = build_dict_with(values, |&x| x);
+    (positions.iter().map(|&p| values[p]).collect(), indices)
+}
+fn build_dict_f64(values: &[f64]) -> (Vec<f64>, Vec<u32>) {
+    // f64 isn't `Hash` — bucket by bit pattern instead. NaN with the
+    // same bit pattern collapses to one dict slot; different NaN bit
+    // patterns get separate slots, which matches parquet-rs.
+    let (positions, indices) = build_dict_with(values, |&x| x.to_bits());
+    (positions.iter().map(|&p| values[p]).collect(), indices)
+}
+fn build_dict_byte_array<'a>(values: &[&'a [u8]]) -> (Vec<&'a [u8]>, Vec<u32>) {
+    let (positions, indices) = build_dict_with(values, |&x| x);
+    (positions.iter().map(|&p| values[p]).collect(), indices)
+}
+
+/// Stamp PAR1 + dict page + data page + footer into `out`. Same
+/// skeleton as `write_single_column`, but the column-chunk has two
+/// pages and `dictionary_page_offset` is set.
+#[allow(clippy::too_many_arguments)]
+fn write_single_column_dict<W: Write>(
+    out: &mut W,
+    column_name: &str,
+    parquet_type: ParquetType,
+    num_values: usize,
+    dict_body: Vec<u8>,
+    dict_len: usize,
+    indices: &[u32],
+    codec: CompressionCodec,
+    stats: ColumnStats,
+) -> Result<()> {
+    out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
+    let mut written: u64 = 4;
+
+    // ---- Dictionary page ----
+    let dict_uncomp_size = dict_body.len();
+    let dict_compressed = compress_body(&dict_body, codec)?;
+    let dict_comp_size = dict_compressed.len();
+
+    let dict_header = PageHeader {
+        page_type: PageType::DictionaryPage,
+        uncompressed_page_size: dict_uncomp_size as i32,
+        compressed_page_size: dict_comp_size as i32,
+        crc: None,
+        data_page_header: None,
+        index_page_header: None,
+        dictionary_page_header: Some(DictionaryPageHeader {
+            num_values: dict_len as i32,
+            encoding: Encoding::Plain,
+            is_sorted: Some(false),
+        }),
+        data_page_header_v2: None,
+    };
+    let dict_header_bytes = write_page_header(&dict_header);
+    let dict_page_offset = written as i64;
+    out.write_all(&dict_header_bytes).map_err(io_to_codec)?;
+    written += dict_header_bytes.len() as u64;
+    out.write_all(&dict_compressed).map_err(io_to_codec)?;
+    written += dict_compressed.len() as u64;
+
+    // ---- Data page (RLE_DICTIONARY indices) ----
+    let bit_width = min_bit_width_for_dict(dict_len);
+    let mut data_body = Vec::with_capacity(1 + indices.len());
+    data_body.push(bit_width);
+    data_body.extend_from_slice(&encode_rle_bit_packed_single_run(indices, bit_width));
+
+    let data_uncomp_size = data_body.len();
+    let data_compressed = compress_body(&data_body, codec)?;
+    let data_comp_size = data_compressed.len();
+
+    let data_header = PageHeader {
+        page_type: PageType::DataPage,
+        uncompressed_page_size: data_uncomp_size as i32,
+        compressed_page_size: data_comp_size as i32,
+        crc: None,
+        data_page_header: Some(DataPageHeader {
+            num_values: num_values as i32,
+            encoding: Encoding::PlainDictionary,
+            definition_level_encoding: Encoding::Rle,
+            repetition_level_encoding: Encoding::Rle,
+            statistics: Some(stats.as_statistics()),
+        }),
+        index_page_header: None,
+        dictionary_page_header: None,
+        data_page_header_v2: None,
+    };
+    let data_header_bytes = write_page_header(&data_header);
+    let data_page_offset = written as i64;
+    out.write_all(&data_header_bytes).map_err(io_to_codec)?;
+    written += data_header_bytes.len() as u64;
+    out.write_all(&data_compressed).map_err(io_to_codec)?;
+    written += data_compressed.len() as u64;
+
+    let total_uncompressed_size =
+        (dict_header_bytes.len() + dict_uncomp_size + data_header_bytes.len() + data_uncomp_size)
+            as i64;
+    let total_compressed_size =
+        (dict_header_bytes.len() + dict_comp_size + data_header_bytes.len() + data_comp_size)
+            as i64;
+
+    // ---- Footer ----
+    let column_name_bytes = column_name.as_bytes();
+    let root = SchemaElement {
+        column_type: None,
+        type_length: None,
+        repetition_type: None,
+        name: b"schema",
+        num_children: Some(1),
+        converted_type: None,
+        scale: None,
+        precision: None,
+        field_id: None,
+        logical_type: None,
+    };
+    let leaf = SchemaElement {
+        column_type: Some(parquet_type),
+        type_length: None,
+        repetition_type: Some(FieldRepetitionType::Required),
+        name: column_name_bytes,
+        num_children: None,
+        converted_type: None,
+        scale: None,
+        precision: None,
+        field_id: None,
+        logical_type: None,
+    };
+    let cm = ColumnMetaData {
+        column_type: parquet_type,
+        encodings: vec![Encoding::Plain, Encoding::Rle, Encoding::PlainDictionary],
+        path_in_schema: vec![column_name_bytes],
+        codec,
+        num_values: num_values as i64,
+        total_uncompressed_size,
+        total_compressed_size,
+        key_value_metadata: None,
+        data_page_offset,
+        index_page_offset: None,
+        dictionary_page_offset: Some(dict_page_offset),
+        statistics: Some(stats.as_statistics()),
+        encoding_stats: None,
+        bloom_filter_offset: None,
+        bloom_filter_length: None,
+        size_statistics: None,
+    };
+    let cc = ColumnChunk {
+        file_path: None,
+        // file_offset traditionally points at the dict page when
+        // present (the column chunk's first byte on disk).
+        file_offset: dict_page_offset,
+        meta_data: Some(cm),
+        offset_index_offset: None,
+        offset_index_length: None,
+        column_index_offset: None,
+        column_index_length: None,
+    };
+    let rg = RowGroup {
+        columns: vec![cc],
+        total_byte_size: total_uncompressed_size,
+        num_rows: num_values as i64,
+        sorting_columns: None,
+        file_offset: None,
+        total_compressed_size: None,
+        ordinal: None,
+    };
+    let md = FileMetaData {
+        version: 1,
+        schema: vec![root, leaf],
+        num_rows: num_values as i64,
+        row_groups: vec![rg],
+        key_value_metadata: None,
+        created_by: Some(b"ematix-parquet 0.0.1"),
+        column_orders: None,
+    };
+    let footer = write_file_metadata(&md);
+    let footer_len = footer.len() as u32;
+    out.write_all(&footer).map_err(io_to_codec)?;
+    written += footer.len() as u64;
+    out.write_all(&footer_len.to_le_bytes()).map_err(io_to_codec)?;
+    out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
+    written += 8;
+
+    let _ = written;
+    Ok(())
+}
+
+// ---- Public dict-encoded entry points -------------------------------
+
+/// Write a single-column INT64 file using PLAIN_DICTIONARY encoding.
+/// The dictionary holds the unique values; the data page holds
+/// RLE/bit-pack-encoded indices into it.
+pub fn write_i64_column_dict_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[i64],
+    codec: CompressionCodec,
+) -> Result<()> {
+    let stats = stats_i64(values);
+    let (dict, indices) = build_dict_i64(values);
+    let dict_body = encode_plain_i64(&dict);
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_dict(
+        &mut w,
+        name,
+        ParquetType::Int64,
+        values.len(),
+        dict_body,
+        dict.len(),
+        &indices,
+        codec,
+        stats,
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+pub fn write_i32_column_dict_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[i32],
+    codec: CompressionCodec,
+) -> Result<()> {
+    let stats = stats_i32(values);
+    let (dict, indices) = build_dict_i32(values);
+    let dict_body = encode_plain_i32(&dict);
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_dict(
+        &mut w,
+        name,
+        ParquetType::Int32,
+        values.len(),
+        dict_body,
+        dict.len(),
+        &indices,
+        codec,
+        stats,
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+pub fn write_f64_column_dict_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[f64],
+    codec: CompressionCodec,
+) -> Result<()> {
+    let stats = stats_f64(values);
+    let (dict, indices) = build_dict_f64(values);
+    let dict_body = encode_plain_f64(&dict);
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_dict(
+        &mut w,
+        name,
+        ParquetType::Double,
+        values.len(),
+        dict_body,
+        dict.len(),
+        &indices,
+        codec,
+        stats,
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+/// BYTE_ARRAY is the canonical dict use case: low-cardinality string
+/// columns shrink dramatically when the unique strings are stored
+/// once and the data page only carries indices.
+pub fn write_byte_array_column_dict_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[&[u8]],
+    codec: CompressionCodec,
+) -> Result<()> {
+    let stats = stats_byte_array(values);
+    let (dict, indices) = build_dict_byte_array(values);
+    let dict_body = encode_plain_byte_array(&dict);
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_dict(
+        &mut w,
+        name,
+        ParquetType::ByteArray,
+        values.len(),
+        dict_body,
+        dict.len(),
+        &indices,
+        codec,
+        stats,
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
 }

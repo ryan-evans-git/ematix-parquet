@@ -12,7 +12,7 @@ description = "File handles, byte-range reads, and page-header iteration over Ap
 name = "ematix_parquet_io"
 
 [dependencies]
-ematix-parquet-format = { path = "../ematix-parquet-format" }
+ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.1" }
 
 [dev-dependencies]
 # `snap` so parquet-rs can fully iterate snappy-compressed pages in

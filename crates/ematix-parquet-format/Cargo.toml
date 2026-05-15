@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Hand-rolled Apache Thrift compact-protocol decoder and Parquet format types (FileMetaData, PageHeader, encodings) for ematix-parquet."
+readme = "../../README.md"
 
 [lib]
 name = "ematix_parquet_format"

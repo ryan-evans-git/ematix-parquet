@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Page-body decompression + per-(encoding, physical type) decoders for Apache Parquet. The crate that owns the actual decode-speed work."
+readme = "../../README.md"
 
 [lib]
 name = "ematix_parquet_codec"

@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "File handles, byte-range reads, and page-header iteration over Apache Parquet — the I/O layer that sits between ematix-parquet-format (pure decoding) and the page-body codecs."
+readme = "../../README.md"
 
 [lib]
 name = "ematix_parquet_io"

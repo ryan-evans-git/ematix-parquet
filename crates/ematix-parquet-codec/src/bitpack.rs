@@ -130,6 +130,9 @@ pub fn unpack_indices_into(
 ///
 /// Processes 32 values at a time. For the trailing <32 values uses
 /// the same scalar logic but with NUM_BITS still const-known.
+///
+/// Hot-path uses raw pointer writes (capacity reserved by the
+/// caller; per-value bounds-check on the dict is the only branch).
 #[inline(always)]
 fn unpack_chunks<const NUM_BITS: usize, T: Copy>(
     packed: &[u8],
@@ -148,36 +151,69 @@ fn unpack_chunks<const NUM_BITS: usize, T: Copy>(
     let dict_size = dict.len();
     let bounds_safe = (mask as usize) < dict_size;
 
-    let chunk_bytes = (NUM_BITS * 32) / 8; // always exact: 32 * NUM_BITS is divisible by 8 when NUM_BITS%1=0; actually 32*NUM_BITS is always divisible by 8 iff NUM_BITS is divisible by 1, but 32*N is always a multiple of 32, so / 8 is exact for any N
+    let chunk_bytes = (NUM_BITS * 32) / 8;
     let full_chunks = num_values / 32;
     let tail = num_values % 32;
 
+    let dict_ptr = dict.as_ptr();
+    let out_start_len = out.len();
+
     let mut packed_idx = 0usize;
-    for _ in 0..full_chunks {
-        let chunk = &packed[packed_idx..packed_idx + chunk_bytes];
-        // Unroll-friendly: NUM_BITS is const, offsets are const,
-        // LLVM should emit straight-line code with no inner branches.
-        for i in 0..32usize {
-            let start_bit = i * NUM_BITS;
-            let start_byte = start_bit / 8;
-            let bit_in_byte = (start_bit % 8) as u32;
-            // Load up to 5 bytes covering this value into u64.
-            // Worst case: NUM_BITS=32 + bit_in_byte=7 → 39 bits → 5 bytes.
-            let bytes_needed = (NUM_BITS + bit_in_byte as usize + 7) / 8;
-            let mut acc: u64 = 0;
-            for j in 0..bytes_needed {
-                acc |= (chunk[start_byte + j] as u64) << (j * 8);
+    let mut written = 0usize;
+    // SAFETY: caller reserved `num_values` capacity ahead of this
+    // function; out_ptr.add(written + i) is in-bounds for all writes
+    // because total writes never exceed num_values.
+    unsafe {
+        let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+        if bounds_safe {
+            for _ in 0..full_chunks {
+                let chunk = &packed[packed_idx..packed_idx + chunk_bytes];
+                for i in 0..32usize {
+                    let start_bit = i * NUM_BITS;
+                    let start_byte = start_bit / 8;
+                    let bit_in_byte = (start_bit % 8) as u32;
+                    let bytes_needed = (NUM_BITS + bit_in_byte as usize + 7) / 8;
+                    let mut acc: u64 = 0;
+                    for j in 0..bytes_needed {
+                        acc |= (chunk[start_byte + j] as u64) << (j * 8);
+                    }
+                    let idx = ((acc >> bit_in_byte) & mask) as usize;
+                    *out_ptr.add(written + i) = *dict_ptr.add(idx);
+                }
+                written += 32;
+                packed_idx += chunk_bytes;
             }
-            let idx = ((acc >> bit_in_byte) & mask) as usize;
-            if !bounds_safe && idx >= dict_size {
-                return Err(CodecError::DictIndexOutOfRange {
-                    index: idx as u32,
-                    dict_size,
-                });
+        } else {
+            for _ in 0..full_chunks {
+                let chunk = &packed[packed_idx..packed_idx + chunk_bytes];
+                for i in 0..32usize {
+                    let start_bit = i * NUM_BITS;
+                    let start_byte = start_bit / 8;
+                    let bit_in_byte = (start_bit % 8) as u32;
+                    let bytes_needed = (NUM_BITS + bit_in_byte as usize + 7) / 8;
+                    let mut acc: u64 = 0;
+                    for j in 0..bytes_needed {
+                        acc |= (chunk[start_byte + j] as u64) << (j * 8);
+                    }
+                    let idx = ((acc >> bit_in_byte) & mask) as usize;
+                    if idx >= dict_size {
+                        // Commit what we've written so far so that
+                        // any partial state doesn't leak — though
+                        // in practice the caller drops `out` on err.
+                        out.set_len(out_start_len + written);
+                        return Err(CodecError::DictIndexOutOfRange {
+                            index: idx as u32,
+                            dict_size,
+                        });
+                    }
+                    *out_ptr.add(written + i) = *dict_ptr.add(idx);
+                }
+                written += 32;
+                packed_idx += chunk_bytes;
             }
-            out.push(dict[idx]);
         }
-        packed_idx += chunk_bytes;
+        out.set_len(out_start_len + written);
     }
 
     // Tail: 0..32 values, scalar-streaming bit buffer.
@@ -202,7 +238,12 @@ fn unpack_chunks<const NUM_BITS: usize, T: Copy>(
                     dict_size,
                 });
             }
-            out.push(dict[idx]);
+            // SAFETY: tail is bounded by 31 and capacity was reserved.
+            unsafe {
+                let out_ptr = out.as_mut_ptr().add(out.len());
+                *out_ptr = *dict_ptr.add(idx);
+                out.set_len(out.len() + 1);
+            }
         }
     }
 
@@ -227,21 +268,31 @@ fn unpack_chunks_indices<const NUM_BITS: usize>(
     let full_chunks = num_values / 32;
     let tail = num_values % 32;
 
+    let out_start_len = out.len();
     let mut packed_idx = 0usize;
-    for _ in 0..full_chunks {
-        let chunk = &packed[packed_idx..packed_idx + chunk_bytes];
-        for i in 0..32usize {
-            let start_bit = i * NUM_BITS;
-            let start_byte = start_bit / 8;
-            let bit_in_byte = (start_bit % 8) as u32;
-            let bytes_needed = (NUM_BITS + bit_in_byte as usize + 7) / 8;
-            let mut acc: u64 = 0;
-            for j in 0..bytes_needed {
-                acc |= (chunk[start_byte + j] as u64) << (j * 8);
+    let mut written = 0usize;
+    // SAFETY: caller reserved `num_values` capacity; raw pointer
+    // writes never exceed that bound because total writes equal
+    // num_values exactly.
+    unsafe {
+        let out_ptr = out.as_mut_ptr().add(out_start_len);
+        for _ in 0..full_chunks {
+            let chunk = &packed[packed_idx..packed_idx + chunk_bytes];
+            for i in 0..32usize {
+                let start_bit = i * NUM_BITS;
+                let start_byte = start_bit / 8;
+                let bit_in_byte = (start_bit % 8) as u32;
+                let bytes_needed = (NUM_BITS + bit_in_byte as usize + 7) / 8;
+                let mut acc: u64 = 0;
+                for j in 0..bytes_needed {
+                    acc |= (chunk[start_byte + j] as u64) << (j * 8);
+                }
+                *out_ptr.add(written + i) = ((acc >> bit_in_byte) & mask) as u32;
             }
-            out.push(((acc >> bit_in_byte) & mask) as u32);
+            written += 32;
+            packed_idx += chunk_bytes;
         }
-        packed_idx += chunk_bytes;
+        out.set_len(out_start_len + written);
     }
 
     if tail > 0 {
@@ -256,7 +307,12 @@ fn unpack_chunks_indices<const NUM_BITS: usize>(
                 byte_idx += 1;
                 bits += 8;
             }
-            out.push((buf & mask) as u32);
+            // SAFETY: capacity reserved; tail < 32.
+            unsafe {
+                let out_ptr = out.as_mut_ptr().add(out.len());
+                *out_ptr = (buf & mask) as u32;
+                out.set_len(out.len() + 1);
+            }
             buf >>= NUM_BITS;
             bits -= NUM_BITS as u32;
         }

@@ -31,7 +31,8 @@ use crate::dict::decode_rle_dictionary_into;
 use crate::error::{CodecError, Result};
 use crate::page_index::{select_pages_overlapping_i32, select_pages_overlapping_i64};
 use crate::plain::{
-    decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
+    decode_plain_byte_array, decode_plain_f64, decode_plain_fixed_len_byte_array,
+    decode_plain_i32, decode_plain_i64, decode_plain_int96, Int96,
 };
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
@@ -140,6 +141,95 @@ pub fn read_column_byte_array(
         }
     }
 
+    Ok(out)
+}
+
+/// Read the entire column chunk at (`row_group`, `column`) into a
+/// `Vec<Int96>`. Requires the column's physical type to be INT96.
+///
+/// INT96 is mostly used for legacy nanosecond timestamps (pre-2018
+/// Hive output). Modern files use INT64 with a `Timestamp` logical
+/// type instead — but reading old files is still a load-bearing
+/// requirement.
+pub fn read_column_int96(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<Vec<Int96>> {
+    decode_chunk(file, row_group, column, |bytes| decode_plain_int96(bytes))
+}
+
+/// Read the entire column chunk at (`row_group`, `column`) into a
+/// `Vec<Vec<u8>>`. Requires the column's physical type to be
+/// FIXED_LEN_BYTE_ARRAY. The fixed value width is taken from the
+/// schema's `type_length`.
+///
+/// Common shapes: UUIDs (`type_length`=16), DECIMAL(N, S) where the
+/// binary form is fixed-width, opaque BLOBs.
+pub fn read_column_flba(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let type_length = type_length_for(file, column)?;
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+
+    // FLBA values are owned per row in the output; the dictionary,
+    // if present, is also owned (Vec<Vec<u8>>) so values can be
+    // copied out by index without holding onto page buffers.
+    let mut dict: Vec<Vec<u8>> = Vec::new();
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(total_values);
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
+        decompress_into(codec, body, &mut decomp)?;
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                let slices = decode_plain_fixed_len_byte_array(&decomp, type_length)?;
+                dict = slices.into_iter().map(|s| s.to_vec()).collect();
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                let dph = hdr
+                    .data_page_header
+                    .as_ref()
+                    .ok_or_else(|| CodecError::InvalidInput("data page missing header".into()))?;
+                let n = dph.num_values as usize;
+                match dph.encoding {
+                    Encoding::Plain => {
+                        let slices = decode_plain_fixed_len_byte_array(&decomp, type_length)?;
+                        out.extend(slices.into_iter().map(|s| s.to_vec()));
+                    }
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        if dict.is_empty() {
+                            return Err(CodecError::InvalidInput(
+                                "dict-encoded data page before dictionary".into(),
+                            ));
+                        }
+                        let indices = crate::dict::decode_rle_dictionary_indices(&decomp, n)?;
+                        out.reserve(n);
+                        for idx in indices {
+                            let v = dict.get(idx as usize).ok_or_else(|| {
+                                CodecError::InvalidInput(
+                                    "dictionary index out of range".into(),
+                                )
+                            })?;
+                            out.push(v.clone());
+                        }
+                    }
+                    other => {
+                        return Err(CodecError::Unsupported(format!(
+                            "encoding not yet dispatched by façade: {other:?}"
+                        )));
+                    }
+                }
+            }
+            PageType::IndexPage => {}
+        }
+        if out.len() >= total_values {
+            break;
+        }
+    }
     Ok(out)
 }
 
@@ -310,6 +400,29 @@ fn decode_chunk_masked<T: Copy>(
 
 fn format_to_codec(e: ematix_parquet_format::error::FormatError) -> CodecError {
     CodecError::InvalidInput(format!("format: {e}"))
+}
+
+fn type_length_for(file: &ParquetFile, column: usize) -> Result<i32> {
+    let md = file.metadata().map_err(io_to_codec)?;
+    // Schema is depth-first; column N is the (N+1)-th leaf — but in
+    // practice for flat REQUIRED columns the schema has [root, leaf0,
+    // leaf1, ...]. Walk leaves to find the Nth.
+    let mut leaf_seen = 0usize;
+    for se in &md.schema {
+        if se.column_type.is_some() {
+            if leaf_seen == column {
+                return se.type_length.ok_or_else(|| {
+                    CodecError::InvalidInput(
+                        "FIXED_LEN_BYTE_ARRAY column missing type_length".into(),
+                    )
+                });
+            }
+            leaf_seen += 1;
+        }
+    }
+    Err(CodecError::InvalidInput(format!(
+        "column {column} not found in schema"
+    )))
 }
 
 /// Generic chunk-decode for `Copy` scalar types. `decode_plain` knows

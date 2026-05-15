@@ -19,7 +19,7 @@
 //! That gap is tracked in the v1.0 roadmap.
 
 use ematix_parquet_format::compact::Cursor;
-use ematix_parquet_format::metadata::read_column_index;
+use ematix_parquet_format::metadata::{read_column_index, PageHeader};
 use ematix_parquet_format::types::{CompressionCodec, Encoding, PageType};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
@@ -86,22 +86,17 @@ pub fn read_column_byte_array(
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(total_values);
 
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
-        decompress_into(codec, body, &mut decomp)?;
-
         match hdr.page_type {
             PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
                 let slices = decode_plain_byte_array(&decomp)?;
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let dph = hdr
-                    .data_page_header
-                    .as_ref()
-                    .ok_or_else(|| CodecError::InvalidInput("data page missing header".into()))?;
-                let n = dph.num_values as usize;
-                match dph.encoding {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                match info.encoding {
                     Encoding::Plain => {
-                        let slices = decode_plain_byte_array(&decomp)?;
+                        let slices = decode_plain_byte_array(info.values)?;
                         out.extend(slices.into_iter().map(|s| s.to_vec()));
                     }
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
@@ -110,12 +105,11 @@ pub fn read_column_byte_array(
                                 "dict-encoded data page before dictionary".into(),
                             ));
                         }
-                        // We can't use decode_rle_dictionary_into directly
-                        // for byte_array (Vec<Vec<u8>> isn't Copy). Decode
-                        // indices then gather.
+                        // Vec<Vec<u8>> isn't Copy, so we go via the
+                        // index decoder and gather by hand.
                         let indices =
-                            crate::dict::decode_rle_dictionary_indices(&decomp, n)?;
-                        out.reserve(n);
+                            crate::dict::decode_rle_dictionary_indices(info.values, info.num_values)?;
+                        out.reserve(info.num_values);
                         for idx in indices {
                             let v = dict.get(idx as usize).ok_or_else(|| {
                                 CodecError::InvalidInput(
@@ -183,21 +177,17 @@ pub fn read_column_flba(
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(total_values);
 
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
-        decompress_into(codec, body, &mut decomp)?;
         match hdr.page_type {
             PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
                 let slices = decode_plain_fixed_len_byte_array(&decomp, type_length)?;
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let dph = hdr
-                    .data_page_header
-                    .as_ref()
-                    .ok_or_else(|| CodecError::InvalidInput("data page missing header".into()))?;
-                let n = dph.num_values as usize;
-                match dph.encoding {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                match info.encoding {
                     Encoding::Plain => {
-                        let slices = decode_plain_fixed_len_byte_array(&decomp, type_length)?;
+                        let slices = decode_plain_fixed_len_byte_array(info.values, type_length)?;
                         out.extend(slices.into_iter().map(|s| s.to_vec()));
                     }
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
@@ -206,8 +196,11 @@ pub fn read_column_flba(
                                 "dict-encoded data page before dictionary".into(),
                             ));
                         }
-                        let indices = crate::dict::decode_rle_dictionary_indices(&decomp, n)?;
-                        out.reserve(n);
+                        let indices = crate::dict::decode_rle_dictionary_indices(
+                            info.values,
+                            info.num_values,
+                        )?;
+                        out.reserve(info.num_values);
                         for idx in indices {
                             let v = dict.get(idx as usize).ok_or_else(|| {
                                 CodecError::InvalidInput(
@@ -362,15 +355,10 @@ fn decode_chunk_masked<T: Copy>(
                 if !keep {
                     continue;
                 }
-                decompress_into(codec, body, &mut decomp)?;
-                let dph = hdr
-                    .data_page_header
-                    .as_ref()
-                    .ok_or_else(|| CodecError::InvalidInput("data page missing header".into()))?;
-                let n = dph.num_values as usize;
-                match dph.encoding {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                match info.encoding {
                     Encoding::Plain => {
-                        out.extend(decode_plain(&decomp)?);
+                        out.extend(decode_plain(info.values)?);
                     }
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
                         if dict.is_empty() {
@@ -378,7 +366,12 @@ fn decode_chunk_masked<T: Copy>(
                                 "dict-encoded data page before dictionary".into(),
                             ));
                         }
-                        decode_rle_dictionary_into(&decomp, &dict, n, &mut out)?;
+                        decode_rle_dictionary_into(
+                            info.values,
+                            &dict,
+                            info.num_values,
+                            &mut out,
+                        )?;
                     }
                     other => {
                         return Err(CodecError::Unsupported(format!(
@@ -400,6 +393,66 @@ fn decode_chunk_masked<T: Copy>(
 
 fn format_to_codec(e: ematix_parquet_format::error::FormatError) -> CodecError {
     CodecError::InvalidInput(format!("format: {e}"))
+}
+
+/// Per-data-page view that abstracts V1 vs V2 layout differences.
+struct DataPageInfo<'a> {
+    num_values: usize,
+    encoding: Encoding,
+    /// Decompressed value bytes. For V1, the entire decompressed
+    /// page body. For V2 with rep+def levels, the slice past the
+    /// (uncompressed) rep+def prefix, then decompressed if the
+    /// header's `is_compressed` flag is set.
+    values: &'a [u8],
+}
+
+/// Extract the value bytes from a data page (V1 or V2). Decompression
+/// happens into `decomp` (which the caller owns and reuses across
+/// pages); the returned `DataPageInfo` borrows from either `decomp`
+/// or `body` depending on which path was taken.
+fn data_page_view<'a>(
+    hdr: &'a PageHeader<'a>,
+    body: &'a [u8],
+    chunk_codec: CompressionCodec,
+    decomp: &'a mut Vec<u8>,
+) -> Result<DataPageInfo<'a>> {
+    if let Some(ref dph) = hdr.data_page_header {
+        // ---- DataPageV1: whole body is one compressed unit ----
+        decompress_into(chunk_codec, body, decomp)?;
+        Ok(DataPageInfo {
+            num_values: dph.num_values as usize,
+            encoding: dph.encoding,
+            values: decomp.as_slice(),
+        })
+    } else if let Some(ref dph) = hdr.data_page_header_v2 {
+        // ---- DataPageV2: rep + def prefixes are uncompressed ----
+        let rep_len = dph.repetition_levels_byte_length as usize;
+        let def_len = dph.definition_levels_byte_length as usize;
+        let prefix = rep_len + def_len;
+        if body.len() < prefix {
+            return Err(CodecError::InvalidInput(format!(
+                "DataPageV2 body too short: {} bytes, need {} for rep+def",
+                body.len(),
+                prefix
+            )));
+        }
+        let value_bytes = &body[prefix..];
+        let values: &[u8] = if dph.is_compressed && chunk_codec != CompressionCodec::Uncompressed {
+            decompress_into(chunk_codec, value_bytes, decomp)?;
+            decomp.as_slice()
+        } else {
+            value_bytes
+        };
+        Ok(DataPageInfo {
+            num_values: dph.num_values as usize,
+            encoding: dph.encoding,
+            values,
+        })
+    } else {
+        Err(CodecError::InvalidInput(
+            "data page missing both V1 and V2 header".into(),
+        ))
+    }
 }
 
 fn type_length_for(file: &ParquetFile, column: usize) -> Result<i32> {
@@ -441,21 +494,16 @@ fn decode_chunk<T: Copy>(
     let mut out: Vec<T> = Vec::with_capacity(total_values);
 
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
-        decompress_into(codec, body, &mut decomp)?;
-
         match hdr.page_type {
             PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
                 dict = decode_plain(&decomp)?;
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let dph = hdr
-                    .data_page_header
-                    .as_ref()
-                    .ok_or_else(|| CodecError::InvalidInput("data page missing header".into()))?;
-                let n = dph.num_values as usize;
-                match dph.encoding {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                match info.encoding {
                     Encoding::Plain => {
-                        out.extend(decode_plain(&decomp)?);
+                        out.extend(decode_plain(info.values)?);
                     }
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
                         if dict.is_empty() {
@@ -463,7 +511,12 @@ fn decode_chunk<T: Copy>(
                                 "dict-encoded data page before dictionary".into(),
                             ));
                         }
-                        decode_rle_dictionary_into(&decomp, &dict, n, &mut out)?;
+                        decode_rle_dictionary_into(
+                            info.values,
+                            &dict,
+                            info.num_values,
+                            &mut out,
+                        )?;
                     }
                     other => {
                         return Err(CodecError::Unsupported(format!(

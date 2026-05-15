@@ -365,6 +365,14 @@ fn main() {
     compare("ours vs polars    ", o_med, po_med);
     println!();
 
+    println!("l_suppkey  INT64  (dict bw=14, 100% — l_suppkey is the bw=14 hot path)");
+    let (o_med, _, _) = bench("ours", || ours_decode_i64(&path, 2));
+    let (pr_med, _, _) = bench("parquet-rs", || pr_decode_i64(&path, 2));
+    let (po_med, _, _) = bench("polars (eager)", || polars_decode_i64(&path, "l_suppkey"));
+    compare("ours vs parquet-rs", o_med, pr_med);
+    compare("ours vs polars    ", o_med, po_med);
+    println!();
+
     println!("l_shipdate  INT32  (dict, 1,048,576 values)");
     let (o_med, _, _) = bench("ours", || ours_decode_i32(&path, 10));
     let (pr_med, _, _) = bench("parquet-rs", || pr_decode_i32(&path, 10));

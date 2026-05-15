@@ -60,15 +60,24 @@ pub fn unpack_lookup_into<T: Copy>(
 
     out.reserve(num_values);
 
-    // NEON specialization for bw=12 (hot in lineitem: shipdate +
-    // commitdate + receiptdate). NEON unpack into a stack staging
-    // buffer, then scalar dict gather per lane.
+    // NEON specializations for hot widths in TPC-H lineitem: bw=12
+    // covers shipdate / commitdate / receiptdate, bw=14 covers
+    // l_suppkey. NEON unpack into a stack staging buffer, then scalar
+    // dict gather per lane.
     #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
     {
-        if bit_width == 12 {
-            return crate::bitpack_neon::unpack_lookup_into_neon_bw12(
-                packed, num_values, dict, out,
-            );
+        match bit_width {
+            12 => {
+                return crate::bitpack_neon::unpack_lookup_into_neon_bw12(
+                    packed, num_values, dict, out,
+                );
+            }
+            14 => {
+                return crate::bitpack_neon::unpack_lookup_into_neon_bw14(
+                    packed, num_values, dict, out,
+                );
+            }
+            _ => {}
         }
     }
 
@@ -100,13 +109,14 @@ pub fn unpack_indices_into(
     out.reserve(num_values);
 
     // NEON specializations. Profiled at ~10× scalar on M-series for
-    // bw=12 (l_shipdate / l_commitdate / l_receiptdate) and bw=17
-    // (l_extendedprice 43%, l_partkey 67%, l_orderkey 51%). Other
-    // widths fall through to scalar.
+    // bw=12 (l_shipdate / l_commitdate / l_receiptdate), bw=14
+    // (l_suppkey 100%), and bw=17 (l_extendedprice 43%, l_partkey
+    // 67%, l_orderkey 51%). Other widths fall through to scalar.
     #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
     {
         match bit_width {
             12 => return crate::bitpack_neon::unpack_indices_into_neon_bw12(packed, num_values, out),
+            14 => return crate::bitpack_neon::unpack_indices_into_neon_bw14(packed, num_values, out),
             17 => return crate::bitpack_neon::unpack_indices_into_neon_bw17(packed, num_values, out),
             _ => {}
         }

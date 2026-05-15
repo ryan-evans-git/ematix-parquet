@@ -11,10 +11,12 @@ a write path that produces files the rest of the ecosystem can read.
 
 ## Status
 
-`v0.0.x` — pre-1.0, API still moving. The standard read+write path is
-feature-complete for every Parquet shape covered below; the missing
-items are listed explicitly in the roadmap. Downstream consumers
-should pin by SHA.
+`v0.1.x` — v1.0 cut criteria are met (every Parquet shape we read
+or write is covered, predicate pushdown lights up end-to-end,
+TPC-H lineitem decode beats `parquet-rs` and `polars-parquet`).
+API is settling but the write side still has a few rough edges
+(per-column encoding choice on multi-column writes, smarter RLE
+encoder); pin by SHA until we tag v1.0.
 
 ## What's implemented
 
@@ -26,17 +28,21 @@ BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY. Every Parquet primitive.
 **Encodings** — PLAIN, PLAIN_DICTIONARY, RLE_DICTIONARY (the
 RLE + bit-pack hybrid for dictionary indices and definition /
 repetition levels), DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY,
-DELTA_BYTE_ARRAY. BYTE_STREAM_SPLIT is still open.
+DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT. Every encoding the spec
+defines.
 
 **Compression** — Snappy (hand-rolled fast path + `snap` fallback),
 Zstd, Gzip, Brotli, LZ4_RAW, Uncompressed. The complete set of
 mainstream codecs.
 
 **Metadata** — Thrift compact-protocol parse of file footer, row
-groups, column chunks, page headers, schema (logical + converted
-types), statistics (min / max / null count). Page index + column
-index parsed; pruning is wired but only fires when stats are tight
-enough to skip pages.
+groups, column chunks, page headers (V1 + V2), schema (logical +
+converted types), statistics (min / max / null count). Page index
++ column index parsed and wired into the read façade via
+`read_column_{i32,i64}_with_range(file, rg, col, lo, hi)` —
+pages whose `[min, max]` doesn't overlap `[lo, hi]` are skipped
+without decompression. Bloom-filter decoder (Split-Block + XXHash64)
+ships too.
 
 ### Write path
 
@@ -70,18 +76,35 @@ codec × type combination against `parquet-rs`.
 
 ### Performance
 
-**SIMD bit-unpackers (NEON, AArch64)**
+**End-to-end TPC-H lineitem decode** (Apple Silicon, median of 12 iters):
 
-- bw=12: hot for date columns (`l_shipdate`, `l_commitdate`,
-  `l_receiptdate`) — ~10× the scalar baseline.
-- bw=17: hot for price / key columns (`l_extendedprice`,
-  `l_partkey`, `l_orderkey`) — ~11× on the dominant gather width.
+| Column        | Type        | Width | vs `parquet-rs` (SF=1) | vs `parquet-rs` (SF=10) | vs `polars-parquet` |
+| ------------- | ----------- | ----- | ---------------------- | ----------------------- | ------------------- |
+| `l_orderkey`  | INT64       | mixed | ~at parity / +7%       | ~at parity              | 75-99% faster       |
+| `l_suppkey`   | INT64       | bw=14 | **+16% faster**        | **+48% faster (~2×)**   | 81-97% faster       |
+| `l_shipdate`  | INT32       | bw=12 | **+11% faster**        | **+46% faster (~2×)**   | 85-99% faster       |
+| `l_returnflag`| BYTE_ARRAY  | bw=2  | **+12% faster**        | **+13% faster**         | 83-99% faster       |
 
-**Scalar fallback** — const-generic per-bit-width macro-unrolled
-unpacker covers every bit-width from 1 to 32 on every target.
-Compiles to per-width inlined loops; benefits from LLVM
-auto-vectorisation on a wide range of widths even without hand-rolled
-SIMD.
+`bench_decode` is the harness — `cargo run --release --example bench_decode`
+with `TPCH_DATA_DIR` pointing at a TPC-H lineitem.parquet.
+
+**SIMD bit-unpackers (NEON, AArch64)** — every kernel hits the
+~78 GB/s output ceiling on M-series. Specialised widths:
+
+- bw=12: dates (`l_shipdate`, `l_commitdate`, `l_receiptdate`).
+- bw=14: keys (`l_suppkey` 100%) — 16× the scalar baseline.
+- bw=17: prices/keys (`l_extendedprice`, `l_partkey`, `l_orderkey`).
+
+Each width has both a raw-indices kernel (for index-only consumers)
+and a fused-gather lookup kernel that interleaves dict gather with
+the unpack, eliminating an intermediate `Vec<u32>`.
+
+**Scalar fallback** — const-generic per-bit-width unpacker covers
+every bit-width from 1 to 32 on every target. The `unpack_chunks`
+hot-loop uses raw pointer writes (capacity reserved by the caller),
+so the scalar path is also free of `Vec::push`'s capacity check on
+every value. Benefits from LLVM auto-vectorisation on widths that
+align well.
 
 **Predicate-fused decode** —
 `decode_rle_dictionary_predicate_bitmap_bw12` performs the RLE
@@ -97,7 +120,7 @@ to keep the slow path off the hot loop.
 ### Test coverage
 
 Oracle tests against `parquet-rs` cover both directions on every
-codec and every type. ~200 tests across 30+ test binaries. The
+codec and every type. ~430 tests across 40+ test binaries. The
 matrix:
 
 **Read side** — `parquet-rs` writes files we then decode and
@@ -200,19 +223,18 @@ ematix-parquet column chunks without going through `parquet-rs`'s
 
 ## What's still open
 
-Aiming for these in v1.0+:
+v1.0 cut criteria are met: every Parquet shape we read or write is
+covered, predicate pushdown lights up end-to-end, and
+TPC-H lineitem decode beats `parquet-rs` and `polars-parquet`. The
+remaining roadmap items are performance polish, not correctness or
+interop gaps:
 
-| Item                                                               | Status   |
-| ------------------------------------------------------------------ | -------- |
-| **Dictionary encoding on writes**                                  | Open     |
-| **Multi row-group writes** (writer currently emits one row group)  | Open     |
-| **Statistics on writes** (min / max / null_count on column chunks) | Open     |
-| **DataPageV2 read + write**                                        | Open     |
-| BYTE_STREAM_SPLIT encoding (rare in practice)                       | Open     |
-| Bloom-filter decoder                                                | Open     |
-| Page-index pruning wired into the read façade (parsed today)        | Open     |
-| NEON kernels for mid-range widths (1, 4, 5, 8, 18, 20, 21)          | Open     |
-| INT96 / FLBA dispatch in the high-level façade (low-level done)     | Open     |
+| Item                                                                  | Status   |
+| --------------------------------------------------------------------- | -------- |
+| Additional NEON kernels for mid-range widths (1, 4, 5, 8, 18, 20, 21) | Open — performance polish; bw=12/14/17 already cover the dominant TPC-H widths |
+| Smarter RLE encoder (run-coalescing on writes)                        | Open — current single-bit-packed-run output is spec-compliant; benchmark before optimising |
+| Per-column encoding choice on `write_table_to_path_*`                 | Open — single-column dict entry points exist; multi-column needs a `ColumnEncoding` opt-in |
+| Bloom-filter writer                                                   | Open — decoder ships; writer is the symmetric work |
 
 **Not on the v1.0 path**: encrypted modules (out of scope), async /
 object-store integration (the `io` crate is sync over `Read` —

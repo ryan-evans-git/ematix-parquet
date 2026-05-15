@@ -87,6 +87,19 @@ impl<'a> ColumnData<'a> {
             ColumnData::ByteArray(v) => encode_plain_byte_array(v),
         }
     }
+
+    /// Borrow a sub-range as a new `ColumnData` over the same
+    /// underlying slice. Used by the multi-row-group writer to walk
+    /// each column in `row_group_size` chunks without copying data.
+    fn slice(&self, range: std::ops::Range<usize>) -> ColumnData<'a> {
+        match self {
+            ColumnData::I32(v) => ColumnData::I32(&v[range]),
+            ColumnData::I64(v) => ColumnData::I64(&v[range]),
+            ColumnData::F64(v) => ColumnData::F64(&v[range]),
+            ColumnData::Bool(v) => ColumnData::Bool(&v[range]),
+            ColumnData::ByteArray(v) => ColumnData::ByteArray(&v[range]),
+        }
+    }
 }
 
 /// Write a multi-column single-row-group Parquet file.
@@ -103,11 +116,7 @@ pub fn write_table_to_path<P: AsRef<Path>>(
     columns: &[(&str, ColumnData<'_>)],
     codec: CompressionCodec,
 ) -> Result<()> {
-    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
-    let mut w = BufWriter::new(f);
-    write_table(&mut w, columns, codec)?;
-    w.flush().map_err(io_to_codec)?;
-    Ok(())
+    write_table_to_path_with_row_group_size(path, columns, codec, usize::MAX)
 }
 
 /// Same as `write_table_to_path` but writes to an arbitrary `Write` sink.
@@ -116,18 +125,55 @@ pub fn write_table<W: Write>(
     columns: &[(&str, ColumnData<'_>)],
     codec: CompressionCodec,
 ) -> Result<()> {
+    write_table_with_row_group_size(out, columns, codec, usize::MAX)
+}
+
+/// Multi-row-group variant. `row_group_size` is the row count at
+/// which the writer cuts a new row group. `usize::MAX` produces a
+/// single row group regardless of input size (the default shape).
+///
+/// Each row group carries its own page headers and its own per-column
+/// `Statistics`, computed against the rows in that group only. This
+/// is what makes per-row-group predicate pushdown effective on the
+/// reader side.
+pub fn write_table_to_path_with_row_group_size<P: AsRef<Path>>(
+    path: P,
+    columns: &[(&str, ColumnData<'_>)],
+    codec: CompressionCodec,
+    row_group_size: usize,
+) -> Result<()> {
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_table_with_row_group_size(&mut w, columns, codec, row_group_size)?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+/// `write_table_to_path_with_row_group_size` for an arbitrary
+/// `Write` sink.
+pub fn write_table_with_row_group_size<W: Write>(
+    out: &mut W,
+    columns: &[(&str, ColumnData<'_>)],
+    codec: CompressionCodec,
+    row_group_size: usize,
+) -> Result<()> {
     if columns.is_empty() {
         return Err(CodecError::InvalidInput(
             "write_table requires at least one column".into(),
         ));
     }
-    let num_rows = columns[0].1.row_count();
+    if row_group_size == 0 {
+        return Err(CodecError::InvalidInput(
+            "row_group_size must be > 0".into(),
+        ));
+    }
+    let total_rows = columns[0].1.row_count();
     for (name, c) in &columns[1..] {
-        if c.row_count() != num_rows {
+        if c.row_count() != total_rows {
             return Err(CodecError::InvalidInput(format!(
                 "column {name:?} has row count {} but first column has {}",
                 c.row_count(),
-                num_rows
+                total_rows
             )));
         }
     }
@@ -135,10 +181,8 @@ pub fn write_table<W: Write>(
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
     let mut written: u64 = 4;
 
-    // For each column: compute stats, encode body, compress, write
-    // page header + body, remember the offsets and byte sizes for
-    // the footer. Stats are computed up-front so the page header can
-    // carry them too (matches what parquet-rs writes).
+    /// Per-column descriptor inside one row group: where its single
+    /// data page landed and its (owned) stats bytes.
     struct PreparedColumn {
         data_page_offset: i64,
         total_uncompressed_size: i64,
@@ -146,48 +190,69 @@ pub fn write_table<W: Write>(
         stats: ColumnStats,
     }
 
-    let mut prepared: Vec<PreparedColumn> = Vec::with_capacity(columns.len());
+    // One `PreparedColumn` vec per row group, owned for the lifetime
+    // of the footer construction below (the `Statistics<'_>` in each
+    // `ColumnMetaData` borrows from these).
+    let mut prepared_groups: Vec<(usize, Vec<PreparedColumn>)> = Vec::new();
 
-    for (_name, col) in columns {
-        let stats = compute_stats(col);
-        let body = col.encode_plain();
-        let uncompressed_size = body.len();
-        let compressed_body = compress_body(&body, codec)?;
-        let compressed_size = compressed_body.len();
-
-        let header = PageHeader {
-            page_type: PageType::DataPage,
-            uncompressed_page_size: uncompressed_size as i32,
-            compressed_page_size: compressed_size as i32,
-            crc: None,
-            data_page_header: Some(DataPageHeader {
-                num_values: num_rows as i32,
-                encoding: Encoding::Plain,
-                definition_level_encoding: Encoding::Rle,
-                repetition_level_encoding: Encoding::Rle,
-                statistics: Some(stats.as_statistics()),
-            }),
-            index_page_header: None,
-            dictionary_page_header: None,
-            data_page_header_v2: None,
+    // Empty input still emits a single empty row group — what the
+    // existing `write_empty_column` oracle relies on.
+    let mut row_start = 0usize;
+    let mut emitted_any = false;
+    while row_start < total_rows || !emitted_any {
+        let row_end = if total_rows == 0 {
+            0
+        } else {
+            (row_start + row_group_size).min(total_rows)
         };
-        let header_bytes = write_page_header(&header);
+        let chunk_rows = row_end - row_start;
 
-        let data_page_offset = written as i64;
-        out.write_all(&header_bytes).map_err(io_to_codec)?;
-        written += header_bytes.len() as u64;
-        out.write_all(&compressed_body).map_err(io_to_codec)?;
-        written += compressed_body.len() as u64;
+        let mut prepared: Vec<PreparedColumn> = Vec::with_capacity(columns.len());
+        for (_name, col) in columns {
+            let col_slice = col.slice(row_start..row_end);
+            let stats = compute_stats(&col_slice);
+            let body = col_slice.encode_plain();
+            let uncompressed_size = body.len();
+            let compressed_body = compress_body(&body, codec)?;
+            let compressed_size = compressed_body.len();
 
-        prepared.push(PreparedColumn {
-            data_page_offset,
-            total_uncompressed_size: (header_bytes.len() + uncompressed_size) as i64,
-            total_compressed_size: (header_bytes.len() + compressed_size) as i64,
-            stats,
-        });
+            let header = PageHeader {
+                page_type: PageType::DataPage,
+                uncompressed_page_size: uncompressed_size as i32,
+                compressed_page_size: compressed_size as i32,
+                crc: None,
+                data_page_header: Some(DataPageHeader {
+                    num_values: chunk_rows as i32,
+                    encoding: Encoding::Plain,
+                    definition_level_encoding: Encoding::Rle,
+                    repetition_level_encoding: Encoding::Rle,
+                    statistics: Some(stats.as_statistics()),
+                }),
+                index_page_header: None,
+                dictionary_page_header: None,
+                data_page_header_v2: None,
+            };
+            let header_bytes = write_page_header(&header);
+
+            let data_page_offset = written as i64;
+            out.write_all(&header_bytes).map_err(io_to_codec)?;
+            written += header_bytes.len() as u64;
+            out.write_all(&compressed_body).map_err(io_to_codec)?;
+            written += compressed_body.len() as u64;
+
+            prepared.push(PreparedColumn {
+                data_page_offset,
+                total_uncompressed_size: (header_bytes.len() + uncompressed_size) as i64,
+                total_compressed_size: (header_bytes.len() + compressed_size) as i64,
+                stats,
+            });
+        }
+        prepared_groups.push((chunk_rows, prepared));
+        emitted_any = true;
+        row_start = row_end;
     }
 
-    // ---- Build the footer schema + row group ----
+    // ---- Build the footer schema + row groups ----
     let root = SchemaElement {
         column_type: None,
         type_length: None,
@@ -200,7 +265,6 @@ pub fn write_table<W: Write>(
         field_id: None,
         logical_type: None,
     };
-
     let mut schema: Vec<SchemaElement<'_>> = Vec::with_capacity(columns.len() + 1);
     schema.push(root);
     for (name, col) in columns {
@@ -218,54 +282,56 @@ pub fn write_table<W: Write>(
         });
     }
 
-    let mut row_group_columns: Vec<ColumnChunk<'_>> = Vec::with_capacity(columns.len());
-    let mut total_byte_size: i64 = 0;
-    for ((name, col), prep) in columns.iter().zip(prepared.iter()) {
-        let cm = ColumnMetaData {
-            column_type: col.parquet_type(),
-            encodings: vec![Encoding::Plain, Encoding::Rle],
-            path_in_schema: vec![name.as_bytes()],
-            codec,
-            num_values: num_rows as i64,
-            total_uncompressed_size: prep.total_uncompressed_size,
-            total_compressed_size: prep.total_compressed_size,
-            key_value_metadata: None,
-            data_page_offset: prep.data_page_offset,
-            index_page_offset: None,
-            dictionary_page_offset: None,
-            statistics: Some(prep.stats.as_statistics()),
-            encoding_stats: None,
-            bloom_filter_offset: None,
-            bloom_filter_length: None,
-            size_statistics: None,
-        };
-        row_group_columns.push(ColumnChunk {
-            file_path: None,
-            file_offset: prep.data_page_offset,
-            meta_data: Some(cm),
-            offset_index_offset: None,
-            offset_index_length: None,
-            column_index_offset: None,
-            column_index_length: None,
+    let mut row_groups: Vec<RowGroup<'_>> = Vec::with_capacity(prepared_groups.len());
+    for (rg_ix, (chunk_rows, prepared)) in prepared_groups.iter().enumerate() {
+        let mut row_group_columns: Vec<ColumnChunk<'_>> = Vec::with_capacity(columns.len());
+        let mut total_byte_size: i64 = 0;
+        for ((name, col), prep) in columns.iter().zip(prepared.iter()) {
+            let cm = ColumnMetaData {
+                column_type: col.parquet_type(),
+                encodings: vec![Encoding::Plain, Encoding::Rle],
+                path_in_schema: vec![name.as_bytes()],
+                codec,
+                num_values: *chunk_rows as i64,
+                total_uncompressed_size: prep.total_uncompressed_size,
+                total_compressed_size: prep.total_compressed_size,
+                key_value_metadata: None,
+                data_page_offset: prep.data_page_offset,
+                index_page_offset: None,
+                dictionary_page_offset: None,
+                statistics: Some(prep.stats.as_statistics()),
+                encoding_stats: None,
+                bloom_filter_offset: None,
+                bloom_filter_length: None,
+                size_statistics: None,
+            };
+            row_group_columns.push(ColumnChunk {
+                file_path: None,
+                file_offset: prep.data_page_offset,
+                meta_data: Some(cm),
+                offset_index_offset: None,
+                offset_index_length: None,
+                column_index_offset: None,
+                column_index_length: None,
+            });
+            total_byte_size += prep.total_uncompressed_size;
+        }
+        row_groups.push(RowGroup {
+            columns: row_group_columns,
+            total_byte_size,
+            num_rows: *chunk_rows as i64,
+            sorting_columns: None,
+            file_offset: None,
+            total_compressed_size: None,
+            ordinal: Some(rg_ix as i16),
         });
-        total_byte_size += prep.total_uncompressed_size;
     }
-
-    let rg = RowGroup {
-        columns: row_group_columns,
-        total_byte_size,
-        num_rows: num_rows as i64,
-        sorting_columns: None,
-        file_offset: None,
-        total_compressed_size: None,
-        ordinal: None,
-    };
 
     let md = FileMetaData {
         version: 1,
         schema,
-        num_rows: num_rows as i64,
-        row_groups: vec![rg],
+        num_rows: total_rows as i64,
+        row_groups,
         key_value_metadata: None,
         created_by: Some(b"ematix-parquet 0.0.1"),
         column_orders: None,

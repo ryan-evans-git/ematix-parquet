@@ -20,6 +20,7 @@ pub mod bitpack;
 #[cfg(target_arch = "aarch64")]
 pub mod bitpack_neon;
 pub mod bloom;
+pub mod byte_stream_split;
 pub mod column;
 pub mod compression;
 pub mod delta;

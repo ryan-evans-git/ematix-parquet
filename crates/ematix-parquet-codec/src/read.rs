@@ -18,6 +18,8 @@
 //! by the façade — call the low-level decoders directly for those.
 //! That gap is tracked in the v1.0 roadmap.
 
+use ematix_parquet_format::compact::Cursor;
+use ematix_parquet_format::metadata::read_column_index;
 use ematix_parquet_format::types::{CompressionCodec, Encoding, PageType};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
@@ -27,6 +29,7 @@ use crate::compression::{
 };
 use crate::dict::decode_rle_dictionary_into;
 use crate::error::{CodecError, Result};
+use crate::page_index::{select_pages_overlapping_i32, select_pages_overlapping_i64};
 use crate::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
 };
@@ -140,7 +143,174 @@ pub fn read_column_byte_array(
     Ok(out)
 }
 
+// ---- Page-index pruning entry points (Π.5a) -------------------------
+//
+// `*_with_range(file, rg, col, lo, hi)` returns values from data
+// pages whose [page_min, page_max] intersect [lo, hi]. Pages that
+// can't possibly contain a value in [lo, hi] are skipped without
+// being decompressed or decoded.
+//
+// Caller still applies the final value-level predicate — pruning is a
+// page-granularity optimisation, not row-granularity. The win is the
+// pages we never touched; the returned vec may include some
+// non-matching values from kept pages.
+//
+// If the column has no `ColumnIndex` in the footer, the entry point
+// falls back to a full chunk read (same result as `read_column_*`).
+
+/// `read_column_i64` with page-index pruning by `[lo, hi]` (inclusive).
+pub fn read_column_i64_with_range(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    lo: i64,
+    hi: i64,
+) -> Result<Vec<i64>> {
+    let mask = page_mask_i64(file, row_group, column, lo, hi)?;
+    decode_chunk_masked(file, row_group, column, mask, |bytes| decode_plain_i64(bytes))
+}
+
+/// `read_column_i32` with page-index pruning by `[lo, hi]` (inclusive).
+pub fn read_column_i32_with_range(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    lo: i32,
+    hi: i32,
+) -> Result<Vec<i32>> {
+    let mask = page_mask_i32(file, row_group, column, lo, hi)?;
+    decode_chunk_masked(file, row_group, column, mask, |bytes| decode_plain_i32(bytes))
+}
+
+fn page_mask_i64(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    lo: i64,
+    hi: i64,
+) -> Result<Option<Vec<bool>>> {
+    let Some(ci_bytes) = read_column_index_bytes(file, row_group, column)? else {
+        return Ok(None);
+    };
+    let mut cur = Cursor::new(&ci_bytes);
+    let ci = read_column_index(&mut cur).map_err(format_to_codec)?;
+    Ok(Some(select_pages_overlapping_i64(&ci, lo, hi)?))
+}
+
+fn page_mask_i32(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    lo: i32,
+    hi: i32,
+) -> Result<Option<Vec<bool>>> {
+    let Some(ci_bytes) = read_column_index_bytes(file, row_group, column)? else {
+        return Ok(None);
+    };
+    let mut cur = Cursor::new(&ci_bytes);
+    let ci = read_column_index(&mut cur).map_err(format_to_codec)?;
+    Ok(Some(select_pages_overlapping_i32(&ci, lo, hi)?))
+}
+
+fn read_column_index_bytes(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<Option<Vec<u8>>> {
+    let md = file.metadata().map_err(io_to_codec)?;
+    let rg = md.row_groups.get(row_group).ok_or_else(|| {
+        CodecError::InvalidInput(format!("row group {row_group} out of range"))
+    })?;
+    let col = rg
+        .columns
+        .get(column)
+        .ok_or_else(|| CodecError::InvalidInput(format!("column {column} out of range")))?;
+    match (col.column_index_offset, col.column_index_length) {
+        (Some(off), Some(len)) => {
+            let bytes = file.read_range(off as u64, len as u64).map_err(io_to_codec)?;
+            Ok(Some(bytes))
+        }
+        _ => Ok(None),
+    }
+}
+
 // ---- internals -------------------------------------------------------------
+
+/// Same as `decode_chunk` but skips data pages whose `page_mask`
+/// entry is `false`. `page_mask` is indexed by data-page ordinal
+/// (dictionary pages are not counted). `None` means "no pruning"
+/// — equivalent to `decode_chunk`.
+fn decode_chunk_masked<T: Copy>(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    page_mask: Option<Vec<bool>>,
+    decode_plain: impl Fn(&[u8]) -> Result<Vec<T>>,
+) -> Result<Vec<T>> {
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+
+    let mut dict: Vec<T> = Vec::new();
+    let mut out: Vec<T> = Vec::with_capacity(total_values);
+    let mut data_page_ix: usize = 0;
+    let total_kept_data_pages = page_mask
+        .as_ref()
+        .map(|m| m.iter().filter(|b| **b).count());
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
+                dict = decode_plain(&decomp)?;
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                let keep = page_mask
+                    .as_ref()
+                    .map_or(true, |m| m.get(data_page_ix).copied().unwrap_or(true));
+                data_page_ix += 1;
+                if !keep {
+                    continue;
+                }
+                decompress_into(codec, body, &mut decomp)?;
+                let dph = hdr
+                    .data_page_header
+                    .as_ref()
+                    .ok_or_else(|| CodecError::InvalidInput("data page missing header".into()))?;
+                let n = dph.num_values as usize;
+                match dph.encoding {
+                    Encoding::Plain => {
+                        out.extend(decode_plain(&decomp)?);
+                    }
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        if dict.is_empty() {
+                            return Err(CodecError::InvalidInput(
+                                "dict-encoded data page before dictionary".into(),
+                            ));
+                        }
+                        decode_rle_dictionary_into(&decomp, &dict, n, &mut out)?;
+                    }
+                    other => {
+                        return Err(CodecError::Unsupported(format!(
+                            "encoding not yet dispatched by façade: {other:?}"
+                        )));
+                    }
+                }
+            }
+            PageType::IndexPage => {}
+        }
+        // Without pruning, exit early once we've decoded the chunk's
+        // total. With pruning, walker exhaustion is the natural end.
+        if total_kept_data_pages.is_none() && out.len() >= total_values {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn format_to_codec(e: ematix_parquet_format::error::FormatError) -> CodecError {
+    CodecError::InvalidInput(format!("format: {e}"))
+}
 
 /// Generic chunk-decode for `Copy` scalar types. `decode_plain` knows
 /// how to turn a bytes slice into a `Vec<T>` via the PLAIN encoding.

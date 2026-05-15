@@ -128,7 +128,8 @@ unsafe fn unpack_neon_bw12_unchecked(packed: &[u8], full_blocks: usize, out: &mu
 /// Fused NEON unpack (bw=12) + scalar dict gather. Mirror of
 /// `bitpack::unpack_lookup_into` for the bw=12 specialization.
 /// Each block unpacks 8 indices via NEON into a stack buffer, then
-/// gathers `dict[idx]` per lane and pushes into `out`.
+/// gathers `dict[idx]` per lane via raw pointer writes — no
+/// per-element bounds or capacity checks on the hot path.
 pub fn unpack_lookup_into_neon_bw12<T: Copy>(
     packed: &[u8],
     num_values: usize,
@@ -163,45 +164,82 @@ pub fn unpack_lookup_into_neon_bw12<T: Copy>(
         full_blocks - 1
     };
 
-    // Fast path: dict size > 4096 means every 12-bit index is a valid
-    // dict offset, so we can elide bounds checks. Real-world dicts for
-    // bw=12 columns (shipdate ≈ 2525) are typically smaller, so we
-    // need per-lane bounds checks.
-    let bounds_safe = dict.len() > 4095;
     let dict_size = dict.len();
+    let dict_ptr = dict.as_ptr();
+    let out_start_len = out.len();
+    // Pre-validate: a single up-front pass through the staging
+    // buffer would require allocating one. Instead, we let the
+    // hot path write speculatively (raw pointer writes are safe
+    // because we reserved capacity), and validate the indices in
+    // the same block — bailing out with the post-hoc error if any
+    // index is out of range. This keeps the hot path branchless.
 
     let mut staging = [0u32; 8];
+    let mut bad_idx: Option<u32> = None;
     unsafe {
-        unpack_neon_bw12_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
-            // 8 scalar gathers per block; LLVM should unroll this.
-            for &i in idxs {
-                let i = i as usize;
-                if !bounds_safe && i >= dict_size {
-                    return Err(CodecError::DictIndexOutOfRange {
-                        index: i as u32,
-                        dict_size,
-                    });
+        let out_ptr = out.as_mut_ptr().add(out_start_len);
+        let mut written = 0usize;
+
+        if dict_size > 4095 {
+            // Bounds-safe fast path: every 12-bit index fits in dict.
+            // No per-element bounds check.
+            unpack_neon_bw12_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i as usize);
                 }
-                out.push(dict[i]);
-            }
-            Ok(())
-        })?;
+                written += 8;
+                Ok(())
+            })?;
+        } else {
+            // Bounds-checked path. Branch is predictable (taken or
+            // not based on dict_size, which is fixed across the page).
+            unpack_neon_bw12_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    let i_usize = i as usize;
+                    if i_usize >= dict_size {
+                        bad_idx = Some(i);
+                        return Err(CodecError::DictIndexOutOfRange {
+                            index: i,
+                            dict_size,
+                        });
+                    }
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i_usize);
+                }
+                written += 8;
+                Ok(())
+            })?;
+        }
+        // Commit the writes done above.
+        out.set_len(out_start_len + written);
+    }
+    if let Some(i) = bad_idx {
+        return Err(CodecError::DictIndexOutOfRange {
+            index: i,
+            dict_size,
+        });
     }
 
+    // Tail: scalar fallback for the < 8 remaining values.
     let processed = safe_full_blocks * 8;
     let remaining = num_values - processed;
     if remaining > 0 {
         let mut tail_idxs: Vec<u32> = Vec::with_capacity(remaining);
         scalar_bw12(&packed[processed * 12 / 8..], remaining, &mut tail_idxs);
         for &i in &tail_idxs {
-            let i = i as usize;
-            if !bounds_safe && i >= dict_size {
+            let i_usize = i as usize;
+            if i_usize >= dict_size {
                 return Err(CodecError::DictIndexOutOfRange {
-                    index: i as u32,
+                    index: i,
                     dict_size,
                 });
             }
-            out.push(dict[i]);
+            // SAFETY: out has reserved num_values capacity, and we've
+            // written exactly safe_full_blocks * 8 < num_values so far.
+            unsafe {
+                let out_ptr = out.as_mut_ptr().add(out.len());
+                *out_ptr = *dict_ptr.add(i_usize);
+                out.set_len(out.len() + 1);
+            }
         }
     }
     Ok(())
@@ -636,7 +674,9 @@ unsafe fn unpack_neon_bw14_unchecked(packed: &[u8], full_blocks: usize, out: &mu
 
 /// Fused NEON unpack (bw=14) + scalar dict gather. Mirror of
 /// `unpack_lookup_into_neon_bw12` for the bw=14 specialization
-/// (l_suppkey is ~6.25M values per TPC-H lineitem SF=1).
+/// (l_suppkey is ~6.25M values per TPC-H lineitem SF=1). Uses
+/// raw pointer writes — no per-element bounds or capacity checks
+/// on the hot path.
 pub fn unpack_lookup_into_neon_bw14<T: Copy>(
     packed: &[u8],
     num_values: usize,
@@ -671,44 +711,71 @@ pub fn unpack_lookup_into_neon_bw14<T: Copy>(
         full_blocks - 1
     };
 
-    // Fast path: dict size > 16383 (max 14-bit value) means every
-    // index is a valid dict offset, so we can elide bounds checks.
-    // l_suppkey has ~10000 distinct values at SF=1, so we usually
-    // take the bounds-checked path.
-    let bounds_safe = dict.len() > (1 << 14) - 1;
     let dict_size = dict.len();
+    let dict_ptr = dict.as_ptr();
+    let out_start_len = out.len();
 
     let mut staging = [0u32; 8];
+    let mut bad_idx: Option<u32> = None;
     unsafe {
-        unpack_neon_bw14_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
-            for &i in idxs {
-                let i = i as usize;
-                if !bounds_safe && i >= dict_size {
-                    return Err(CodecError::DictIndexOutOfRange {
-                        index: i as u32,
-                        dict_size,
-                    });
+        let out_ptr = out.as_mut_ptr().add(out_start_len);
+        let mut written = 0usize;
+
+        if dict_size > (1 << 14) - 1 {
+            // Bounds-safe fast path: every 14-bit index fits in dict.
+            unpack_neon_bw14_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i as usize);
                 }
-                out.push(dict[i]);
-            }
-            Ok(())
-        })?;
+                written += 8;
+                Ok(())
+            })?;
+        } else {
+            // Bounds-checked path; branch is predictable across page.
+            unpack_neon_bw14_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    let i_usize = i as usize;
+                    if i_usize >= dict_size {
+                        bad_idx = Some(i);
+                        return Err(CodecError::DictIndexOutOfRange {
+                            index: i,
+                            dict_size,
+                        });
+                    }
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i_usize);
+                }
+                written += 8;
+                Ok(())
+            })?;
+        }
+        out.set_len(out_start_len + written);
+    }
+    if let Some(i) = bad_idx {
+        return Err(CodecError::DictIndexOutOfRange {
+            index: i,
+            dict_size,
+        });
     }
 
+    // Tail: scalar fallback for the < 8 remaining values.
     let processed = safe_full_blocks * 8;
     let remaining = num_values - processed;
     if remaining > 0 {
         let mut tail_idxs: Vec<u32> = Vec::with_capacity(remaining);
         scalar_bw_n(&packed[processed * 14 / 8..], remaining, 14, &mut tail_idxs);
         for &i in &tail_idxs {
-            let i = i as usize;
-            if !bounds_safe && i >= dict_size {
+            let i_usize = i as usize;
+            if i_usize >= dict_size {
                 return Err(CodecError::DictIndexOutOfRange {
-                    index: i as u32,
+                    index: i,
                     dict_size,
                 });
             }
-            out.push(dict[i]);
+            unsafe {
+                let out_ptr = out.as_mut_ptr().add(out.len());
+                *out_ptr = *dict_ptr.add(i_usize);
+                out.set_len(out.len() + 1);
+            }
         }
     }
     Ok(())

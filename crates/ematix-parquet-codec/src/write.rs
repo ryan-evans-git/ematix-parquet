@@ -29,8 +29,8 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use ematix_parquet_format::metadata::{
-    ColumnChunk, ColumnMetaData, DataPageHeader, DictionaryPageHeader, FileMetaData, PageHeader,
-    RowGroup, SchemaElement, Statistics,
+    ColumnChunk, ColumnMetaData, DataPageHeader, DataPageHeaderV2, DictionaryPageHeader,
+    FileMetaData, PageHeader, RowGroup, SchemaElement, Statistics,
 };
 use ematix_parquet_format::metadata_writer::{write_file_metadata, write_page_header};
 use ematix_parquet_format::types::{
@@ -130,6 +130,17 @@ pub fn write_table<W: Write>(
     write_table_with_row_group_size(out, columns, codec, usize::MAX)
 }
 
+/// Page-format selector. V1 is the historical default and what every
+/// `write_table*` entry point produces unless explicitly opted into V2.
+/// V2 is the current parquet-mr / parquet-rs default for new files;
+/// choose it for interop with newer ecosystem readers that might
+/// short-circuit V1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageVersion {
+    V1,
+    V2,
+}
+
 /// Multi-row-group variant. `row_group_size` is the row count at
 /// which the writer cuts a new row group. `usize::MAX` produces a
 /// single row group regardless of input size (the default shape).
@@ -151,6 +162,24 @@ pub fn write_table_to_path_with_row_group_size<P: AsRef<Path>>(
     Ok(())
 }
 
+/// V2-page variant of `write_table_to_path_with_row_group_size`.
+/// Same semantics, just emits `PageType::DataPageV2` data pages.
+/// REQUIRED columns only — rep/def levels are zero, so the V2 body
+/// is just the (compressed) values, identical bytes to V1 except for
+/// the page-header type.
+pub fn write_table_to_path_v2<P: AsRef<Path>>(
+    path: P,
+    columns: &[(&str, ColumnData<'_>)],
+    codec: CompressionCodec,
+    row_group_size: usize,
+) -> Result<()> {
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_table_inner(&mut w, columns, codec, row_group_size, PageVersion::V2)?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
 /// `write_table_to_path_with_row_group_size` for an arbitrary
 /// `Write` sink.
 pub fn write_table_with_row_group_size<W: Write>(
@@ -158,6 +187,16 @@ pub fn write_table_with_row_group_size<W: Write>(
     columns: &[(&str, ColumnData<'_>)],
     codec: CompressionCodec,
     row_group_size: usize,
+) -> Result<()> {
+    write_table_inner(out, columns, codec, row_group_size, PageVersion::V1)
+}
+
+fn write_table_inner<W: Write>(
+    out: &mut W,
+    columns: &[(&str, ColumnData<'_>)],
+    codec: CompressionCodec,
+    row_group_size: usize,
+    page_version: PageVersion,
 ) -> Result<()> {
     if columns.is_empty() {
         return Err(CodecError::InvalidInput(
@@ -218,21 +257,45 @@ pub fn write_table_with_row_group_size<W: Write>(
             let compressed_body = compress_body(&body, codec)?;
             let compressed_size = compressed_body.len();
 
-            let header = PageHeader {
-                page_type: PageType::DataPage,
-                uncompressed_page_size: uncompressed_size as i32,
-                compressed_page_size: compressed_size as i32,
-                crc: None,
-                data_page_header: Some(DataPageHeader {
-                    num_values: chunk_rows as i32,
-                    encoding: Encoding::Plain,
-                    definition_level_encoding: Encoding::Rle,
-                    repetition_level_encoding: Encoding::Rle,
-                    statistics: Some(stats.as_statistics()),
-                }),
-                index_page_header: None,
-                dictionary_page_header: None,
-                data_page_header_v2: None,
+            let header = match page_version {
+                PageVersion::V1 => PageHeader {
+                    page_type: PageType::DataPage,
+                    uncompressed_page_size: uncompressed_size as i32,
+                    compressed_page_size: compressed_size as i32,
+                    crc: None,
+                    data_page_header: Some(DataPageHeader {
+                        num_values: chunk_rows as i32,
+                        encoding: Encoding::Plain,
+                        definition_level_encoding: Encoding::Rle,
+                        repetition_level_encoding: Encoding::Rle,
+                        statistics: Some(stats.as_statistics()),
+                    }),
+                    index_page_header: None,
+                    dictionary_page_header: None,
+                    data_page_header_v2: None,
+                },
+                PageVersion::V2 => PageHeader {
+                    page_type: PageType::DataPageV2,
+                    uncompressed_page_size: uncompressed_size as i32,
+                    compressed_page_size: compressed_size as i32,
+                    crc: None,
+                    data_page_header: None,
+                    index_page_header: None,
+                    dictionary_page_header: None,
+                    // REQUIRED columns: no rep/def levels, no nulls.
+                    // The V2 body is therefore just the (compressed)
+                    // value bytes — identical layout to V1.
+                    data_page_header_v2: Some(DataPageHeaderV2 {
+                        num_values: chunk_rows as i32,
+                        num_nulls: 0,
+                        num_rows: chunk_rows as i32,
+                        encoding: Encoding::Plain,
+                        definition_levels_byte_length: 0,
+                        repetition_levels_byte_length: 0,
+                        is_compressed: codec != CompressionCodec::Uncompressed,
+                        statistics: Some(stats.as_statistics()),
+                    }),
+                },
             };
             let header_bytes = write_page_header(&header);
 

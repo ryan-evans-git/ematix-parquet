@@ -17,8 +17,8 @@
 use crate::compact::FieldType;
 use crate::compact_writer::Writer;
 use crate::metadata::{
-    ColumnChunk, ColumnMetaData, DataPageHeader, DictionaryPageHeader, FileMetaData, PageHeader,
-    RowGroup, SchemaElement, Statistics,
+    ColumnChunk, ColumnMetaData, DataPageHeader, DataPageHeaderV2, DictionaryPageHeader,
+    FileMetaData, PageHeader, RowGroup, SchemaElement, Statistics,
 };
 
 /// Encode a `PageHeader` into the compact-protocol wire form. Returns
@@ -78,9 +78,50 @@ fn encode_page_header(w: &mut Writer, hdr: &PageHeader<'_>) {
         prev = 7;
     }
 
-    // 8: data_page_header_v2 — not yet supported on the write side.
-    if hdr.data_page_header_v2.is_some() {
-        panic!("data_page_header_v2 write not yet implemented (Π.2a focuses on v1)");
+    // 8: data_page_header_v2 (optional, struct)
+    if let Some(ref dphv2) = hdr.data_page_header_v2 {
+        w.write_field_header(8, FieldType::Struct, prev);
+        encode_data_page_header_v2(w, dphv2);
+        prev = 8;
+    }
+
+    let _ = prev;
+    w.write_field_stop();
+}
+
+fn encode_data_page_header_v2(w: &mut Writer, dph: &DataPageHeaderV2<'_>) {
+    // 1: num_values (i32, required)
+    w.write_field_header(1, FieldType::I32, 0);
+    w.write_zigzag_i32(dph.num_values);
+    // 2: num_nulls (i32, required)
+    w.write_field_header(2, FieldType::I32, 1);
+    w.write_zigzag_i32(dph.num_nulls);
+    // 3: num_rows (i32, required)
+    w.write_field_header(3, FieldType::I32, 2);
+    w.write_zigzag_i32(dph.num_rows);
+    // 4: encoding (i32, required)
+    w.write_field_header(4, FieldType::I32, 3);
+    w.write_zigzag_i32(dph.encoding as i32);
+    // 5: definition_levels_byte_length (i32, required)
+    w.write_field_header(5, FieldType::I32, 4);
+    w.write_zigzag_i32(dph.definition_levels_byte_length);
+    // 6: repetition_levels_byte_length (i32, required)
+    w.write_field_header(6, FieldType::I32, 5);
+    w.write_zigzag_i32(dph.repetition_levels_byte_length);
+    let mut prev: i16 = 6;
+
+    // 7: is_compressed (bool, default true). The reader treats an
+    // absent field as `true` per spec, so we only emit when false.
+    if !dph.is_compressed {
+        w.write_field_header(7, FieldType::BoolFalse, prev);
+        prev = 7;
+    }
+
+    // 8: statistics (struct, optional)
+    if let Some(ref s) = dph.statistics {
+        w.write_field_header(8, FieldType::Struct, prev);
+        encode_statistics(w, s);
+        prev = 8;
     }
 
     let _ = prev;
@@ -747,6 +788,61 @@ mod tests {
         let bytes = write_file_metadata(&md);
         let decoded = crate::metadata::read_file_metadata(&mut Cursor::new(&bytes)).unwrap();
         assert_eq!(decoded, md);
+    }
+
+    #[test]
+    fn data_page_header_v2_roundtrip_minimal() {
+        let hdr = PageHeader {
+            page_type: PageType::DataPageV2,
+            uncompressed_page_size: 4096,
+            compressed_page_size: 1234,
+            crc: None,
+            data_page_header: None,
+            index_page_header: None,
+            dictionary_page_header: None,
+            data_page_header_v2: Some(crate::metadata::DataPageHeaderV2 {
+                num_values: 1000,
+                num_nulls: 0,
+                num_rows: 1000,
+                encoding: Encoding::Plain,
+                definition_levels_byte_length: 0,
+                repetition_levels_byte_length: 0,
+                is_compressed: true,
+                statistics: None,
+            }),
+        };
+        let bytes = write_page_header(&hdr);
+        let decoded = read_page_header(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(decoded, hdr);
+    }
+
+    #[test]
+    fn data_page_header_v2_roundtrip_uncompressed() {
+        // is_compressed=false exercises the BoolFalse field-emission
+        // path (the field is omitted when true, since reader default
+        // is true).
+        let hdr = PageHeader {
+            page_type: PageType::DataPageV2,
+            uncompressed_page_size: 256,
+            compressed_page_size: 256,
+            crc: None,
+            data_page_header: None,
+            index_page_header: None,
+            dictionary_page_header: None,
+            data_page_header_v2: Some(crate::metadata::DataPageHeaderV2 {
+                num_values: 64,
+                num_nulls: 5,
+                num_rows: 64,
+                encoding: Encoding::PlainDictionary,
+                definition_levels_byte_length: 12,
+                repetition_levels_byte_length: 0,
+                is_compressed: false,
+                statistics: None,
+            }),
+        };
+        let bytes = write_page_header(&hdr);
+        let decoded = read_page_header(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(decoded, hdr);
     }
 
     #[test]

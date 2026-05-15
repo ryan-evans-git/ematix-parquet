@@ -556,6 +556,157 @@ unsafe fn unpack_neon_bw17_unchecked(packed: &[u8], full_blocks: usize, out: &mu
     out.set_len(out_start_len + full_blocks * 8);
 }
 
+/// Fused NEON unpack (bw=17) + scalar dict gather. Mirror of the
+/// bw=12/bw=14 lookup specializations for the bw=17 hot path
+/// (l_orderkey 51%, l_partkey 67%, l_extendedprice 43% at SF=1).
+pub fn unpack_lookup_into_neon_bw17<T: Copy>(
+    packed: &[u8],
+    num_values: usize,
+    dict: &[T],
+    out: &mut Vec<T>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    if dict.is_empty() {
+        return Err(CodecError::DictIndexOutOfRange {
+            index: 0,
+            dict_size: 0,
+        });
+    }
+    let required_bytes = (num_values * 17).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "neon bw17 lookup: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+    out.reserve(num_values);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 17 * (full_blocks - 1) + 24 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let dict_size = dict.len();
+    let dict_ptr = dict.as_ptr();
+    let out_start_len = out.len();
+
+    let mut staging = [0u32; 8];
+    let mut bad_idx: Option<u32> = None;
+    unsafe {
+        let out_ptr = out.as_mut_ptr().add(out_start_len);
+        let mut written = 0usize;
+
+        if dict_size > (1 << 17) - 1 {
+            unpack_neon_bw17_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i as usize);
+                }
+                written += 8;
+                Ok(())
+            })?;
+        } else {
+            unpack_neon_bw17_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    let i_usize = i as usize;
+                    if i_usize >= dict_size {
+                        bad_idx = Some(i);
+                        return Err(CodecError::DictIndexOutOfRange {
+                            index: i,
+                            dict_size,
+                        });
+                    }
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i_usize);
+                }
+                written += 8;
+                Ok(())
+            })?;
+        }
+        out.set_len(out_start_len + written);
+    }
+    if let Some(i) = bad_idx {
+        return Err(CodecError::DictIndexOutOfRange {
+            index: i,
+            dict_size,
+        });
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut tail_idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 17 / 8..], remaining, 17, &mut tail_idxs);
+        for &i in &tail_idxs {
+            let i_usize = i as usize;
+            if i_usize >= dict_size {
+                return Err(CodecError::DictIndexOutOfRange {
+                    index: i,
+                    dict_size,
+                });
+            }
+            unsafe {
+                let out_ptr = out.as_mut_ptr().add(out.len());
+                *out_ptr = *dict_ptr.add(i_usize);
+                out.set_len(out.len() + 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// bw=17 staging helper, mirror of `unpack_neon_bw12_into_staging`.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn unpack_neon_bw17_into_staging<F>(
+    packed: &[u8],
+    full_blocks: usize,
+    staging: &mut [u32; 8],
+    mut sink: F,
+) -> Result<()>
+where
+    F: FnMut(&[u32; 8]) -> Result<()>,
+{
+    use std::arch::aarch64::*;
+    let shuffle: uint8x16_t = vld1q_u8(
+        [0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr(),
+    );
+    let shifts_lo: int32x4_t = vld1q_s32([0i32, -1, -2, -3].as_ptr());
+    let shifts_hi: int32x4_t = vld1q_s32([-4i32, -5, -6, -7].as_ptr());
+    let mask: uint32x4_t = vdupq_n_u32(0x1_FFFF);
+    let mut src_ptr = packed.as_ptr();
+    let staging_ptr = staging.as_mut_ptr();
+
+    for _ in 0..full_blocks {
+        let v0 = vld1q_u8(src_ptr);
+        let v1 = vld1q_u8(src_ptr.add(8));
+        let lo_b = vqtbl1q_u8(v0, shuffle);
+        let hi_b = vqtbl1q_u8(v1, shuffle);
+        let lo = vreinterpretq_u32_u8(lo_b);
+        let hi = vreinterpretq_u32_u8(hi_b);
+        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(
+            vreinterpretq_s32_u32(lo),
+            shifts_lo,
+        ));
+        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(
+            vreinterpretq_s32_u32(hi),
+            shifts_hi,
+        ));
+        let lo_masked = vandq_u32(lo_shifted, mask);
+        let hi_masked = vandq_u32(hi_shifted, mask);
+        vst1q_u32(staging_ptr, lo_masked);
+        vst1q_u32(staging_ptr.add(4), hi_masked);
+        sink(staging)?;
+        src_ptr = src_ptr.add(17);
+    }
+    Ok(())
+}
+
 /// NEON unpacker for bit_width = 14 — the dominant width for
 /// l_suppkey (100% of dict pages, ~6.25M values per TPC-H lineitem
 /// SF=1). Per 8-row block: 14 bytes input, 32 bytes output (8 × u32).

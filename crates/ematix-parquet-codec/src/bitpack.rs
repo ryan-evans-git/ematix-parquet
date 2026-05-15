@@ -62,8 +62,9 @@ pub fn unpack_lookup_into<T: Copy>(
 
     // NEON specializations for hot widths in TPC-H lineitem: bw=12
     // covers shipdate / commitdate / receiptdate, bw=14 covers
-    // l_suppkey. NEON unpack into a stack staging buffer, then scalar
-    // dict gather per lane.
+    // l_suppkey, bw=17 covers l_orderkey 51% / l_partkey 67% /
+    // l_extendedprice 43%. NEON unpack into a stack staging buffer,
+    // then scalar dict gather per lane.
     #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
     {
         match bit_width {
@@ -74,6 +75,11 @@ pub fn unpack_lookup_into<T: Copy>(
             }
             14 => {
                 return crate::bitpack_neon::unpack_lookup_into_neon_bw14(
+                    packed, num_values, dict, out,
+                );
+            }
+            17 => {
+                return crate::bitpack_neon::unpack_lookup_into_neon_bw17(
                     packed, num_values, dict, out,
                 );
             }

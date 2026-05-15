@@ -18,7 +18,7 @@ use crate::compact::FieldType;
 use crate::compact_writer::Writer;
 use crate::metadata::{
     ColumnChunk, ColumnMetaData, DataPageHeader, DictionaryPageHeader, FileMetaData, PageHeader,
-    RowGroup, SchemaElement,
+    RowGroup, SchemaElement, Statistics,
 };
 
 /// Encode a `PageHeader` into the compact-protocol wire form. Returns
@@ -104,13 +104,74 @@ fn encode_data_page_header(w: &mut Writer, dph: &DataPageHeader<'_>) {
     w.write_field_header(4, FieldType::I32, 3);
     w.write_zigzag_i32(dph.repetition_level_encoding as i32);
 
-    // 5: statistics (struct, optional) — not yet wired on write.
-    if dph.statistics.is_some() {
-        // Π.2a writes pages without statistics. Stats land alongside
-        // the column-chunk metadata writer in Π.2a.3.
-        panic!("DataPageHeader.statistics write not yet implemented");
+    // 5: statistics (struct, optional)
+    if let Some(ref s) = dph.statistics {
+        w.write_field_header(5, FieldType::Struct, 4);
+        encode_statistics(w, s);
     }
 
+    w.write_field_stop();
+}
+
+/// Encode a `Statistics` struct (compact-protocol). All fields are
+/// optional; only those marked `Some` are emitted.
+///
+/// Field IDs match parquet.thrift:
+///   1: max          2: min            (deprecated; kept for reader compat)
+///   3: null_count   4: distinct_count
+///   5: max_value    6: min_value      (current; preferred by modern readers)
+///   7: is_max_value_exact             8: is_min_value_exact
+fn encode_statistics(w: &mut Writer, s: &Statistics<'_>) {
+    let mut prev: i16 = 0;
+    if let Some(b) = s.max {
+        w.write_field_header(1, FieldType::Binary, prev);
+        w.write_binary(b);
+        prev = 1;
+    }
+    if let Some(b) = s.min {
+        w.write_field_header(2, FieldType::Binary, prev);
+        w.write_binary(b);
+        prev = 2;
+    }
+    if let Some(nc) = s.null_count {
+        w.write_field_header(3, FieldType::I64, prev);
+        w.write_zigzag_i64(nc);
+        prev = 3;
+    }
+    if let Some(dc) = s.distinct_count {
+        w.write_field_header(4, FieldType::I64, prev);
+        w.write_zigzag_i64(dc);
+        prev = 4;
+    }
+    if let Some(b) = s.max_value {
+        w.write_field_header(5, FieldType::Binary, prev);
+        w.write_binary(b);
+        prev = 5;
+    }
+    if let Some(b) = s.min_value {
+        w.write_field_header(6, FieldType::Binary, prev);
+        w.write_binary(b);
+        prev = 6;
+    }
+    if let Some(v) = s.is_max_value_exact {
+        let bool_type = if v {
+            FieldType::BoolTrue
+        } else {
+            FieldType::BoolFalse
+        };
+        w.write_field_header(7, bool_type, prev);
+        prev = 7;
+    }
+    if let Some(v) = s.is_min_value_exact {
+        let bool_type = if v {
+            FieldType::BoolTrue
+        } else {
+            FieldType::BoolFalse
+        };
+        w.write_field_header(8, bool_type, prev);
+        prev = 8;
+    }
+    let _ = prev;
     w.write_field_stop();
 }
 
@@ -398,11 +459,15 @@ fn encode_column_metadata(w: &mut Writer, cm: &ColumnMetaData<'_>) {
         prev = 11;
     }
 
-    // 12: statistics, 13: encoding_stats, 14/15: bloom filter,
-    // 16: size_statistics — all panic; not yet on the write path.
-    if cm.statistics.is_some() {
-        panic!("ColumnMetaData.statistics write not yet implemented");
+    // 12: statistics (struct, optional)
+    if let Some(ref s) = cm.statistics {
+        w.write_field_header(12, FieldType::Struct, prev);
+        encode_statistics(w, s);
+        prev = 12;
     }
+
+    // 13: encoding_stats, 14/15: bloom filter,
+    // 16: size_statistics — all panic; not yet on the write path.
     if cm.encoding_stats.is_some() {
         panic!("ColumnMetaData.encoding_stats write not yet implemented");
     }
@@ -678,6 +743,55 @@ mod tests {
             cm.dictionary_page_offset = Some(4);
             cm.data_page_offset = 128;
             cm.encodings = vec![Encoding::Plain, Encoding::RleDictionary];
+        }
+        let bytes = write_file_metadata(&md);
+        let decoded = crate::metadata::read_file_metadata(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(decoded, md);
+    }
+
+    #[test]
+    fn statistics_roundtrip_full() {
+        // All fields populated — exercises every encode_statistics branch.
+        let max_b: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF];
+        let min_b: &[u8] = &[0x00, 0x00, 0x00, 0x00];
+        let s = Statistics {
+            max: Some(max_b),
+            min: Some(min_b),
+            null_count: Some(7),
+            distinct_count: Some(42),
+            max_value: Some(max_b),
+            min_value: Some(min_b),
+            is_max_value_exact: Some(true),
+            is_min_value_exact: Some(false),
+        };
+        let mut md = minimal_i64_file_metadata();
+        if let Some(ref mut cm) = md.row_groups[0].columns[0].meta_data {
+            cm.statistics = Some(s);
+        }
+        let bytes = write_file_metadata(&md);
+        let decoded = crate::metadata::read_file_metadata(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(decoded, md);
+    }
+
+    #[test]
+    fn statistics_roundtrip_modern_only() {
+        // Just the modern set (min_value/max_value/null_count) — what
+        // the write path actually emits today.
+        let max_bytes = 100i64.to_le_bytes();
+        let min_bytes = (-5i64).to_le_bytes();
+        let s = Statistics {
+            max: None,
+            min: None,
+            null_count: Some(0),
+            distinct_count: None,
+            max_value: Some(&max_bytes),
+            min_value: Some(&min_bytes),
+            is_max_value_exact: Some(true),
+            is_min_value_exact: Some(true),
+        };
+        let mut md = minimal_i64_file_metadata();
+        if let Some(ref mut cm) = md.row_groups[0].columns[0].meta_data {
+            cm.statistics = Some(s);
         }
         let bytes = write_file_metadata(&md);
         let decoded = crate::metadata::read_file_metadata(&mut Cursor::new(&bytes)).unwrap();

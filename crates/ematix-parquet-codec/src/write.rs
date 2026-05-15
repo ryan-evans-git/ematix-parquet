@@ -30,7 +30,7 @@ use std::path::Path;
 
 use ematix_parquet_format::metadata::{
     ColumnChunk, ColumnMetaData, DataPageHeader, FileMetaData, PageHeader, RowGroup,
-    SchemaElement,
+    SchemaElement, Statistics,
 };
 use ematix_parquet_format::metadata_writer::{write_file_metadata, write_page_header};
 use ematix_parquet_format::types::{
@@ -135,17 +135,21 @@ pub fn write_table<W: Write>(
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
     let mut written: u64 = 4;
 
-    // For each column: encode body, compress, write page header + body,
-    // remember the data_page_offset and the byte sizes for the footer.
+    // For each column: compute stats, encode body, compress, write
+    // page header + body, remember the offsets and byte sizes for
+    // the footer. Stats are computed up-front so the page header can
+    // carry them too (matches what parquet-rs writes).
     struct PreparedColumn {
         data_page_offset: i64,
         total_uncompressed_size: i64,
         total_compressed_size: i64,
+        stats: ColumnStats,
     }
 
     let mut prepared: Vec<PreparedColumn> = Vec::with_capacity(columns.len());
 
     for (_name, col) in columns {
+        let stats = compute_stats(col);
         let body = col.encode_plain();
         let uncompressed_size = body.len();
         let compressed_body = compress_body(&body, codec)?;
@@ -161,7 +165,7 @@ pub fn write_table<W: Write>(
                 encoding: Encoding::Plain,
                 definition_level_encoding: Encoding::Rle,
                 repetition_level_encoding: Encoding::Rle,
-                statistics: None,
+                statistics: Some(stats.as_statistics()),
             }),
             index_page_header: None,
             dictionary_page_header: None,
@@ -179,6 +183,7 @@ pub fn write_table<W: Write>(
             data_page_offset,
             total_uncompressed_size: (header_bytes.len() + uncompressed_size) as i64,
             total_compressed_size: (header_bytes.len() + compressed_size) as i64,
+            stats,
         });
     }
 
@@ -228,7 +233,7 @@ pub fn write_table<W: Write>(
             data_page_offset: prep.data_page_offset,
             index_page_offset: None,
             dictionary_page_offset: None,
-            statistics: None,
+            statistics: Some(prep.stats.as_statistics()),
             encoding_stats: None,
             bloom_filter_offset: None,
             bloom_filter_length: None,
@@ -326,7 +331,16 @@ pub fn write_i64_column_to_path_with_codec(
     codec: CompressionCodec,
 ) -> Result<()> {
     let body = encode_plain_i64(values);
-    write_to_path(path, name, ParquetType::Int64, values.len(), body, codec)
+    let stats = stats_i64(values);
+    write_to_path(
+        path,
+        name,
+        ParquetType::Int64,
+        values.len(),
+        body,
+        codec,
+        stats,
+    )
 }
 
 pub fn write_i32_column_to_path_with_codec(
@@ -336,7 +350,16 @@ pub fn write_i32_column_to_path_with_codec(
     codec: CompressionCodec,
 ) -> Result<()> {
     let body = encode_plain_i32(values);
-    write_to_path(path, name, ParquetType::Int32, values.len(), body, codec)
+    let stats = stats_i32(values);
+    write_to_path(
+        path,
+        name,
+        ParquetType::Int32,
+        values.len(),
+        body,
+        codec,
+        stats,
+    )
 }
 
 pub fn write_f64_column_to_path_with_codec(
@@ -346,7 +369,16 @@ pub fn write_f64_column_to_path_with_codec(
     codec: CompressionCodec,
 ) -> Result<()> {
     let body = encode_plain_f64(values);
-    write_to_path(path, name, ParquetType::Double, values.len(), body, codec)
+    let stats = stats_f64(values);
+    write_to_path(
+        path,
+        name,
+        ParquetType::Double,
+        values.len(),
+        body,
+        codec,
+        stats,
+    )
 }
 
 pub fn write_bool_column_to_path_with_codec(
@@ -356,7 +388,16 @@ pub fn write_bool_column_to_path_with_codec(
     codec: CompressionCodec,
 ) -> Result<()> {
     let body = encode_plain_bool(values);
-    write_to_path(path, name, ParquetType::Boolean, values.len(), body, codec)
+    let stats = stats_bool(values);
+    write_to_path(
+        path,
+        name,
+        ParquetType::Boolean,
+        values.len(),
+        body,
+        codec,
+        stats,
+    )
 }
 
 pub fn write_byte_array_column_to_path_with_codec(
@@ -366,13 +407,23 @@ pub fn write_byte_array_column_to_path_with_codec(
     codec: CompressionCodec,
 ) -> Result<()> {
     let body = encode_plain_byte_array(values);
-    write_to_path(path, name, ParquetType::ByteArray, values.len(), body, codec)
+    let stats = stats_byte_array(values);
+    write_to_path(
+        path,
+        name,
+        ParquetType::ByteArray,
+        values.len(),
+        body,
+        codec,
+        stats,
+    )
 }
 
 // ---- Public `Write`-sink variants (in-memory friendly) --------------
 
 pub fn write_i64_column<W: Write>(out: &mut W, name: &str, values: &[i64]) -> Result<()> {
     let body = encode_plain_i64(values);
+    let stats = stats_i64(values);
     write_single_column(
         out,
         name,
@@ -380,11 +431,13 @@ pub fn write_i64_column<W: Write>(out: &mut W, name: &str, values: &[i64]) -> Re
         values.len(),
         body,
         CompressionCodec::Uncompressed,
+        stats,
     )
 }
 
 pub fn write_i32_column<W: Write>(out: &mut W, name: &str, values: &[i32]) -> Result<()> {
     let body = encode_plain_i32(values);
+    let stats = stats_i32(values);
     write_single_column(
         out,
         name,
@@ -392,11 +445,13 @@ pub fn write_i32_column<W: Write>(out: &mut W, name: &str, values: &[i32]) -> Re
         values.len(),
         body,
         CompressionCodec::Uncompressed,
+        stats,
     )
 }
 
 pub fn write_f64_column<W: Write>(out: &mut W, name: &str, values: &[f64]) -> Result<()> {
     let body = encode_plain_f64(values);
+    let stats = stats_f64(values);
     write_single_column(
         out,
         name,
@@ -404,11 +459,13 @@ pub fn write_f64_column<W: Write>(out: &mut W, name: &str, values: &[f64]) -> Re
         values.len(),
         body,
         CompressionCodec::Uncompressed,
+        stats,
     )
 }
 
 pub fn write_bool_column<W: Write>(out: &mut W, name: &str, values: &[bool]) -> Result<()> {
     let body = encode_plain_bool(values);
+    let stats = stats_bool(values);
     write_single_column(
         out,
         name,
@@ -416,11 +473,13 @@ pub fn write_bool_column<W: Write>(out: &mut W, name: &str, values: &[bool]) -> 
         values.len(),
         body,
         CompressionCodec::Uncompressed,
+        stats,
     )
 }
 
 pub fn write_byte_array_column<W: Write>(out: &mut W, name: &str, values: &[&[u8]]) -> Result<()> {
     let body = encode_plain_byte_array(values);
+    let stats = stats_byte_array(values);
     write_single_column(
         out,
         name,
@@ -428,6 +487,7 @@ pub fn write_byte_array_column<W: Write>(out: &mut W, name: &str, values: &[&[u8
         values.len(),
         body,
         CompressionCodec::Uncompressed,
+        stats,
     )
 }
 
@@ -440,10 +500,11 @@ fn write_to_path(
     num_values: usize,
     body: Vec<u8>,
     codec: CompressionCodec,
+    stats: ColumnStats,
 ) -> Result<()> {
     let f = File::create(path.as_ref()).map_err(io_to_codec)?;
     let mut w = BufWriter::new(f);
-    write_single_column(&mut w, name, parquet_type, num_values, body, codec)?;
+    write_single_column(&mut w, name, parquet_type, num_values, body, codec, stats)?;
     w.flush().map_err(io_to_codec)?;
     Ok(())
 }
@@ -461,6 +522,7 @@ fn write_single_column<W: Write>(
     num_values: usize,
     body: Vec<u8>,
     codec: CompressionCodec,
+    stats: ColumnStats,
 ) -> Result<()> {
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
     let mut written: u64 = 4;
@@ -481,7 +543,7 @@ fn write_single_column<W: Write>(
             // REQUIRED columns where no level bytes are emitted.
             definition_level_encoding: Encoding::Rle,
             repetition_level_encoding: Encoding::Rle,
-            statistics: None,
+            statistics: Some(stats.as_statistics()),
         }),
         index_page_header: None,
         dictionary_page_header: None,
@@ -535,7 +597,7 @@ fn write_single_column<W: Write>(
         data_page_offset,
         index_page_offset: None,
         dictionary_page_offset: None,
-        statistics: None,
+        statistics: Some(stats.as_statistics()),
         encoding_stats: None,
         bloom_filter_offset: None,
         bloom_filter_length: None,
@@ -633,6 +695,175 @@ fn encode_plain_byte_array(values: &[&[u8]]) -> Vec<u8> {
 
 fn io_to_codec(e: std::io::Error) -> CodecError {
     CodecError::InvalidInput(format!("io: {e}"))
+}
+
+// ---- Statistics ----------------------------------------------------
+//
+// Owned per-column min/max/null_count, computed during encoding and
+// borrowed by the `Statistics<'a>` struct that lands in
+// `ColumnMetaData.statistics`. Bytes are the spec-defined PLAIN
+// encoding of a single value (LE for fixed-width, raw bytes for
+// BYTE_ARRAY — without the u32 length prefix that PLAIN body uses).
+
+#[derive(Default)]
+struct ColumnStats {
+    min: Option<Vec<u8>>,
+    max: Option<Vec<u8>>,
+    null_count: i64,
+}
+
+impl ColumnStats {
+    /// Build the borrowed `Statistics<'_>` view fed to the metadata
+    /// writer. Emits both deprecated (`min`/`max`) and current
+    /// (`min_value`/`max_value`) field pairs — they're identical
+    /// bytes, and writing both maximises reader compatibility.
+    fn as_statistics(&self) -> Statistics<'_> {
+        Statistics {
+            max: self.max.as_deref(),
+            min: self.min.as_deref(),
+            null_count: Some(self.null_count),
+            distinct_count: None,
+            max_value: self.max.as_deref(),
+            min_value: self.min.as_deref(),
+            is_max_value_exact: self.max.as_ref().map(|_| true),
+            is_min_value_exact: self.min.as_ref().map(|_| true),
+        }
+    }
+}
+
+/// Compute min/max/null_count for a column. No-nulls today, so
+/// `null_count = 0` always; the field is still emitted because
+/// downstream readers branch on its presence for pushdown.
+fn compute_stats(col: &ColumnData<'_>) -> ColumnStats {
+    match col {
+        ColumnData::I32(v) => stats_i32(v),
+        ColumnData::I64(v) => stats_i64(v),
+        ColumnData::F64(v) => stats_f64(v),
+        ColumnData::Bool(v) => stats_bool(v),
+        ColumnData::ByteArray(v) => stats_byte_array(v),
+    }
+}
+
+fn stats_i32(v: &[i32]) -> ColumnStats {
+    let mut it = v.iter().copied();
+    let Some(first) = it.next() else {
+        return ColumnStats::default();
+    };
+    let (mut mn, mut mx) = (first, first);
+    for x in it {
+        if x < mn {
+            mn = x;
+        }
+        if x > mx {
+            mx = x;
+        }
+    }
+    ColumnStats {
+        min: Some(mn.to_le_bytes().to_vec()),
+        max: Some(mx.to_le_bytes().to_vec()),
+        null_count: 0,
+    }
+}
+
+fn stats_i64(v: &[i64]) -> ColumnStats {
+    let mut it = v.iter().copied();
+    let Some(first) = it.next() else {
+        return ColumnStats::default();
+    };
+    let (mut mn, mut mx) = (first, first);
+    for x in it {
+        if x < mn {
+            mn = x;
+        }
+        if x > mx {
+            mx = x;
+        }
+    }
+    ColumnStats {
+        min: Some(mn.to_le_bytes().to_vec()),
+        max: Some(mx.to_le_bytes().to_vec()),
+        null_count: 0,
+    }
+}
+
+/// f64 stats per Parquet spec:
+///   * NaN excluded from min/max.
+///   * If the computed min is +0.0, store -0.0; if max is -0.0,
+///     store +0.0. Keeps range queries that span zero from
+///     incorrectly skipping pages.
+///   * If every value is NaN, no min/max are emitted.
+fn stats_f64(v: &[f64]) -> ColumnStats {
+    let mut mn: Option<f64> = None;
+    let mut mx: Option<f64> = None;
+    for &x in v {
+        if x.is_nan() {
+            continue;
+        }
+        mn = Some(mn.map_or(x, |m| if x < m { x } else { m }));
+        mx = Some(mx.map_or(x, |m| if x > m { x } else { m }));
+    }
+    let (min_b, max_b) = match (mn, mx) {
+        (Some(mn), Some(mx)) => {
+            let mn = if mn.to_bits() == 0u64 { -0.0_f64 } else { mn };
+            let mx = if mx.to_bits() == 0x8000_0000_0000_0000u64 {
+                0.0_f64
+            } else {
+                mx
+            };
+            (
+                Some(mn.to_le_bytes().to_vec()),
+                Some(mx.to_le_bytes().to_vec()),
+            )
+        }
+        _ => (None, None),
+    };
+    ColumnStats {
+        min: min_b,
+        max: max_b,
+        null_count: 0,
+    }
+}
+
+/// Boolean min/max with `false < true`. Encoded as a single byte
+/// (0 or 1), matching how parquet-rs writes BOOLEAN statistics.
+fn stats_bool(v: &[bool]) -> ColumnStats {
+    if v.is_empty() {
+        return ColumnStats::default();
+    }
+    let any_true = v.iter().any(|&b| b);
+    let any_false = v.iter().any(|&b| !b);
+    let mn = !any_false; // false present → min is false; otherwise min is true
+    let mx = any_true; // true present  → max is true;  otherwise max is false
+    ColumnStats {
+        min: Some(vec![mn as u8]),
+        max: Some(vec![mx as u8]),
+        null_count: 0,
+    }
+}
+
+/// BYTE_ARRAY min/max under unsigned lexicographic ordering. Stored
+/// as the raw bytes (NOT length-prefixed — that's a PLAIN-body
+/// detail, not a Statistics detail).
+fn stats_byte_array(v: &[&[u8]]) -> ColumnStats {
+    let mut it = v.iter().copied();
+    let Some(first) = it.next() else {
+        return ColumnStats::default();
+    };
+    let mut mn: &[u8] = first;
+    let mut mx: &[u8] = first;
+    for x in it {
+        if x < mn {
+            mn = x;
+        }
+        if x > mx {
+            mx = x;
+        }
+    }
+    ColumnStats {
+        min: Some(mn.to_vec()),
+        max: Some(mx.to_vec()),
+        null_count: 0,
+    }
 }
 
 /// Dispatch to the right compressor (or no-op for Uncompressed).

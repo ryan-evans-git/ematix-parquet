@@ -737,6 +737,38 @@ pub struct SizeStatistics {
     pub definition_level_histogram: Option<Vec<i64>>,
 }
 
+/// Header preceding the bitset bytes of a Parquet bloom filter.
+///
+/// All four fields are required by the spec, but algorithm / hash /
+/// compression are tagged unions where today only one variant each
+/// is defined: `SplitBlockAlgorithm`, `XxHash`, and `Uncompressed`.
+/// We surface those as flat enums for now since no other variants
+/// exist in any deployed file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BloomFilterHeader {
+    pub num_bytes: i32,
+    pub algorithm: BloomFilterAlgorithm,
+    pub hash: BloomFilterHash,
+    pub compression: BloomFilterCompression,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BloomFilterAlgorithm {
+    /// `BLOCK` — the only algorithm any writer in the wild uses.
+    SplitBlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BloomFilterHash {
+    /// XXHash64 with seed 0.
+    XxHash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BloomFilterCompression {
+    Uncompressed,
+}
+
 /// Per-column-chunk descriptor. Field 17 (GeospatialStatistics) and
 /// the ColumnCryptoMetaData union are not yet modeled and will error
 /// as `UnknownStructField`.
@@ -793,6 +825,91 @@ pub fn read_size_statistics(cur: &mut Cursor<'_>) -> Result<SizeStatistics> {
         repetition_level_histogram: rep_hist,
         definition_level_histogram: def_hist,
     })
+}
+
+/// Read a `BloomFilterHeader` from the bytes pointed at by
+/// `ColumnMetaData.bloom_filter_offset`. The bitset begins
+/// immediately after this header in the same byte stream.
+pub fn read_bloom_filter_header(cur: &mut Cursor<'_>) -> Result<BloomFilterHeader> {
+    let mut num_bytes = None;
+    let mut algorithm = None;
+    let mut hash = None;
+    let mut compression = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::I32) => num_bytes = Some(read_zigzag_i32(cur)?),
+            (2, FieldType::Struct) => {
+                algorithm = Some(read_bloom_algorithm(cur)?);
+            }
+            (3, FieldType::Struct) => {
+                hash = Some(read_bloom_hash(cur)?);
+            }
+            (4, FieldType::Struct) => {
+                compression = Some(read_bloom_compression(cur)?);
+            }
+            _ => return Err(unknown("BloomFilterHeader", h.id)),
+        }
+    }
+    Ok(BloomFilterHeader {
+        num_bytes: num_bytes.ok_or_else(|| missing("BloomFilterHeader", 1))?,
+        algorithm: algorithm.ok_or_else(|| missing("BloomFilterHeader", 2))?,
+        hash: hash.ok_or_else(|| missing("BloomFilterHeader", 3))?,
+        compression: compression.ok_or_else(|| missing("BloomFilterHeader", 4))?,
+    })
+}
+
+fn read_bloom_algorithm(cur: &mut Cursor<'_>) -> Result<BloomFilterAlgorithm> {
+    // Tagged union: each branch is an empty struct. Read the field
+    // header (which identifies the variant), then walk the empty
+    // struct (which is just FieldType::Stop).
+    let mut algo: Option<BloomFilterAlgorithm> = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match h.id {
+            1 => {
+                // SplitBlockAlgorithm — empty struct, walk to stop.
+                while let Some(_inner) = read_field_header(cur, 0)? {}
+                algo = Some(BloomFilterAlgorithm::SplitBlock);
+            }
+            _ => return Err(unknown("BloomFilterAlgorithm", h.id)),
+        }
+    }
+    algo.ok_or_else(|| missing("BloomFilterAlgorithm", 1))
+}
+
+fn read_bloom_hash(cur: &mut Cursor<'_>) -> Result<BloomFilterHash> {
+    let mut hash: Option<BloomFilterHash> = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match h.id {
+            1 => {
+                while let Some(_inner) = read_field_header(cur, 0)? {}
+                hash = Some(BloomFilterHash::XxHash);
+            }
+            _ => return Err(unknown("BloomFilterHash", h.id)),
+        }
+    }
+    hash.ok_or_else(|| missing("BloomFilterHash", 1))
+}
+
+fn read_bloom_compression(cur: &mut Cursor<'_>) -> Result<BloomFilterCompression> {
+    let mut comp: Option<BloomFilterCompression> = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match h.id {
+            1 => {
+                while let Some(_inner) = read_field_header(cur, 0)? {}
+                comp = Some(BloomFilterCompression::Uncompressed);
+            }
+            _ => return Err(unknown("BloomFilterCompression", h.id)),
+        }
+    }
+    comp.ok_or_else(|| missing("BloomFilterCompression", 1))
 }
 
 pub fn read_page_encoding_stats(cur: &mut Cursor<'_>) -> Result<PageEncodingStats> {

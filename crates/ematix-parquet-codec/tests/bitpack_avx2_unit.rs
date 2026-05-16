@@ -481,3 +481,97 @@ fn bw17_matches_scalar_dispatcher() {
     );
     assert_eq!(via_dispatcher, values, "bw17 round trip mismatch");
 }
+
+// ============================================================
+// bw=18 — Π.12e
+// ============================================================
+
+use ematix_parquet_codec::bitpack_avx2::{
+    unpack_indices_into_avx2_bw18, unpack_lookup_into_avx2_bw18,
+};
+
+#[test]
+fn bw18_indices_round_trip_aligned() {
+    if skip_if_no_avx2() {
+        return;
+    }
+    let values: Vec<u32> = (0..1024u32)
+        .map(|i| i.wrapping_mul(17) & 0x3_FFFF)
+        .collect();
+    let packed = pack_bwn(&values, 18);
+
+    let mut out: Vec<u32> = Vec::new();
+    unpack_indices_into_avx2_bw18(&packed, values.len(), &mut out).unwrap();
+    assert_eq!(out, values);
+}
+
+#[test]
+fn bw18_indices_round_trip_with_tail() {
+    if skip_if_no_avx2() {
+        return;
+    }
+    for n in [1usize, 7, 13, 17, 35, 100, 1003] {
+        let values: Vec<u32> = (0..n as u32)
+            .map(|i| i.wrapping_mul(13) & 0x3_FFFF)
+            .collect();
+        let packed = pack_bwn(&values, 18);
+
+        let mut out: Vec<u32> = Vec::new();
+        unpack_indices_into_avx2_bw18(&packed, n, &mut out).unwrap();
+        assert_eq!(out, values, "n = {n}");
+    }
+}
+
+#[test]
+fn bw18_indices_max_values() {
+    if skip_if_no_avx2() {
+        return;
+    }
+    let values: Vec<u32> = vec![0x3_FFFFu32; 256];
+    let packed = pack_bwn(&values, 18);
+
+    let mut out: Vec<u32> = Vec::new();
+    unpack_indices_into_avx2_bw18(&packed, values.len(), &mut out).unwrap();
+    assert_eq!(out, values);
+}
+
+#[test]
+fn bw18_lookup_round_trips_against_dict() {
+    if skip_if_no_avx2() {
+        return;
+    }
+    let dict: Vec<i64> = (1000..1600i64).collect();
+    let indices: Vec<u32> = (0..512).map(|i| (i % dict.len()) as u32).collect();
+    let packed = pack_bwn(&indices, 18);
+
+    let mut out: Vec<i64> = Vec::new();
+    unpack_lookup_into_avx2_bw18(&packed, indices.len(), &dict, &mut out).unwrap();
+
+    let expected: Vec<i64> = indices.iter().map(|&i| dict[i as usize]).collect();
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn bw18_matches_scalar_dispatcher() {
+    if skip_if_no_avx2() {
+        return;
+    }
+    use ematix_parquet_codec::bitpack::unpack_indices_into;
+
+    let values: Vec<u32> = (0..2_048u32)
+        .map(|i| i.wrapping_mul(31337) & 0x3_FFFF)
+        .collect();
+    let packed = pack_bwn(&values, 18);
+
+    let mut via_dispatcher: Vec<u32> = Vec::new();
+    unpack_indices_into(&packed, values.len(), 18, &mut via_dispatcher).unwrap();
+
+    let mut via_direct: Vec<u32> = Vec::new();
+    unpack_indices_into_avx2_bw18(&packed, values.len(), &mut via_direct).unwrap();
+
+    assert_eq!(
+        via_dispatcher, via_direct,
+        "bw18 dispatcher and direct AVX2 disagree"
+    );
+    assert_eq!(via_dispatcher, values, "bw18 round trip mismatch");
+}

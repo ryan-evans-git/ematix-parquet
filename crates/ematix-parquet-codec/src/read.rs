@@ -27,12 +27,14 @@ use crate::compression::{
     decompress_brotli_into, decompress_gzip_into, decompress_lz4_raw_into,
     decompress_snappy_into, decompress_zstd_into,
 };
-use crate::dict::decode_rle_dictionary_into;
+use crate::dict::{decode_rle_dictionary_into, gather_dict_at_bitmap_into};
 use crate::error::{CodecError, Result};
 use crate::page_index::{select_pages_overlapping_i32, select_pages_overlapping_i64};
 use crate::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_fixed_len_byte_array,
-    decode_plain_i32, decode_plain_i64, decode_plain_int96, Int96,
+    decode_plain_i32, decode_plain_i64, decode_plain_int96,
+    plain_sparse_decode_f64_into, plain_sparse_decode_i32_into,
+    plain_sparse_decode_i64_into, Int96,
 };
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
@@ -102,6 +104,86 @@ pub fn read_column_f64_into(
     out: &mut Vec<f64>,
 ) -> Result<()> {
     decode_chunk_into(file, row_group, column, out, |bytes| decode_plain_f64(bytes))
+}
+
+// ============================================================
+// Π.10a — masked-decode read façade (late materialization)
+// ============================================================
+//
+// `read_column_*_masked_into(file, rg, col, mask, &mut out)` decodes
+// only the rows where `mask` (packed bitmap, 1 bit per row) is set,
+// appending matched values to `out` in row order. The dict path
+// reuses Π.5/Π.9-era `gather_dict_at_bitmap_into`; the PLAIN path
+// uses the new `plain_sparse_decode_*_into` primitives. Per-page
+// popcount-skip drops fully-dead pages without decompression.
+//
+// `mask` is a packed bitmap covering the chunk's row 0..num_values
+// address space. Bit `i` of byte `k` is row `8k + i`. Caller is
+// responsible for sizing the mask correctly (≥ ceil(num_values/8)
+// bytes) — undersized masks return `InvalidInput`.
+//
+// **Appends.** Unlike the `_into` variants on the allocating reads,
+// these do NOT clear `out` — callers can build a contiguous output
+// across multiple row-groups via a single Vec. Call `out.clear()`
+// up front if you want full-replace semantics.
+
+/// Decode INT64 only at rows where `mask` is set. Appends to `out`.
+pub fn read_column_i64_masked_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    mask: &[u8],
+    out: &mut Vec<i64>,
+) -> Result<()> {
+    decode_chunk_row_masked_into(
+        file, row_group, column, mask, out,
+        |bytes| decode_plain_i64(bytes),
+        plain_sparse_decode_i64_into,
+    )
+}
+
+/// Decode INT32 only at rows where `mask` is set. Appends to `out`.
+pub fn read_column_i32_masked_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    mask: &[u8],
+    out: &mut Vec<i32>,
+) -> Result<()> {
+    decode_chunk_row_masked_into(
+        file, row_group, column, mask, out,
+        |bytes| decode_plain_i32(bytes),
+        plain_sparse_decode_i32_into,
+    )
+}
+
+/// Decode DOUBLE only at rows where `mask` is set. Appends to `out`.
+pub fn read_column_f64_masked_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    mask: &[u8],
+    out: &mut Vec<f64>,
+) -> Result<()> {
+    decode_chunk_row_masked_into(
+        file, row_group, column, mask, out,
+        |bytes| decode_plain_f64(bytes),
+        plain_sparse_decode_f64_into,
+    )
+}
+
+/// Build a packed bitmap of length `ceil(num_rows / 8)` bytes where
+/// bit `i` of byte `k` is `1` iff `pred(8k + i)` returns true. Useful
+/// when callers don't already have a bitmap-shaped mask (e.g. when
+/// the predicate runs over already-decoded scalar values).
+pub fn build_packed_mask(num_rows: usize, pred: impl Fn(usize) -> bool) -> Vec<u8> {
+    let mut mask = vec![0u8; num_rows.div_ceil(8)];
+    for row in 0..num_rows {
+        if pred(row) {
+            mask[row / 8] |= 1u8 << (row % 8);
+        }
+    }
+    mask
 }
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
@@ -828,6 +910,127 @@ fn decode_chunk_into<T: Copy>(
     }
 
     Ok(())
+}
+
+/// Row-masked chunk decode for scalar `Copy` types. Walks pages
+/// page-by-page; for each data page:
+///
+/// 1. Popcount the mask over the page's row range. If zero, skip
+///    the page entirely (no decompression).
+/// 2. Otherwise, dispatch to PLAIN sparse-decode or
+///    `gather_dict_at_bitmap_into` depending on encoding.
+///
+/// Appends to `out` — does NOT clear.
+///
+/// `plain_full_decode` is used for the DictionaryPage itself
+/// (we need every dict entry). `plain_sparse_decode` is the
+/// per-page-data sparse path.
+fn decode_chunk_row_masked_into<T: Copy>(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    mask: &[u8],
+    out: &mut Vec<T>,
+    plain_full_decode: impl Fn(&[u8]) -> Result<Vec<T>>,
+    plain_sparse_decode: impl Fn(&[u8], usize, &[u8], usize, &mut Vec<T>) -> Result<()>,
+) -> Result<()> {
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+
+    let required_mask_bytes = total_values.div_ceil(8);
+    if mask.len() < required_mask_bytes {
+        return Err(CodecError::InvalidInput(format!(
+            "mask too small: {} bytes for {} rows (need ≥ {})",
+            mask.len(),
+            total_values,
+            required_mask_bytes,
+        )));
+    }
+
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+    let mut dict: Vec<T> = Vec::new();
+    let mut row_cursor: usize = 0;
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
+                dict = plain_full_decode(&decomp)?;
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let page_n = info.num_values;
+                // Per-page popcount: if zero, skip decode entirely.
+                let matched_in_page = popcount_mask_range(mask, row_cursor, row_cursor + page_n);
+                if matched_in_page == 0 {
+                    row_cursor += page_n;
+                    if row_cursor >= total_values {
+                        break;
+                    }
+                    continue;
+                }
+                match info.encoding {
+                    Encoding::Plain => {
+                        plain_sparse_decode(info.values, page_n, mask, row_cursor, out)?;
+                    }
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        if dict.is_empty() {
+                            return Err(CodecError::InvalidInput(
+                                "dict-encoded data page before dictionary".into(),
+                            ));
+                        }
+                        gather_dict_at_bitmap_into(
+                            info.values,
+                            page_n,
+                            mask,
+                            row_cursor,
+                            &dict,
+                            out,
+                        )?;
+                    }
+                    other => {
+                        return Err(CodecError::Unsupported(format!(
+                            "encoding not yet dispatched by façade: {other:?}"
+                        )));
+                    }
+                }
+                row_cursor += page_n;
+                if row_cursor >= total_values {
+                    break;
+                }
+            }
+            PageType::IndexPage => {}
+        }
+    }
+    Ok(())
+}
+
+/// Count set bits in `bitmap[start_bit..end_bit]`. Used by per-page
+/// skip in row-masked decode. Local copy of `dict::popcount_range`
+/// (not exported there).
+fn popcount_mask_range(bitmap: &[u8], start_bit: usize, end_bit: usize) -> usize {
+    if start_bit >= end_bit {
+        return 0;
+    }
+    let mut bit = start_bit;
+    let mut total: usize = 0;
+    while bit < end_bit && bit % 8 != 0 {
+        if (bitmap[bit / 8] >> (bit % 8)) & 1 == 1 {
+            total += 1;
+        }
+        bit += 1;
+    }
+    while bit + 8 <= end_bit {
+        total += bitmap[bit / 8].count_ones() as usize;
+        bit += 8;
+    }
+    while bit < end_bit {
+        if (bitmap[bit / 8] >> (bit % 8)) & 1 == 1 {
+            total += 1;
+        }
+        bit += 1;
+    }
+    total
 }
 
 /// Pull the raw column-chunk bytes (compressed pages, dictionary

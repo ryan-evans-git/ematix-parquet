@@ -851,12 +851,18 @@ fn write_single_column_encrypted<W: Write>(
 
     let uncompressed_size = body.len();
     let compressed_body = compress_body(&body, codec)?;
-    let compressed_size = compressed_body.len();
+
+    // Seal the body FIRST so we know the encrypted-frame size; that's
+    // what goes into compressed_page_size per PME spec (the reader uses
+    // compressed_page_size to know how many on-disk bytes to read for
+    // the body; it must be the encrypted-frame size, not the plaintext
+    // compressed size). parquet-rs writes pages this way too.
+    let encrypted_body = encrypt_module(&compressed_body, &mut ctx, ModuleType::DataPage, Some(0))?;
 
     let data_page_header = PageHeader {
         page_type: PageType::DataPage,
         uncompressed_page_size: uncompressed_size as i32,
-        compressed_page_size: compressed_size as i32,
+        compressed_page_size: encrypted_body.len() as i32,
         crc: None,
         data_page_header: Some(DataPageHeader {
             num_values: num_values as i32,
@@ -871,15 +877,13 @@ fn write_single_column_encrypted<W: Write>(
     };
     let plaintext_header = write_page_header(&data_page_header);
 
-    // Seal the page header bytes (DataPageHeader module, page_ord=0)
-    // and then the compressed body (DataPage module, same page_ord).
+    // Seal the page header bytes (DataPageHeader module, page_ord=0).
     let encrypted_header = encrypt_module(
         &plaintext_header,
         &mut ctx,
         ModuleType::DataPageHeader,
         Some(0),
     )?;
-    let encrypted_body = encrypt_module(&compressed_body, &mut ctx, ModuleType::DataPage, Some(0))?;
 
     let data_page_offset = written as i64;
     out.write_all(&encrypted_header).map_err(io_to_codec)?;

@@ -11,12 +11,17 @@ a write path that produces files the rest of the ecosystem can read.
 
 ## Status
 
-`v0.2.x` — v1.0 cut criteria are met (every Parquet shape we read
+`v0.3.x` — v1.0 cut criteria are met (every Parquet shape we read
 or write is covered, predicate pushdown lights up end-to-end,
 TPC-H lineitem decode beats `parquet-rs` and `polars-parquet`).
-The v0.2 cycle landed Photon-inspired analytical hot paths:
-decode-into-caller-buffer, width-generic predicate fusion across
-every NEON kernel, and a streaming batched-decode iterator.
+The v0.2 cycle landed Photon-inspired analytical hot paths
+(decode-into-caller-buffer, width-generic predicate fusion across
+every NEON kernel, streaming batched-decode iterator). The v0.3
+cycle adds **late-materialization** —
+`read_column_*_masked_into(file, rg, col, &mask, &mut out)` for
+scalar types + byte_array, composing the Π.9 primitives with
+per-page popcount-skip — so consumers can decode only matching
+rows after a filter pass instead of full-decode-then-filter.
 API is settling but the write side still has a few rough edges
 (per-column encoding choice on multi-column writes); pin by SHA
 or version range until we tag v1.0.
@@ -155,10 +160,31 @@ caller's preference (typically Arrow's RecordBatch size). Lets
 the engine pipeline (process batch N while we decode batch N+1)
 and bounds working-set memory for huge row groups.
 
+**Late-materialization read façade** (v0.3) — after a filter pass
+produces a packed mask, decode only the matching rows instead of
+full-decode-then-filter. Available for scalar types and byte_array
+(both `Vec<Vec<u8>>` and Arrow-style `(bytes, offsets)` shapes):
+
+```rust
+let mask = build_packed_mask(num_rows, |i| predicate(i));
+read_column_i64_masked_into(file, rg, col, &mask, &mut out)?;
+read_column_byte_array_offsets_masked_into(file, rg, col, &mask,
+                                           &mut bytes, &mut offsets)?;
+```
+
+Composes Π.9's primitives — `gather_dict_at_bitmap_into` for
+dict-encoded pages, new `plain_sparse_decode_*` for PLAIN — with
+a per-page popcount-skip that drops fully-dead pages without
+decompression. End-to-end Q14 codec-layer measurement on TPC-H
+lineitem SF=1: late-mat 13.26 ms vs baseline 14.03 ms (5.5%
+faster at 1.4% selectivity). The bigger ~2 ms Polars-gap win
+lives at the engine layer where Arrow construction is skipped
+on filtered rows.
+
 ### Test coverage
 
 Oracle tests against `parquet-rs` cover both directions on every
-codec and every type. ~475 tests across 40+ test binaries. The
+codec and every type. ~495 tests across 40+ test binaries. The
 matrix:
 
 **Read side** — `parquet-rs` writes files we then decode and

@@ -186,6 +186,33 @@ pub fn split_encrypted_footer_trailer(trailer: &[u8]) -> Result<(&[u8], &[u8])> 
     Ok((&trailer[..boundary], &trailer[boundary..]))
 }
 
+/// Encrypt a plaintext `FileMetaData` Thrift buffer as the
+/// encrypted-footer wire frame:
+///   `[len: u32 LE][nonce: 12B][ciphertext][tag: 16B]`.
+///
+/// AAD is the Footer-module AAD (`file_aad || 0x00`). Used by the
+/// encrypted-footer writer to wrap the FileMetaData bytes before
+/// emitting them between the FileCryptoMetaData trailer and the
+/// final PARE magic.
+pub fn encrypt_footer<N: NonceSource>(
+    plaintext: &[u8],
+    key: &Key,
+    aad_prefix: Option<&[u8]>,
+    aad_file_unique: &[u8],
+    nonces: &mut N,
+) -> Result<Vec<u8>> {
+    let aad = build_module_aad(aad_prefix, aad_file_unique, ModuleType::Footer, 0, 0, None);
+    let nonce = nonces.next().map_err(map_crypto_err)?;
+    let ct_and_tag =
+        ematix_parquet_crypto::aead::seal(key, &nonce, &aad, plaintext).map_err(map_crypto_err)?;
+    let total = NONCE_LEN + ct_and_tag.len();
+    let mut frame = Vec::with_capacity(SIZE_PREFIX_LEN + total);
+    frame.extend_from_slice(&(total as u32).to_le_bytes());
+    frame.extend_from_slice(&nonce);
+    frame.extend_from_slice(&ct_and_tag);
+    Ok(frame)
+}
+
 /// Per-column **encrypt** context, write-side counterpart of
 /// `ColumnDecryptContext`. Carries the resolved key + AAD bytes plus
 /// a nonce source the writer drives once per module-encrypt op.

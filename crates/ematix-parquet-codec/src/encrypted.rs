@@ -23,9 +23,9 @@
 //! that follows it), so the total bytes on disk = `4 + length`.
 
 use ematix_parquet_crypto::aad::{build_module_aad, ModuleType};
-use ematix_parquet_crypto::aead::{open, TAG_LEN};
+use ematix_parquet_crypto::aead::{open, seal, TAG_LEN};
 use ematix_parquet_crypto::key::Key;
-use ematix_parquet_crypto::nonce::NONCE_LEN;
+use ematix_parquet_crypto::nonce::{NonceSource, NONCE_LEN};
 use ematix_parquet_crypto::CryptoError;
 
 use crate::error::{CodecError, Result};
@@ -184,4 +184,48 @@ pub fn split_encrypted_footer_trailer(trailer: &[u8]) -> Result<(&[u8], &[u8])> 
     })?;
     let boundary = cur.position();
     Ok((&trailer[..boundary], &trailer[boundary..]))
+}
+
+/// Per-column **encrypt** context, write-side counterpart of
+/// `ColumnDecryptContext`. Carries the resolved key + AAD bytes plus
+/// a nonce source the writer drives once per module-encrypt op.
+pub struct ColumnEncryptContext<'a, N: NonceSource> {
+    pub key: Key,
+    pub aad_prefix: Option<&'a [u8]>,
+    pub aad_file_unique: &'a [u8],
+    pub rg_ordinal: i16,
+    pub col_ordinal: i16,
+    pub nonces: &'a mut N,
+}
+
+/// Encrypt one in-memory module (page header, page body, footer)
+/// and emit the on-disk wire frame:
+/// `[length: u32 LE][nonce: 12B][ciphertext+tag]`.
+///
+/// `length` covers `nonce + ciphertext + tag`. Total bytes returned
+/// = `4 + length`.
+pub fn encrypt_module<N: NonceSource>(
+    plaintext: &[u8],
+    ctx: &mut ColumnEncryptContext<'_, N>,
+    module: ModuleType,
+    page_ordinal: Option<i16>,
+) -> Result<Vec<u8>> {
+    let aad = build_module_aad(
+        ctx.aad_prefix,
+        ctx.aad_file_unique,
+        module,
+        ctx.rg_ordinal,
+        ctx.col_ordinal,
+        page_ordinal,
+    );
+    let nonce = ctx.nonces.next().map_err(map_crypto_err)?;
+    let ct_and_tag = seal(&ctx.key, &nonce, &aad, plaintext).map_err(map_crypto_err)?;
+
+    // Wire frame: [length: u32 LE][nonce: 12B][ct||tag].
+    let total = NONCE_LEN + ct_and_tag.len();
+    let mut frame = Vec::with_capacity(SIZE_PREFIX_LEN + total);
+    frame.extend_from_slice(&(total as u32).to_le_bytes());
+    frame.extend_from_slice(&nonce);
+    frame.extend_from_slice(&ct_and_tag);
+    Ok(frame)
 }

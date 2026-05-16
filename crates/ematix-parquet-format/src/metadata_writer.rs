@@ -17,8 +17,9 @@
 use crate::compact::FieldType;
 use crate::compact_writer::Writer;
 use crate::metadata::{
-    ColumnChunk, ColumnMetaData, DataPageHeader, DataPageHeaderV2, DictionaryPageHeader,
-    FileMetaData, PageHeader, RowGroup, SchemaElement, Statistics,
+    AesGcmCtrV1, AesGcmV1, ColumnChunk, ColumnCryptoMetaData, ColumnMetaData, DataPageHeader,
+    DataPageHeaderV2, DictionaryPageHeader, EncryptionAlgorithm, EncryptionWithColumnKey,
+    FileCryptoMetaData, FileMetaData, PageHeader, RowGroup, SchemaElement, Statistics,
 };
 
 /// Encode a `PageHeader` into the compact-protocol wire form. Returns
@@ -271,14 +272,18 @@ fn encode_file_metadata(w: &mut Writer, md: &FileMetaData<'_>) {
         panic!("FileMetaData.column_orders write not yet implemented");
     }
 
-    // 8/9: encryption — Π.13e/f scope. Reader supports parsing them
-    // already (Π.13a); writer panics until the encrypted-write path
-    // lands.
-    if md.encryption_algorithm.is_some() {
-        panic!("FileMetaData.encryption_algorithm write not yet implemented (Π.13e+)");
+    // 8: encryption_algorithm (struct, optional) — Π.13e
+    if let Some(ref alg) = md.encryption_algorithm {
+        w.write_field_header(8, FieldType::Struct, prev);
+        encode_encryption_algorithm(w, alg);
+        prev = 8;
     }
-    if md.footer_signing_key_metadata.is_some() {
-        panic!("FileMetaData.footer_signing_key_metadata write not yet implemented (Π.13e+)");
+
+    // 9: footer_signing_key_metadata (binary, optional) — Π.13e
+    if let Some(km) = md.footer_signing_key_metadata {
+        w.write_field_header(9, FieldType::Binary, prev);
+        w.write_binary(km);
+        prev = 9;
     }
 
     let _ = prev;
@@ -406,6 +411,14 @@ fn encode_row_group(w: &mut Writer, rg: &RowGroup<'_>) {
     w.write_field_stop();
 }
 
+/// Encode a single `ColumnChunk` standalone. Used by tests that
+/// round-trip a `ColumnChunk` without building a whole RowGroup.
+pub fn write_column_chunk(cc: &ColumnChunk<'_>) -> Vec<u8> {
+    let mut w = Writer::new();
+    encode_column_chunk(&mut w, cc);
+    w.into_bytes()
+}
+
 fn encode_column_chunk(w: &mut Writer, cc: &ColumnChunk<'_>) {
     let mut prev: i16 = 0;
 
@@ -450,14 +463,18 @@ fn encode_column_chunk(w: &mut Writer, cc: &ColumnChunk<'_>) {
         prev = 7;
     }
 
-    // 8/9: ColumnCryptoMetaData + encrypted_column_metadata — Π.13e/f.
-    // Reader supports parsing them already (Π.13a); writer panics
-    // until the encrypted-write path lands.
-    if cc.crypto_metadata.is_some() {
-        panic!("ColumnChunk.crypto_metadata write not yet implemented (Π.13e+)");
+    // 8: crypto_metadata (struct, optional) — Π.13e
+    if let Some(ref crypto) = cc.crypto_metadata {
+        w.write_field_header(8, FieldType::Struct, prev);
+        encode_column_crypto_metadata(w, crypto);
+        prev = 8;
     }
-    if cc.encrypted_column_metadata.is_some() {
-        panic!("ColumnChunk.encrypted_column_metadata write not yet implemented (Π.13e+)");
+
+    // 9: encrypted_column_metadata (binary, optional) — Π.13e
+    if let Some(bytes) = cc.encrypted_column_metadata {
+        w.write_field_header(9, FieldType::Binary, prev);
+        w.write_binary(bytes);
+        prev = 9;
     }
 
     let _ = prev;
@@ -563,6 +580,144 @@ fn encode_dictionary_page_header(w: &mut Writer, dictph: &DictionaryPageHeader) 
         // No body byte — the type code carries the value.
     }
 
+    w.write_field_stop();
+}
+
+// ============================================================
+// Parquet Modular Encryption (PME) writers — Π.13e
+//
+// Mirrors the reader functions in `metadata.rs` PME section.
+// Used both inline (FileMetaData fields 8/9, ColumnChunk fields
+// 8/9) and standalone via `write_file_crypto_metadata` for the
+// encrypted-footer trailer (Π.13f).
+// ============================================================
+
+/// Encode a standalone `FileCryptoMetaData` — the trailer that
+/// lives between the encrypted FileMetaData and the `PARE` magic
+/// in encrypted-footer mode. Π.13f uses this; reader counterpart
+/// is `metadata::read_file_crypto_metadata`.
+pub fn write_file_crypto_metadata(fcm: &FileCryptoMetaData<'_>) -> Vec<u8> {
+    let mut w = Writer::new();
+    encode_file_crypto_metadata(&mut w, fcm);
+    w.into_bytes()
+}
+
+fn encode_file_crypto_metadata(w: &mut Writer, fcm: &FileCryptoMetaData<'_>) {
+    let mut prev: i16 = 0;
+    // 1: encryption_algorithm (struct, required)
+    let alg = fcm
+        .encryption_algorithm
+        .as_ref()
+        .expect("FileCryptoMetaData.encryption_algorithm is required");
+    w.write_field_header(1, FieldType::Struct, prev);
+    encode_encryption_algorithm(w, alg);
+    prev = 1;
+
+    // 2: key_metadata (binary, optional)
+    if let Some(km) = fcm.key_metadata {
+        w.write_field_header(2, FieldType::Binary, prev);
+        w.write_binary(km);
+        prev = 2;
+    }
+    let _ = prev;
+    w.write_field_stop();
+}
+
+fn encode_encryption_algorithm(w: &mut Writer, alg: &EncryptionAlgorithm<'_>) {
+    // Thrift union — exactly one variant tag is written.
+    match alg {
+        EncryptionAlgorithm::AesGcmV1(v) => {
+            w.write_field_header(1, FieldType::Struct, 0);
+            encode_aes_gcm_v1(w, v);
+        }
+        EncryptionAlgorithm::AesGcmCtrV1(v) => {
+            w.write_field_header(2, FieldType::Struct, 0);
+            encode_aes_gcm_ctr_v1(w, v);
+        }
+    }
+    w.write_field_stop();
+}
+
+fn encode_aes_gcm_v1(w: &mut Writer, v: &AesGcmV1<'_>) {
+    let mut prev: i16 = 0;
+    if let Some(p) = v.aad_prefix {
+        w.write_field_header(1, FieldType::Binary, prev);
+        w.write_binary(p);
+        prev = 1;
+    }
+    if let Some(u) = v.aad_file_unique {
+        w.write_field_header(2, FieldType::Binary, prev);
+        w.write_binary(u);
+        prev = 2;
+    }
+    if let Some(b) = v.supply_aad_prefix {
+        // Thrift compact protocol: a bool field's value is carried
+        // in the field-header type nibble (BoolTrue / BoolFalse).
+        let t = if b {
+            FieldType::BoolTrue
+        } else {
+            FieldType::BoolFalse
+        };
+        w.write_field_header(3, t, prev);
+        prev = 3;
+    }
+    let _ = prev;
+    w.write_field_stop();
+}
+
+fn encode_aes_gcm_ctr_v1(w: &mut Writer, v: &AesGcmCtrV1<'_>) {
+    let mut prev: i16 = 0;
+    if let Some(p) = v.aad_prefix {
+        w.write_field_header(1, FieldType::Binary, prev);
+        w.write_binary(p);
+        prev = 1;
+    }
+    if let Some(u) = v.aad_file_unique {
+        w.write_field_header(2, FieldType::Binary, prev);
+        w.write_binary(u);
+        prev = 2;
+    }
+    if let Some(b) = v.supply_aad_prefix {
+        let t = if b {
+            FieldType::BoolTrue
+        } else {
+            FieldType::BoolFalse
+        };
+        w.write_field_header(3, t, prev);
+        prev = 3;
+    }
+    let _ = prev;
+    w.write_field_stop();
+}
+
+fn encode_column_crypto_metadata(w: &mut Writer, c: &ColumnCryptoMetaData<'_>) {
+    match c {
+        ColumnCryptoMetaData::EncryptionWithFooterKey => {
+            // Marker variant — empty struct.
+            w.write_field_header(1, FieldType::Struct, 0);
+            w.write_field_stop(); // empty inner struct
+        }
+        ColumnCryptoMetaData::EncryptionWithColumnKey(k) => {
+            w.write_field_header(2, FieldType::Struct, 0);
+            encode_encryption_with_column_key(w, k);
+        }
+    }
+    w.write_field_stop();
+}
+
+fn encode_encryption_with_column_key(w: &mut Writer, k: &EncryptionWithColumnKey<'_>) {
+    // 1: path_in_schema (list<binary>, required)
+    w.write_field_header(1, FieldType::List, 0);
+    w.write_list_header(k.path_in_schema.len(), FieldType::Binary);
+    for seg in &k.path_in_schema {
+        w.write_binary(seg);
+    }
+
+    // 2: key_metadata (binary, optional)
+    if let Some(km) = k.key_metadata {
+        w.write_field_header(2, FieldType::Binary, 1);
+        w.write_binary(km);
+    }
     w.write_field_stop();
 }
 

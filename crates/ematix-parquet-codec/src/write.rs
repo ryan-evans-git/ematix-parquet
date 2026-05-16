@@ -426,6 +426,44 @@ pub fn write_i32_column_to_path(path: impl AsRef<Path>, name: &str, values: &[i3
     write_i32_column_to_path_with_codec(path, name, values, CompressionCodec::Uncompressed)
 }
 
+/// PME plaintext-footer mode: write a single i32 column encrypted
+/// under `key`. The footer stays plaintext but advertises
+/// `EncryptionAlgorithm::AesGcmV1`; the single column chunk's
+/// data page header + body are both AES-GCM-sealed using the
+/// wire frame `[length: u32 LE][nonce: 12B][ct+tag]`.
+///
+/// Footer-key mode only (no per-column keys; `ColumnChunk.crypto_metadata
+/// = EncryptionWithFooterKey`). 16-byte random `aad_file_unique` is
+/// generated per file. The caller-supplied `aad_prefix` is NOT embedded
+/// in the metadata — readers must supply it themselves
+/// (`supply_aad_prefix = true`).
+#[cfg(feature = "encryption")]
+pub fn write_i32_column_to_path_encrypted(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[i32],
+    key: &ematix_parquet_crypto::key::Key,
+    aad_prefix: Option<&[u8]>,
+) -> Result<()> {
+    let body = encode_plain_i32(values);
+    let stats = stats_i32(values);
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_encrypted(
+        &mut w,
+        name,
+        ParquetType::Int32,
+        values.len(),
+        body,
+        CompressionCodec::Uncompressed,
+        stats,
+        key,
+        aad_prefix,
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
 pub fn write_f64_column_to_path(path: impl AsRef<Path>, name: &str, values: &[f64]) -> Result<()> {
     write_f64_column_to_path_with_codec(path, name, values, CompressionCodec::Uncompressed)
 }
@@ -762,6 +800,211 @@ fn write_single_column<W: Write>(
     let footer_len = footer.len() as u32;
     out.write_all(&footer).map_err(io_to_codec)?;
     written += footer.len() as u64;
+
+    out.write_all(&footer_len.to_le_bytes())
+        .map_err(io_to_codec)?;
+    out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
+    written += 8;
+
+    let _ = written;
+    Ok(())
+}
+
+/// Encrypted-write counterpart of `write_single_column`. Emits a
+/// single-column-chunk file whose data page header + body are both
+/// AES-GCM-sealed under `key`. Footer stays plaintext (PAR1 magic)
+/// but advertises `EncryptionAlgorithm::AesGcmV1`.
+#[cfg(feature = "encryption")]
+#[allow(clippy::too_many_arguments)]
+fn write_single_column_encrypted<W: Write>(
+    out: &mut W,
+    column_name: &str,
+    parquet_type: ParquetType,
+    num_values: usize,
+    body: Vec<u8>,
+    codec: CompressionCodec,
+    stats: ColumnStats,
+    key: &ematix_parquet_crypto::key::Key,
+    aad_prefix: Option<&[u8]>,
+) -> Result<()> {
+    use crate::encrypted::{encrypt_module, ColumnEncryptContext};
+    use ematix_parquet_crypto::aad::ModuleType;
+    use ematix_parquet_crypto::nonce::RandomNonceSource;
+    use ematix_parquet_format::metadata::{AesGcmV1, ColumnCryptoMetaData, EncryptionAlgorithm};
+
+    // 16-byte random file-unique per spec recommendation.
+    let file_unique = ematix_parquet_crypto::nonce::random_bytes::<16>()
+        .map_err(|e| CodecError::Decompress(format!("PME encrypt: rng: {e}")))?;
+
+    let mut nonces = RandomNonceSource;
+    let mut ctx = ColumnEncryptContext {
+        key: key.clone(),
+        aad_prefix,
+        aad_file_unique: &file_unique,
+        rg_ordinal: 0,
+        col_ordinal: 0,
+        nonces: &mut nonces,
+    };
+
+    out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
+    let mut written: u64 = 4;
+
+    let uncompressed_size = body.len();
+    let compressed_body = compress_body(&body, codec)?;
+    let compressed_size = compressed_body.len();
+
+    let data_page_header = PageHeader {
+        page_type: PageType::DataPage,
+        uncompressed_page_size: uncompressed_size as i32,
+        compressed_page_size: compressed_size as i32,
+        crc: None,
+        data_page_header: Some(DataPageHeader {
+            num_values: num_values as i32,
+            encoding: Encoding::Plain,
+            definition_level_encoding: Encoding::Rle,
+            repetition_level_encoding: Encoding::Rle,
+            statistics: Some(stats.as_statistics()),
+        }),
+        index_page_header: None,
+        dictionary_page_header: None,
+        data_page_header_v2: None,
+    };
+    let plaintext_header = write_page_header(&data_page_header);
+
+    // Seal the page header bytes (DataPageHeader module, page_ord=0)
+    // and then the compressed body (DataPage module, same page_ord).
+    let encrypted_header = encrypt_module(
+        &plaintext_header,
+        &mut ctx,
+        ModuleType::DataPageHeader,
+        Some(0),
+    )?;
+    let encrypted_body = encrypt_module(&compressed_body, &mut ctx, ModuleType::DataPage, Some(0))?;
+
+    let data_page_offset = written as i64;
+    out.write_all(&encrypted_header).map_err(io_to_codec)?;
+    written += encrypted_header.len() as u64;
+    out.write_all(&encrypted_body).map_err(io_to_codec)?;
+    written += encrypted_body.len() as u64;
+
+    // The on-disk *encrypted* sizes go into ColumnMetaData. The
+    // uncompressed size is still the original plaintext body length
+    // (spec convention — encrypted_size is implicit from the wire
+    // frame length prefix that the reader walks).
+    let total_uncompressed_size = (plaintext_header.len() + uncompressed_size) as i64;
+    let total_compressed_size = (encrypted_header.len() + encrypted_body.len()) as i64;
+    let column_name_bytes = column_name.as_bytes();
+
+    let root = SchemaElement {
+        column_type: None,
+        type_length: None,
+        repetition_type: None,
+        name: b"schema",
+        num_children: Some(1),
+        converted_type: None,
+        scale: None,
+        precision: None,
+        field_id: None,
+        logical_type: None,
+    };
+    let leaf = SchemaElement {
+        column_type: Some(parquet_type),
+        type_length: None,
+        repetition_type: Some(FieldRepetitionType::Required),
+        name: column_name_bytes,
+        num_children: None,
+        converted_type: None,
+        scale: None,
+        precision: None,
+        field_id: None,
+        logical_type: None,
+    };
+    let cm = ColumnMetaData {
+        column_type: parquet_type,
+        encodings: vec![Encoding::Plain, Encoding::Rle],
+        path_in_schema: vec![column_name_bytes],
+        codec,
+        num_values: num_values as i64,
+        total_uncompressed_size,
+        total_compressed_size,
+        key_value_metadata: None,
+        data_page_offset,
+        index_page_offset: None,
+        dictionary_page_offset: None,
+        statistics: Some(stats.as_statistics()),
+        encoding_stats: None,
+        bloom_filter_offset: None,
+        bloom_filter_length: None,
+        size_statistics: None,
+    };
+    let cc = ColumnChunk {
+        file_path: None,
+        file_offset: data_page_offset,
+        meta_data: Some(cm),
+        offset_index_offset: None,
+        offset_index_length: None,
+        column_index_offset: None,
+        column_index_length: None,
+        crypto_metadata: Some(ColumnCryptoMetaData::EncryptionWithFooterKey),
+        encrypted_column_metadata: None,
+    };
+    let rg = RowGroup {
+        columns: vec![cc],
+        total_byte_size: total_uncompressed_size,
+        num_rows: num_values as i64,
+        sorting_columns: None,
+        file_offset: None,
+        total_compressed_size: None,
+        ordinal: Some(0),
+    };
+    let md = FileMetaData {
+        version: 1,
+        schema: vec![root, leaf],
+        num_rows: num_values as i64,
+        row_groups: vec![rg],
+        key_value_metadata: None,
+        created_by: Some(b"ematix-parquet 0.0.1"),
+        column_orders: None,
+        encryption_algorithm: Some(EncryptionAlgorithm::AesGcmV1(AesGcmV1 {
+            aad_prefix: None,
+            aad_file_unique: Some(&file_unique),
+            // Set when the caller passes an aad_prefix that is NOT
+            // embedded in the file — readers must obtain it
+            // themselves.
+            supply_aad_prefix: aad_prefix.map(|_| true),
+        })),
+        footer_signing_key_metadata: None,
+    };
+    let footer = write_file_metadata(&md);
+
+    // Plaintext-footer-mode signature per spec:
+    //   [ FileMetaData ][ nonce: 12B ][ tag: 16B ]
+    // computed as AES-GCM over the FileMetaData bytes with the
+    // footer key and Footer-module AAD. parquet-rs verifies this on
+    // read, even though the footer itself is unencrypted.
+    use ematix_parquet_crypto::aad::build_module_aad;
+    use ematix_parquet_crypto::aead::seal;
+    use ematix_parquet_crypto::nonce::NonceSource;
+
+    let footer_aad = build_module_aad(aad_prefix, &file_unique, ModuleType::Footer, 0, 0, None);
+    let footer_nonce = ctx
+        .nonces
+        .next()
+        .map_err(|e| CodecError::Decompress(format!("PME encrypt: footer nonce: {e}")))?;
+    let ct_and_tag = seal(key, &footer_nonce, &footer_aad, &footer)
+        .map_err(|e| CodecError::Decompress(format!("PME encrypt: footer seal: {e}")))?;
+    // We need just the trailing tag (the ciphertext we discard;
+    // the FileMetaData stays plaintext on disk). `aes-gcm` always
+    // returns ciphertext || tag, so the last 16 bytes are the tag.
+    let tag = &ct_and_tag[ct_and_tag.len() - 16..];
+
+    let footer_len = (footer.len() + 12 + 16) as u32;
+    out.write_all(&footer).map_err(io_to_codec)?;
+    written += footer.len() as u64;
+    out.write_all(&footer_nonce).map_err(io_to_codec)?;
+    written += 12;
+    out.write_all(tag).map_err(io_to_codec)?;
+    written += 16;
 
     out.write_all(&footer_len.to_le_bytes())
         .map_err(io_to_codec)?;

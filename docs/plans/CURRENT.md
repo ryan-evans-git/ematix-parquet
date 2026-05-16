@@ -10,11 +10,13 @@ Tracks the work between v0.1.1 and v1.0. Phases use the existing `Π.N` conventi
 | Π.4   | Write-side production parity (stats, multi-RG, dictionary encoding)  | ✓ Done   |
 | Π.5   | Read-side predicate pushdown (page-index pruning, façade dispatch)   | ✓ Done   |
 | Π.6   | DataPageV2 (read + write) + Bloom-filter decoder                     | ✓ Done   |
-| Π.7   | BYTE_STREAM_SPLIT (NEON kernel coverage deferred to v1.1)            | ✓ Done   |
+| Π.7   | BYTE_STREAM_SPLIT + first NEON wave (bw=14, gather opt, bw=17 lookup) | ✓ Done   |
+| Π.8   | Performance polish: byte_array zero-copy, more NEON widths, RLE coalesce | ✓ Done |
 
-The v1.0 cut criteria are met. Remaining open item — NEON kernels for
-mid-range widths — is performance polish, not a correctness or interop
-gap; deferred to v1.1.
+v1.0 cut criteria are already met (correctness, interop, beats
+parquet-rs end-to-end on TPC-H lineitem). Π.8 is concrete performance
+work to widen the lead — measured by `bench_decode` against parquet-rs
+and polars on TPC-H lineitem at SF=1 and SF=10.
 
 ---
 
@@ -222,16 +224,17 @@ page for low-cardinality columns.
   writes a BYTE_STREAM_SPLIT-encoded file, our decoder reads the
   page body and asserts bit-exact recovery via `to_bits()`.
 
-### Deferred to v1.1: NEON kernels for widths 1, 4, 5, 8, 18, 20, 21
+### Π.7 deferred items (subsequent work)
 
-Each width is its own focused NEON-engineering effort against a
-benchmark — the existing bw=12 and bw=17 kernels are 561 lines of
-hand-tuned NEON between them. The scalar const-generic fallback is
-correct for every width and is auto-vectorised by LLVM at many of
-them; absent profiling that points at a specific width as the
-bottleneck, more NEON kernels are speculative work. Concrete
-trigger to revisit: a benchmark on a real workload that shows a
-specific width dominating decode time on AArch64.
+Picked up in Π.8b: bw=15, bw=16, bw=18 NEON kernels — all at
+memory bandwidth.
+
+Still open and explicitly out of scope: NEON kernels for widths
+1, 4, 5, 8, 20, 21. The scalar const-generic fallback hits
+~7-9 GB/s output for these — fast enough that the gather (not the
+unpack) dominates on the columns where they appear in TPC-H
+lineitem. Concrete trigger to revisit: a real-workload benchmark
+that shows one of these widths dominating decode time.
 
 ---
 
@@ -246,5 +249,116 @@ All four phases (Π.4, Π.5, Π.6, Π.7) are shipped:
 
 Test coverage: 427 tests across the workspace, every passing.
 
-The remaining roadmap item — NEON kernels for additional widths —
-is an open performance project, not a correctness gap.
+---
+
+## Π.8 — Performance polish ✓ DONE
+
+The v1.0 cut criteria are met. Π.8 is concrete performance work to
+widen the lead over `parquet-rs` and `polars-parquet`. Each sub-phase
+ships behind a benchmark — no speculative SIMD or "should be faster"
+claims. The harness is `bench_decode` against TPC-H lineitem at SF=1
+and SF=10, with `parquet-rs` and `polars-parquet` as the cross-check.
+
+### Sequencing
+
+I'm reordering from how the items were originally listed, by
+expected end-to-end ROI on the TPC-H lineitem benchmark:
+
+| Order | Sub-phase | Why first / Why later |
+| ----- | --------- | --------------------- |
+| 1 | Π.8a — byte_array zero-copy gather | Biggest single read-perf win available. l_returnflag is 43-83 ms today, dominated by 1M tiny mallocs from `dict[i].clone()`. Estimated 5-20× speedup → drops byte_array decode from ~50 ms to ~3-10 ms. |
+| 2 | Π.8b — Mid-range NEON widths (bw=15, 16, 18) | Mechanical work that mirrors bw=14/17. Modest end-to-end wins (5-10% on l_orderkey, l_partkey, l_extendedprice). Validates the NEON pattern is repeatable and doesn't require novel design. |
+| 3 | Π.8c — Smarter RLE encoder (run-coalescing on writes) | Write-side only. File-size reduction on highly-repetitive dict-encoded columns. Measured by output bytes vs `parquet-rs`-written equivalent. Modest (5-15% size reduction on l_returnflag-class output). |
+
+Small-width NEON (bw=1, 2, 3, 4, 6) is **explicitly deferred** —
+it's not on the v1.1 path. The microbench shows scalar bw=1-6 at
+0.47-0.61 ns/val (~7-9 GB/s output), which is already fast enough
+that on l_returnflag the gather, not the unpack, dominates.
+
+### Π.8a — byte_array zero-copy gather ✓ DONE
+
+**Shipped:** new `read_column_byte_array_offsets(file, rg, col) ->
+Result<(Vec<u8>, Vec<u32>)>` returning Arrow-style flat bytes +
+N+1 offsets. The dict-gather hot loop validates indices in a
+pre-pass then uses `ptr::copy_nonoverlapping` with raw pointer
+writes — no per-row bounds check, no `Vec::push` capacity check,
+no per-row allocator call.
+
+**Bench result.** l_returnflag (1M rows × 1-byte values, dict-encoded)
+went from 43 ms → **4.4 ms** — a 10× speedup, 91% faster than
+parquet-rs, 60× faster than polars-parquet. The hypothesis that
+1M `dict[i].clone()` mallocs were the bottleneck was correct.
+
+6 oracle tests cover PLAIN + dict round-trips, agreement with the
+existing `Vec<Vec<u8>>` entry point, single-byte (l_returnflag) shape,
+empty column, variable-length values, and a parquet-rs-written file
+cross-check.
+
+### Π.8b — Mid-range NEON widths: bw=15, 16, 18 ✓ DONE
+
+**Shipped:** three new kernel pairs (`unpack_indices_into_neon_bw{15,16,18}`
++ `unpack_lookup_into_neon_bw{15,16,18}`), wired into both
+`unpack_indices_into` and `unpack_lookup_into` dispatchers in
+`bitpack.rs`. Each kernel hits the ~76-96 GB/s output bandwidth
+ceiling on M-series.
+
+**Microbench.** Width / scalar / NEON / speedup:
+- bw=15: 0.55 ms / 0.05 ms / **~10×**
+- bw=16: 0.58 ms / 0.04 ms / **~14×** (byte-aligned, fastest)
+- bw=18: 0.58 ms / 0.05 ms / **~10×**
+
+**End-to-end.** No regression on the lineitem matrix; modest wins
+on l_orderkey (bit-unpack was no longer the bottleneck after Π.7).
+The kernels are in place for any workload that has these widths
+dominating.
+
+**Implementation note.** First attempt used
+`vextq_u8(v0, vld1q_u8(src + 8), 7)` to construct a "bytes 7..23"
+view for the high lanes. That LOOKS contiguous but actually returns
+`v0[7..16] + v1[0..7]` = bytes 7..15 + bytes 8..14 (REPEATED). The
+fix is `vld1q_u8(src + 7)` — direct load. Spotted by a microbench
+assertion failure on bw=18 lane 7 (which needs byte 16/17
+contributions to survive the mask).
+
+### Π.8c — Smarter RLE encoder ✓ DONE
+
+**Shipped:** `rle::encode_rle_bit_packed` with run-coalescing.
+`write_single_column_dict` now uses it instead of the single-run
+encoder. The reference single-run encoder stays in place for tests.
+
+**Algorithm.** Walks the index stream identifying maximal value-runs.
+Runs of length ≥ 8 emit RLE; shorter runs accumulate in a bit-pack
+buffer that flushes (only the final flush is allowed to be
+zero-padded; intermediate flushes borrow from the upcoming RLE run
+to align to a multiple of 8).
+
+**Size oracle results.**
+- 100K rows × 10000-element runs (10 distinct values, bit_width=4):
+  on-disk file < 4 KB. Bit-pack alone would produce ~50KB index
+  stream; RLE coalescing collapses it to ~30 bytes.
+- 30K cycling input (3 distinct, no runs ≥ 8): no regression vs
+  single-run encoder.
+- 50K mixed shape (80%-hot value with cold bursts): file < 2 KB.
+
+**Implementation note — alignment via borrow.** A naive "pad with
+zeros and emit" approach for intermediate flushes leaks padding
+into the value stream because the decoder only stops at the global
+`num_values` cap, not at end-of-run markers. The borrow-and-realign
+trick avoids this: when an RLE-worthy run interrupts a non-aligned
+bit-pack accumulator, take `8 - pending_mod` values from the run
+to align the bit-pack flush, then RLE the residual. Spotted by a
+unit test (`smart_ends_with_long_run`) that decoded one extra
+zero where it shouldn't have.
+
+### Out of scope for Π.8
+
+- **Smaller-width NEON** (bw=1, 2, 3, 4, 6) — scalar already at
+  ~7-9 GB/s output; adding NEON would help in narrow benchmarks but
+  not on the lineitem decode matrix. Revisit if a real workload
+  shows a small-width column dominating decode time.
+- **Bloom-filter writer** — symmetric to the decoder, but no real
+  reader will pay attention to a bloom filter on output until we have
+  a story for who needs us to write one.
+- **Per-column encoding choice on `write_table_*`** — would let
+  callers mix PLAIN and dict per column. Useful but invasive (new
+  `WriteOptions` shape). Land it when a real consumer asks.

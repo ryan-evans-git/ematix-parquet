@@ -78,22 +78,31 @@ codec × type combination against `parquet-rs`.
 
 **End-to-end TPC-H lineitem decode** (Apple Silicon, median of 12 iters):
 
-| Column        | Type        | Width | vs `parquet-rs` (SF=1) | vs `parquet-rs` (SF=10) | vs `polars-parquet` |
-| ------------- | ----------- | ----- | ---------------------- | ----------------------- | ------------------- |
-| `l_orderkey`  | INT64       | mixed | ~at parity / +7%       | ~at parity              | 75-99% faster       |
-| `l_suppkey`   | INT64       | bw=14 | **+16% faster**        | **+48% faster (~2×)**   | 81-97% faster       |
-| `l_shipdate`  | INT32       | bw=12 | **+11% faster**        | **+46% faster (~2×)**   | 85-99% faster       |
-| `l_returnflag`| BYTE_ARRAY  | bw=2  | **+12% faster**        | **+13% faster**         | 83-99% faster       |
+| Column                       | Type        | Width | vs `parquet-rs` (SF=1)  | vs `polars-parquet` |
+| ---------------------------- | ----------- | ----- | ----------------------- | ------------------- |
+| `l_orderkey`                 | INT64       | mixed | +4-7% faster            | 72-99% faster       |
+| `l_suppkey`                  | INT64       | bw=14 | **+17% faster**         | 88-97% faster       |
+| `l_shipdate`                 | INT32       | bw=12 | **+12% faster**         | 90-99% faster       |
+| `l_returnflag` (`Vec<Vec<u8>>`)| BYTE_ARRAY | bw=2  | **+7-12% faster**       | 83-99% faster       |
+| `l_returnflag` (offsets API) | BYTE_ARRAY  | bw=2  | **+91% faster (10×)**   | **98-99% faster (60×)** |
 
 `bench_decode` is the harness — `cargo run --release --example bench_decode`
 with `TPCH_DATA_DIR` pointing at a TPC-H lineitem.parquet.
 
-**SIMD bit-unpackers (NEON, AArch64)** — every kernel hits the
-~78 GB/s output ceiling on M-series. Specialised widths:
+The byte_array "offsets API" (`read_column_byte_array_offsets`)
+returns Arrow-style flat bytes + offsets and skips the per-row
+`Vec` allocation that dominates the standard `Vec<Vec<u8>>` path.
+Use it for any consumer that doesn't need owned per-row Vecs.
 
-- bw=12: dates (`l_shipdate`, `l_commitdate`, `l_receiptdate`).
-- bw=14: keys (`l_suppkey` 100%) — 16× the scalar baseline.
-- bw=17: prices/keys (`l_extendedprice`, `l_partkey`, `l_orderkey`).
+**SIMD bit-unpackers (NEON, AArch64)** — every specialised kernel
+hits the ~76-96 GB/s output ceiling on M-series. Covered widths:
+
+- **bw=12**: dates (`l_shipdate`, `l_commitdate`, `l_receiptdate`).
+- **bw=14**: keys (`l_suppkey` 100%) — 16× the scalar baseline.
+- **bw=15, 16, 18**: tail of the price/key columns. bw=16 is byte-
+  aligned and is the fastest kernel of all (~96 GB/s output).
+- **bw=17**: prices/keys (`l_extendedprice`, `l_partkey`,
+  `l_orderkey`) — the dominant gather width.
 
 Each width has both a raw-indices kernel (for index-only consumers)
 and a fused-gather lookup kernel that interleaves dict gather with
@@ -117,10 +126,17 @@ dictionary entries selected by an upstream bitmap, with an 8-row
 bitmap-byte skip for cold selectivity. Pairs with the fused decode
 to keep the slow path off the hot loop.
 
+**Smart RLE/bit-pack encoder on writes** — dict-encoded columns
+emit RLE runs for repeated indices (length ≥ 8) instead of always
+bit-packing. Borrow-and-realign keeps intermediate bit-pack runs
+on multiples of 8 without leaking padding into the value stream.
+For long-run-dominated input (e.g., a sorted dimension key
+repeated thousands of times), the index stream shrinks 10-100×.
+
 ### Test coverage
 
 Oracle tests against `parquet-rs` cover both directions on every
-codec and every type. ~430 tests across 40+ test binaries. The
+codec and every type. ~445 tests across 40+ test binaries. The
 matrix:
 
 **Read side** — `parquet-rs` writes files we then decode and
@@ -231,8 +247,7 @@ interop gaps:
 
 | Item                                                                  | Status   |
 | --------------------------------------------------------------------- | -------- |
-| Additional NEON kernels for mid-range widths (1, 4, 5, 8, 18, 20, 21) | Open — performance polish; bw=12/14/17 already cover the dominant TPC-H widths |
-| Smarter RLE encoder (run-coalescing on writes)                        | Open — current single-bit-packed-run output is spec-compliant; benchmark before optimising |
+| Additional NEON kernels for small widths (1, 4, 5, 8, 20, 21)         | Open — scalar already at ~7-9 GB/s output; gather dominates on these columns. Revisit if a workload demands |
 | Per-column encoding choice on `write_table_to_path_*`                 | Open — single-column dict entry points exist; multi-column needs a `ColumnEncoding` opt-in |
 | Bloom-filter writer                                                   | Open — decoder ships; writer is the symmetric work |
 

@@ -2,18 +2,20 @@
 
 A hand-rolled Apache Parquet implementation in Rust — both read and
 write — optimised for AArch64 (NEON) and analytical query workloads.
-The goal is a self-contained crate that competes with `parquet-rs` on
-the shapes where most analytical queries actually live.
+A self-contained, dependency-light codec built for the shapes most
+analytical queries hit: dict-encoded numeric columns, RLE/bit-packed
+indices, selective filters with sparse downstream gather.
 
 Sibling project to [ematix-flow](https://github.com/ryan-evans-git/ematix-flow);
 designed to be a clean drop-in for high-throughput columnar scans and
-a write path that produces files the rest of the ecosystem can read.
+a write path that produces spec-compliant files.
 
 ## Status
 
 `v0.4.x` — v1.0 cut criteria are met (every Parquet shape we read
-or write is covered, predicate pushdown lights up end-to-end,
-TPC-H lineitem decode beats `parquet-rs` and `polars-parquet`).
+or write is covered, predicate pushdown lights up end-to-end, and
+the decode hot paths are hand-tuned for the columns that dominate
+analytical TPC-H workloads).
 The v0.2 cycle landed Photon-inspired analytical hot paths
 (decode-into-caller-buffer, width-generic predicate fusion across
 every NEON kernel, streaming batched-decode iterator). The v0.3
@@ -82,22 +84,27 @@ write_table_to_path(path, &columns, CompressionCodec::Snappy)?;
 
 All five mainstream codecs (Snappy / Zstd / Gzip / Brotli / LZ4_RAW)
 are wired on the write side. Round-trip oracles validate every
-codec × type combination against `parquet-rs`.
+codec × type combination by writing with the codec and reading
+back through a reference Parquet implementation.
 
 ### Performance
 
 **End-to-end TPC-H lineitem decode** (Apple Silicon, median of 12 iters):
 
-| Column                       | Type        | Width | vs `parquet-rs` (SF=1)  | vs `polars-parquet` |
-| ---------------------------- | ----------- | ----- | ----------------------- | ------------------- |
-| `l_orderkey`                 | INT64       | mixed | +4-7% faster            | 72-99% faster       |
-| `l_suppkey`                  | INT64       | bw=14 | **+17% faster**         | 88-97% faster       |
-| `l_shipdate`                 | INT32       | bw=12 | **+12% faster**         | 90-99% faster       |
-| `l_returnflag` (`Vec<Vec<u8>>`)| BYTE_ARRAY | bw=2  | **+7-12% faster**       | 83-99% faster       |
-| `l_returnflag` (offsets API) | BYTE_ARRAY  | bw=2  | **+91% faster (10×)**   | **98-99% faster (60×)** |
+| Column                          | Type        | Width | Median per call |
+| ------------------------------- | ----------- | ----- | --------------- |
+| `l_orderkey`                    | INT64       | mixed | ~3.8 ms         |
+| `l_suppkey`                     | INT64       | bw=14 | ~0.8 ms         |
+| `l_shipdate`                    | INT32       | bw=12 | ~0.8 ms         |
+| `l_returnflag` (`Vec<Vec<u8>>`) | BYTE_ARRAY  | bw=2  | ~43 ms (allocating per row) |
+| `l_returnflag` (offsets API)    | BYTE_ARRAY  | bw=2  | ~2.7 ms         |
 
 `bench_decode` is the harness — `cargo run --release --example bench_decode`
-with `TPCH_DATA_DIR` pointing at a TPC-H lineitem.parquet.
+with `TPCH_DATA_DIR` pointing at a TPC-H lineitem.parquet. The
+byte_array offsets API (`read_column_byte_array_offsets_into`)
+amortises the per-row Vec allocation that dominates the standard
+`Vec<Vec<u8>>` path — the right choice for low-cardinality
+dict-encoded BYTE_ARRAY columns.
 
 The byte_array "offsets API" (`read_column_byte_array_offsets`)
 returns Arrow-style flat bytes + offsets and skips the per-row
@@ -203,19 +210,19 @@ Composes Π.9's primitives — `gather_dict_at_bitmap_into` for
 dict-encoded pages, new `plain_sparse_decode_*` for PLAIN — with
 a per-page popcount-skip that drops fully-dead pages without
 decompression. End-to-end Q14 codec-layer measurement on TPC-H
-lineitem SF=1: late-mat 13.26 ms vs baseline 14.03 ms (5.5%
-faster at 1.4% selectivity). The bigger ~2 ms Polars-gap win
-lives at the engine layer where Arrow construction is skipped
-on filtered rows.
+lineitem SF=1: late-mat 13.26 ms vs full-decode-then-filter
+14.03 ms (5.5% faster at 1.4% selectivity). Bigger wins live at
+the engine layer where Arrow construction is skipped on filtered
+rows.
 
 ### Test coverage
 
-Oracle tests against `parquet-rs` cover both directions on every
-codec and every type. ~495 tests across 40+ test binaries. The
-matrix:
+Oracle tests against reference Parquet implementations cover both
+directions on every codec and every type. ~495 tests across 40+
+test binaries. The matrix:
 
-**Read side** — `parquet-rs` writes files we then decode and
-diff value-by-value:
+**Read side** — a reference implementation writes files we then
+decode and diff value-by-value:
 
 - TPC-H SF=1 lineitem column oracles (i64 / dict / byte_array /
   Q14-shape multi-column / page-index range selection)
@@ -225,8 +232,8 @@ diff value-by-value:
 - High-level façade: i32 / i64 / f64 / byte_array against
   TPC-H lineitem
 
-**Write side** — we write the file and `parquet-rs` reads it
-back, plus a symmetric check via our own reader:
+**Write side** — we write the file and a reference implementation
+reads it back, plus a symmetric check via our own reader:
 
 - PLAIN i64 / i32 / f64 / bool / byte_array round-trip
 - Snappy / Zstd / Gzip / Brotli / LZ4_RAW round-trip per codec
@@ -245,10 +252,10 @@ Under `crates/ematix-parquet-codec/examples/`:
 
 | Example              | What it shows                                                           |
 | -------------------- | ----------------------------------------------------------------------- |
-| `bench_decode`       | End-to-end column decode vs `parquet-rs` and `polars` for i64/i32/utf8 |
+| `bench_decode`       | End-to-end column decode timings on TPC-H lineitem (i64/i32/utf8)       |
 | `bench_late_mat`     | Q14 predicate via late materialisation: ~14.6 ms end-to-end (TPC-H SF=1) |
 | `bench_unpack`       | Bit-unpack microbench across widths 1–32 (drives SIMD ROI calls)        |
-| `bench_snappy`       | Snappy decompression vs `snap` crate                                    |
+| `bench_snappy`       | Snappy decompression throughput                                          |
 | `probe_bitwidths`    | Reports actual bit-widths per column on a given Parquet file            |
 
 The Q14 win comes from the fused decode path: a single NEON loop
@@ -311,16 +318,16 @@ For zero-copy or per-page access (Arrow integration, predicate-fused
 decode, custom dictionary handling), drop down to the low-level
 decoders directly. `ematix-flow`'s
 [`ematix_parquet_bridge.rs`](https://github.com/ryan-evans-git/ematix-flow/blob/main/crates/ematix-flow-core/src/ematix_parquet_bridge.rs)
-is the canonical example — it produces Arrow `RecordBatch`es from
-ematix-parquet column chunks without going through `parquet-rs`'s
-`ParquetRecordBatchReader`.
+is the canonical example — it produces Arrow `RecordBatch`es
+directly from raw column-chunk bytes without an intermediate
+high-level reader.
 
 ## What's still open
 
 v1.0 cut criteria for the codec are met: every Parquet shape we
 read or write is covered, predicate pushdown lights up end-to-end,
-and TPC-H lineitem decode beats `parquet-rs` and `polars-parquet`
-on Apple Silicon.
+and the decode hot paths are hand-tuned for the columns that
+dominate analytical TPC-H workloads on Apple Silicon.
 
 The road from v0.2 to v2.0 broadens platform coverage and pushes
 the perf ceiling further — **see `docs/plans/CURRENT.md`** for

@@ -12,7 +12,7 @@ a write path that produces spec-compliant files.
 
 ## Status
 
-`v0.6.x` — v1.0 cut criteria are met (every Parquet shape we read
+`v0.8.x` — v1.0 cut criteria are met (every Parquet shape we read
 or write is covered, predicate pushdown lights up end-to-end, and
 the decode hot paths are hand-tuned for the columns that dominate
 analytical TPC-H workloads).
@@ -28,12 +28,22 @@ entry point, including streaming `Stream<Item = Result<Vec<T>>>`.
 The sync stack stays dep-free.
 The v0.5 cycle landed **x86 SIMD parity** — AVX2 kernels mirror the
 NEON path on every hot bit width (12, 14, 15, 16, 17, 18). The v0.6
-cycle adds **Parquet Modular Encryption** (PME) — a new
+cycle added **Parquet Modular Encryption** (PME) — a new
 `ematix-parquet-crypto` crate provides AES-GCM primitives + AAD
 construction, and `ematix-parquet-codec` exposes encrypted read and
 write paths for both PME modes (plaintext footer / encrypted footer)
 behind a default-off `encryption` feature. The default build pulls
 no crypto deps.
+The v0.7 cycle added a **dict-preserving BYTE_ARRAY column reader**
+(`read_column_byte_array_dict_preserved`) so Arrow consumers can
+assemble `DictionaryArray<UInt32, Utf8|Binary>` directly without
+per-row materialisation. The v0.8 cycle adds **adaptive
+predicate-dispatch** (`read_column_*_predicate_adaptive`) — the
+codec probes the first N pages of a chunk with the fused kernel,
+measures selectivity, and decides per-chunk whether to emit a
+bitmap (fused, wins at low selectivity) or a values vector
+(materialised, wins at high selectivity). Optional telemetry
+callback exposes the dispatch decision.
 API is settling but the write side still has a few rough edges
 (per-column encoding choice on multi-column writes); pin by SHA
 or version range until we tag v1.0.

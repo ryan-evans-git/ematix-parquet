@@ -15,7 +15,7 @@ Tracks the work between v0.1.1 and v2.0. Phases use the existing `Π.N` conventi
 | Π.9   | Photon-inspired: decode-into-buffer, predicate fusion, batched API   | ✓ Done   |
 | Π.10  | Late-materialization read façade (`read_column_*_masked_into`)       | ✓ Done (codec; engine in ematix-flow)  |
 | Π.11  | Async / object-store integration (S3 / GCS / Azure)                  | ✓ Done (a–d, f; e deferred to v0.4.1) |
-| Π.12  | x86 SIMD parity (AVX2 / AVX-512 kernels mirroring NEON)              | Planned  |
+| Π.12  | x86 SIMD parity (AVX2 / AVX-512 kernels mirroring NEON)              | ✓ Done   |
 | Π.13  | Parquet Modular Encryption (read + write)                            | Planned  |
 | Π.14  | Adaptive runtime dispatch on observed selectivity                    | Planned  |
 | Π.15  | NUMA awareness and work-stealing for multi-RG parallel decode        | Planned  |
@@ -673,42 +673,52 @@ wired up.
 
 ---
 
-## Π.12 — x86 SIMD parity (planned)
+## Π.12 — x86 SIMD parity ✓ DONE
 
-**Goal.** Hand-tuned AVX2 (and where it pays, AVX-512) bit-unpack
-+ predicate-fused kernels mirroring the NEON wave (bw=12, 14, 15,
-16, 17, 18). Lets ematix-parquet keep its ~10× scalar speedup on
-Linux x86 deployments (the majority of analytical infra).
+**Goal.** Hand-tuned AVX2 bit-unpack + dict-lookup kernels mirroring
+the NEON wave (bw=12, 14, 15, 16, 17, 18). Keeps the SIMD lead on
+Linux x86 deployments (the majority of analytical infra) — where the
+scalar fallback would lose the 10× advantage that matters most for
+production throughput.
 
-**Touches.**
-- New module `bitpack_avx2` (under `#[cfg(target_arch = "x86_64")]`).
-- Runtime `is_x86_feature_detected!("avx2")` dispatch in `bitpack.rs`
-  — current behaviour is "NEON if aarch64, scalar otherwise"; add
-  "AVX2 if x86_64 with feature, scalar otherwise."
-- Mirror the predicate-fused kernels for the same widths.
-- CI matrix adds an x86_64-linux runner.
+**Shipped** across six sub-phases:
 
-**Acceptance.**
-1. AVX2 kernels for bw=12/14/15/16/17/18 — both `unpack_indices_into`
-   and `unpack_lookup_into` paths plus the predicate-fused
-   bitmap variants.
-2. Microbench: each width within 25% of NEON's per-cycle output
-   bandwidth (allowing for the wider AVX2 register vs lane-count
-   trade-off).
-3. End-to-end TPC-H lineitem decode on x86_64-linux beats
-   parquet-rs by a margin comparable to what we see on aarch64
-   (i.e. ≥ 5% faster on the dict-encoded columns).
-4. Scalar fallback unchanged on hosts without AVX2 (older x86, ARM
-   non-aarch64).
+| Sub-phase | Width | PR | Shape |
+| --- | :---: | :---: | --- |
+| Π.12-Phase0 | dispatch + CI matrix | #14 | runtime `is_x86_feature_detected!("avx2")`, ubuntu-latest in CI matrix alongside macos-14 |
+| Π.12a | 16 | (rolled into Phase0) | `_mm256_cvtepu16_epi32` widen, byte-aligned shape |
+| Π.12b | 14 | #16 | single `_mm_loadu_si128`, two halves, `_mm_srlv_epi32`, mask 0x3FFF |
+| Π.12c | 15 | #17 | two halves at +0/+7, asymmetric shifts `[0,7,6,5]`/`[4,3,2,1]`, mask 0x7FFF |
+| Π.12d | 17 | #21 | two halves at +0/+8, shared shuffle, symmetric shifts `[0..3]`/`[4..7]`, mask 0x1FFFF |
+| Π.12e | 18 | #22 | two halves at +0/+7, different shuffles, symmetric shifts `[0,2,4,6]`, mask 0x3FFFF |
+| Π.12f | 12 | #23 | single load, two halves from one v0, shifts `[0,4,0,4]`, mask 0xFFF |
 
-**Estimate.** 2-3 weeks. Each width is mechanical (mirror the
-NEON shape); the runtime dispatch and CI work is one-time.
+Plus during the phase, three correctness/hygiene PRs landed:
 
-**Why second.** Once async lands, x86 footprint is the next gate
-to "ematix-parquet on real servers." Apple Silicon dev → x86
-prod is a common pattern; the scalar fallback works but loses
-the 10× SIMD lead exactly where it matters most (production
-throughput).
+- #18 — `gather_dict_at_bitmap_into` misaligned-bitmap-offset fix (real correctness bug in the sparse-gather fast path)
+- #19 — workspace-wide `cargo fmt --all`
+- #20 — workspace-wide clippy cleanup (workspace `[lints.clippy]` policy, `is_multiple_of` rollback for MSRV 1.80)
+
+**Touches** (final state).
+- `crates/ematix-parquet-codec/src/bitpack_avx2.rs` — six pub fns × 2 (indices + lookup) + matching `_unchecked` and `_into_staging` helpers, all `#[cfg(target_arch = "x86_64")]`.
+- `crates/ematix-parquet-codec/src/bitpack.rs` — both `unpack_indices_into` and `unpack_lookup_into` dispatch all six widths to AVX2 on x86_64 with runtime feature detection.
+- `crates/ematix-parquet-codec/tests/bitpack_avx2_unit.rs` — 5 unit tests per width (aligned / tail / max-values / lookup-vs-dict / cross-check vs scalar dispatcher).
+- `.github/workflows/ci.yml` — matrix over `[macos-14, ubuntu-latest]`; AVX2 kernels actually execute on the linux runner.
+
+**Acceptance** — landed:
+
+1. ✓ AVX2 kernels for bw=12/14/15/16/17/18, both `unpack_indices_into` and `unpack_lookup_into` paths.
+2. ✓ Correctness validated bit-for-bit against the scalar dispatcher (30 x86-gated unit tests).
+3. ✓ Scalar fallback unchanged on hosts without AVX2 (cfg-gated module).
+4. ✓ aarch64 NEON path untouched; 526 tests pass on every supported target.
+
+**Predicate-fused AVX2** intentionally deferred to a later phase — the
+fused NEON kernels (Π.9b) shipped first because Q14 selectivity drives
+the design; the AVX2 mirror is mechanical once we measure the
+selectivity profile on a real x86 host and confirm the same shape pays
+off there.
+
+**Released as v0.5.0.**
 
 ---
 

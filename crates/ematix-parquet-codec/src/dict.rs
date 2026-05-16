@@ -15,7 +15,11 @@ use ematix_parquet_format::compact::{read_uvarint, Cursor};
 
 use crate::bitpack::{unpack_indices_into, unpack_lookup_into};
 #[cfg(target_arch = "aarch64")]
-use crate::bitpack_neon::decode_predicate_bitmap_neon_bw12;
+use crate::bitpack_neon::{
+    decode_predicate_bitmap_neon_bw12, decode_predicate_bitmap_neon_bw14,
+    decode_predicate_bitmap_neon_bw15, decode_predicate_bitmap_neon_bw16,
+    decode_predicate_bitmap_neon_bw17, decode_predicate_bitmap_neon_bw18,
+};
 use crate::error::{CodecError, Result};
 
 /// Decode `num_values` u32 indices from a data-page body that uses
@@ -203,9 +207,44 @@ pub fn decode_rle_dictionary_predicate_bitmap_bw12(
             "decode_rle_dictionary_predicate_bitmap_bw12: expected bit_width=12, got {bit_width}"
         )));
     }
-    if dict_mask.len() < 4096 {
+    decode_rle_dictionary_predicate_bitmap(body, num_values, dict_mask, out)
+}
+
+/// Width-generic predicate-fused decode. Mirror of
+/// `decode_rle_dictionary_predicate_bitmap_bw12` but supports any
+/// bit_width: NEON-fused for bw ∈ {12, 14, 15, 16, 17, 18}, scalar
+/// fallback otherwise.
+///
+/// `dict_mask.len()` must be ≥ `1 << bit_width` so the NEON gather
+/// can safely read every possible index without per-lane bounds
+/// checks. Bits ≥ `dict.len()` should be zero-padded by the caller
+/// (see `build_dict_predicate_mask`).
+///
+/// Produces a packed bitmap (`num_values.div_ceil(8)` bytes appended
+/// to `out`). Bit `i` of byte `k` is `dict_mask[idx[8k+i]]`.
+pub fn decode_rle_dictionary_predicate_bitmap(
+    body: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if body.is_empty() {
+        return Err(CodecError::EmptyDictPageBody);
+    }
+    let bit_width = body[0];
+    if bit_width > 32 {
+        return Err(CodecError::BitWidthOutOfRange(bit_width));
+    }
+    let required_mask = if bit_width == 0 {
+        1
+    } else if bit_width >= 32 {
+        return Err(CodecError::BitWidthOutOfRange(bit_width));
+    } else {
+        1usize << bit_width
+    };
+    if dict_mask.len() < required_mask {
         return Err(CodecError::Decompress(format!(
-            "dict_mask must be ≥ 4096 entries (got {})",
+            "dict_mask must be ≥ {required_mask} entries for bw={bit_width} (got {})",
             dict_mask.len()
         )));
     }
@@ -217,6 +256,15 @@ pub fn decode_rle_dictionary_predicate_bitmap_bw12(
     let out_start = out.len();
     out.resize(out_start + bitmap_bytes, 0);
 
+    if bit_width == 0 {
+        // Degenerate dict: every index is 0, so every bit is dict_mask[0].
+        if dict_mask[0] != 0 {
+            splat_ones(out, out_start, 0, num_values);
+        }
+        return Ok(());
+    }
+
+    let value_bytes = (bit_width as usize + 7) / 8;
     let mut cur = Cursor::new(&body[1..]);
     let mut emitted: usize = 0;
 
@@ -228,34 +276,22 @@ pub fn decode_rle_dictionary_predicate_bitmap_bw12(
         if is_bit_packed {
             let total = count * 8;
             let to_emit = (num_values - emitted).min(total);
-            let needed = (total * 12 + 7) / 8;
+            let needed = (total * bit_width as usize + 7) / 8;
             let chunk = cur.take(needed)?;
 
-            // Two cases:
-            //   (a) `emitted % 8 == 0` AND `to_emit == total` (or % 8 == 0):
-            //       The NEON kernel can write directly into the bitmap
-            //       starting at byte `emitted / 8` — no row-shift work.
-            //   (b) `emitted % 8 != 0` OR partial run:
-            //       Use a temporary bitmap from a fresh `Vec<u8>` then
-            //       OR-merge into `out` with the right row offset.
-            //
-            // In real lineitem pages emitted always grows by multiples
-            // of 8 (page sizes are 20480 rows and RLE runs are
-            // multiples of 8), so (a) is the common path.
+            // Common path: row-aligned + emit-aligned. NEON kernel
+            // writes directly into the bitmap.
             if emitted % 8 == 0 && to_emit % 8 == 0 {
                 let dst_byte = out_start + emitted / 8;
                 let dst_bytes = to_emit / 8;
                 let mut tmp: Vec<u8> = Vec::with_capacity(dst_bytes);
-                fused_bitmap_chunk(chunk, to_emit, dict_mask, &mut tmp)?;
-                // `fused_bitmap_chunk` produces exactly `dst_bytes`
-                // bytes since `to_emit % 8 == 0`.
+                fused_bitmap_chunk(chunk, bit_width, to_emit, dict_mask, &mut tmp)?;
                 debug_assert_eq!(tmp.len(), dst_bytes);
                 out[dst_byte..dst_byte + dst_bytes].copy_from_slice(&tmp);
             } else {
-                // Slow path: produce a temp bitmap and OR-merge bit-
-                // by-bit (rare).
+                // Slow path: produce temp bitmap, OR-merge bit-by-bit.
                 let mut tmp: Vec<u8> = Vec::with_capacity(to_emit.div_ceil(8));
-                fused_bitmap_chunk(chunk, to_emit, dict_mask, &mut tmp)?;
+                fused_bitmap_chunk(chunk, bit_width, to_emit, dict_mask, &mut tmp)?;
                 for i in 0..to_emit {
                     let src_bit = (tmp[i / 8] >> (i % 8)) & 1;
                     let row = emitted + i;
@@ -266,20 +302,22 @@ pub fn decode_rle_dictionary_predicate_bitmap_bw12(
             emitted += to_emit;
         } else {
             // RLE run: one index repeated `count` times.
-            let value_chunk = cur.take(2)?; // bw=12 → 2 bytes
-            let idx = ((value_chunk[0] as u32) | ((value_chunk[1] as u32) << 8)) as usize;
-            if idx >= 4096 {
+            let value_chunk = cur.take(value_bytes)?;
+            let mut idx_u32: u32 = 0;
+            for j in 0..value_bytes {
+                idx_u32 |= (value_chunk[j] as u32) << (j * 8);
+            }
+            let idx = idx_u32 as usize;
+            if idx >= required_mask {
                 return Err(CodecError::DictIndexOutOfRange {
-                    index: idx as u32,
-                    dict_size: 4096,
+                    index: idx_u32,
+                    dict_size: required_mask,
                 });
             }
-            // SAFETY: idx < 4096 ≤ dict_mask.len().
+            // SAFETY: idx < required_mask ≤ dict_mask.len().
             let bit = unsafe { *dict_mask.get_unchecked(idx) };
             let to_emit = (num_values - emitted).min(count);
-            if bit == 0 {
-                // Zero already; just advance.
-            } else {
+            if bit != 0 {
                 let start_row = emitted;
                 let end_row = emitted + to_emit;
                 splat_ones(out, out_start, start_row, end_row);
@@ -288,6 +326,37 @@ pub fn decode_rle_dictionary_predicate_bitmap_bw12(
         }
     }
     Ok(())
+}
+
+/// Build a `dict_mask` suitable for `decode_rle_dictionary_predicate_bitmap`
+/// from a decoded dictionary and a predicate. Output length is
+/// `1 << bit_width` (padded with zeros for index slots beyond
+/// `dict.len()`).
+///
+/// Caller must pass the bit_width that matches the data pages — this
+/// is the value in `body[0]` of any dict-encoded page in the chunk.
+pub fn build_dict_predicate_mask<T>(
+    dict: &[T],
+    bit_width: u8,
+    pred: impl Fn(&T) -> bool,
+) -> Result<Vec<u8>> {
+    if bit_width > 32 || bit_width == 0 {
+        return Err(CodecError::BitWidthOutOfRange(bit_width));
+    }
+    let len = 1usize << bit_width;
+    if dict.len() > len {
+        return Err(CodecError::Decompress(format!(
+            "dict has {} entries, exceeds bit_width={bit_width} addressable space ({len})",
+            dict.len()
+        )));
+    }
+    let mut mask = vec![0u8; len];
+    for (i, v) in dict.iter().enumerate() {
+        if pred(v) {
+            mask[i] = 1;
+        }
+    }
+    Ok(mask)
 }
 
 /// Set bits `[start_row, end_row)` of the bitmap stored in
@@ -315,40 +384,47 @@ fn splat_ones(out: &mut [u8], out_start: usize, start_row: usize, end_row: usize
     }
 }
 
-/// Dispatch helper: bit-packed chunk → bitmap bytes. NEON on
-/// aarch64, scalar fallback elsewhere.
+/// Dispatch helper: bit-packed chunk → bitmap bytes. NEON-fused for
+/// bw ∈ {12, 14, 15, 16, 17, 18}; scalar fallback otherwise. Caller
+/// has already verified `dict_mask.len() ≥ 1 << bit_width`.
 #[inline]
 fn fused_bitmap_chunk(
     chunk: &[u8],
+    bit_width: u8,
     n: usize,
     dict_mask: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<()> {
     #[cfg(target_arch = "aarch64")]
     {
-        return decode_predicate_bitmap_neon_bw12(chunk, n, dict_mask, out);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        // Scalar fallback: unpack, gather, pack.
-        let mut idxs: Vec<u32> = Vec::with_capacity(n);
-        crate::bitpack::unpack_indices_into(chunk, n, 12, &mut idxs)?;
-        let bytes = n.div_ceil(8);
-        let out_start = out.len();
-        out.resize(out_start + bytes, 0);
-        for (row, idx) in idxs.into_iter().enumerate() {
-            let i = idx as usize;
-            if i >= dict_mask.len() {
-                return Err(CodecError::DictIndexOutOfRange {
-                    index: idx,
-                    dict_size: dict_mask.len(),
-                });
-            }
-            let bit = dict_mask[i];
-            out[out_start + row / 8] |= bit << (row % 8);
+        match bit_width {
+            12 => return decode_predicate_bitmap_neon_bw12(chunk, n, dict_mask, out),
+            14 => return decode_predicate_bitmap_neon_bw14(chunk, n, dict_mask, out),
+            15 => return decode_predicate_bitmap_neon_bw15(chunk, n, dict_mask, out),
+            16 => return decode_predicate_bitmap_neon_bw16(chunk, n, dict_mask, out),
+            17 => return decode_predicate_bitmap_neon_bw17(chunk, n, dict_mask, out),
+            18 => return decode_predicate_bitmap_neon_bw18(chunk, n, dict_mask, out),
+            _ => {}
         }
-        Ok(())
     }
+    // Scalar fallback: unpack, gather, pack.
+    let mut idxs: Vec<u32> = Vec::with_capacity(n);
+    unpack_indices_into(chunk, n, bit_width, &mut idxs)?;
+    let bytes = n.div_ceil(8);
+    let out_start = out.len();
+    out.resize(out_start + bytes, 0);
+    for (row, idx) in idxs.into_iter().enumerate() {
+        let i = idx as usize;
+        if i >= dict_mask.len() {
+            return Err(CodecError::DictIndexOutOfRange {
+                index: idx,
+                dict_size: dict_mask.len(),
+            });
+        }
+        let bit = dict_mask[i];
+        out[out_start + row / 8] |= bit << (row % 8);
+    }
+    Ok(())
 }
 
 /// Bitmap-driven sparse gather from a dict-encoded data page.

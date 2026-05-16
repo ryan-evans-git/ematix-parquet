@@ -110,6 +110,115 @@ fn run_one(bit_width: u8) {
     );
 }
 
+/// Π.9b benchmark: predicate fusion for non-bw=12 widths.
+///
+/// Compares two strategies for "decode dict-encoded indices, then
+/// evaluate a predicate per row":
+///   1. **Materialise then filter** (baseline): scalar unpack to
+///      `Vec<u32>`, then walk and OR-pack `dict_mask[idx]` into a
+///      bitmap. This is what a naive consumer writes.
+///   2. **Fused decode** (Π.9b): NEON kernel runs unpack and
+///      dict-mask gather + bitmap pack in one pass.
+///
+/// At ~1% selectivity (Q14-shape), the fused path should win
+/// substantially because it skips the Vec<u32> intermediate
+/// (4× output write traffic, plus a second read pass).
+#[cfg(target_arch = "aarch64")]
+fn run_predicate_fused_compare(
+    label: &str,
+    bit_width: u8,
+    fused_kernel: fn(&[u8], usize, &[u8], &mut Vec<u8>) -> ematix_parquet_codec::error::Result<()>,
+) {
+    let mask: u32 = (1u32 << bit_width) - 1;
+    let mut seed: u32 = 0xC0FFEE ^ (bit_width as u32);
+    let values: Vec<u32> = (0..N_VALUES)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & mask
+        })
+        .collect();
+    let packed = pack(&values, bit_width);
+    // Q14-shape predicate: ~1% of dict slots match.
+    let dict_size = 1usize << bit_width;
+    let mut dict_mask = vec![0u8; dict_size];
+    let match_lo = dict_size / 100;
+    for slot in dict_mask.iter_mut().take(match_lo + (dict_size / 100).max(40)) {
+        *slot = 1;
+    }
+    // Reset the lower window to zero, then mark a small middle band.
+    for slot in dict_mask.iter_mut().take(match_lo) {
+        *slot = 0;
+    }
+
+    // Strategy 1: materialise then filter (baseline).
+    let mut idx_buf: Vec<u32> = Vec::with_capacity(N_VALUES);
+    let mut bitmap: Vec<u8> = vec![0u8; N_VALUES.div_ceil(8)];
+    for _ in 0..3 {
+        idx_buf.clear();
+        unpack_indices_into(black_box(&packed), N_VALUES, bit_width, &mut idx_buf).unwrap();
+        for b in bitmap.iter_mut() {
+            *b = 0;
+        }
+        for (row, idx) in idx_buf.iter().enumerate() {
+            let bit = dict_mask[*idx as usize];
+            bitmap[row / 8] |= bit << (row % 8);
+        }
+    }
+    let mut best_baseline: f64 = f64::INFINITY;
+    let mut baseline_match: usize = 0;
+    for _ in 0..ITERS {
+        idx_buf.clear();
+        for b in bitmap.iter_mut() {
+            *b = 0;
+        }
+        let t0 = Instant::now();
+        unpack_indices_into(black_box(&packed), N_VALUES, bit_width, &mut idx_buf).unwrap();
+        for (row, idx) in idx_buf.iter().enumerate() {
+            let bit = dict_mask[*idx as usize];
+            bitmap[row / 8] |= bit << (row % 8);
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        if dt < best_baseline {
+            best_baseline = dt;
+            baseline_match = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+        }
+    }
+
+    // Strategy 2: fused decode.
+    let mut bitmap2: Vec<u8> = Vec::with_capacity(N_VALUES.div_ceil(8));
+    for _ in 0..3 {
+        bitmap2.clear();
+        fused_kernel(black_box(&packed), N_VALUES, &dict_mask, &mut bitmap2).unwrap();
+    }
+    let mut best_fused: f64 = f64::INFINITY;
+    let mut fused_match: usize = 0;
+    for _ in 0..ITERS {
+        bitmap2.clear();
+        let t0 = Instant::now();
+        fused_kernel(black_box(&packed), N_VALUES, &dict_mask, &mut bitmap2).unwrap();
+        let dt = t0.elapsed().as_secs_f64();
+        if dt < best_fused {
+            best_fused = dt;
+            fused_match = bitmap2.iter().map(|b| b.count_ones() as usize).sum();
+        }
+    }
+    assert_eq!(baseline_match, fused_match, "fused vs baseline match-count mismatch");
+
+    let speedup = best_baseline / best_fused;
+    let baseline_ns = best_baseline * 1e9 / N_VALUES as f64;
+    let fused_ns = best_fused * 1e9 / N_VALUES as f64;
+    println!(
+        "  {label} ({} matches, {:.1}% sel)\n    baseline (unpack→Vec<u32>→bitmap): {:>7.3} ms  {:>5.2} ns/val\n    fused    (unpack+gather+pack)    : {:>7.3} ms  {:>5.2} ns/val\n    speedup: {:>5.2}×",
+        baseline_match,
+        100.0 * baseline_match as f64 / N_VALUES as f64,
+        best_baseline * 1e3,
+        baseline_ns,
+        best_fused * 1e3,
+        fused_ns,
+        speedup,
+    );
+}
+
 #[cfg(target_arch = "aarch64")]
 fn run_predicate_fused_bw12() {
     use ematix_parquet_codec::bitpack_neon::decode_predicate_bitmap_neon_bw12;
@@ -351,5 +460,18 @@ fn main() {
         run_neon_bw17();
         run_neon_simple("bw=18 NEON", 18, unpack_indices_into_neon_bw18);
         run_predicate_fused_bw12();
+
+        println!();
+        println!("== Π.9b — predicate fusion vs materialise-then-filter (Q14-shape, ~1% sel) ==");
+        use ematix_parquet_codec::bitpack_neon::{
+            decode_predicate_bitmap_neon_bw14, decode_predicate_bitmap_neon_bw15,
+            decode_predicate_bitmap_neon_bw16, decode_predicate_bitmap_neon_bw17,
+            decode_predicate_bitmap_neon_bw18,
+        };
+        run_predicate_fused_compare("bw=14", 14, decode_predicate_bitmap_neon_bw14);
+        run_predicate_fused_compare("bw=15", 15, decode_predicate_bitmap_neon_bw15);
+        run_predicate_fused_compare("bw=16", 16, decode_predicate_bitmap_neon_bw16);
+        run_predicate_fused_compare("bw=17", 17, decode_predicate_bitmap_neon_bw17);
+        run_predicate_fused_compare("bw=18", 18, decode_predicate_bitmap_neon_bw18);
     }
 }

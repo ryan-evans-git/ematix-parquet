@@ -445,6 +445,383 @@ unsafe fn fused_predicate_neon_bw12(
     }
 }
 
+/// Pack 8 dict-mask lookups into one bitmap byte. Used by the
+/// width-N fused predicate kernels below. Each idx must be a valid
+/// offset into `mask_ptr` (caller verifies via dict_mask length).
+///
+/// LLVM keeps the 8 loads independent — they pipeline through the
+/// load units. The shifted-OR chain folds in fixed cycles.
+#[inline(always)]
+unsafe fn pack_predicate_byte(idxs: &[u32; 8], mask_ptr: *const u8) -> u8 {
+    let b0 = *mask_ptr.add(idxs[0] as usize);
+    let b1 = *mask_ptr.add(idxs[1] as usize);
+    let b2 = *mask_ptr.add(idxs[2] as usize);
+    let b3 = *mask_ptr.add(idxs[3] as usize);
+    let b4 = *mask_ptr.add(idxs[4] as usize);
+    let b5 = *mask_ptr.add(idxs[5] as usize);
+    let b6 = *mask_ptr.add(idxs[6] as usize);
+    let b7 = *mask_ptr.add(idxs[7] as usize);
+    b0 | (b1 << 1) | (b2 << 2) | (b3 << 3) | (b4 << 4) | (b5 << 5) | (b6 << 6) | (b7 << 7)
+}
+
+/// Predicate-fused decode for bw=14: indices ∈ [0, 16384), `dict_mask`
+/// must be ≥ 16384 bytes. Mirror of `decode_predicate_bitmap_neon_bw12`
+/// — leverages the existing `unpack_neon_bw14_into_staging` helper.
+pub fn decode_predicate_bitmap_neon_bw14(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 14) {
+        return Err(CodecError::Decompress(format!(
+            "neon bw14 fused: dict_mask must be ≥ 16384 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 14).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "neon bw14 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 14 * (full_blocks - 1) + 16 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_neon_bw14_into_staging(
+            packed,
+            safe_full_blocks,
+            &mut staging,
+            |idxs| {
+                *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+                blk_idx += 1;
+                Ok(())
+            },
+        )?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 14 / 8..], remaining, 14, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}
+
+/// Predicate-fused decode for bw=15: indices ∈ [0, 32768), `dict_mask`
+/// must be ≥ 32768 bytes.
+pub fn decode_predicate_bitmap_neon_bw15(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 15) {
+        return Err(CodecError::Decompress(format!(
+            "neon bw15 fused: dict_mask must be ≥ 32768 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 15).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "neon bw15 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 15 * (full_blocks - 1) + 24 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_neon_bw15_into_staging(
+            packed,
+            safe_full_blocks,
+            &mut staging,
+            |idxs| {
+                *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+                blk_idx += 1;
+                Ok(())
+            },
+        )?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 15 / 8..], remaining, 15, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}
+
+/// Predicate-fused decode for bw=16: indices ∈ [0, 65536), `dict_mask`
+/// must be ≥ 65536 bytes. The byte-aligned, simplest kernel.
+pub fn decode_predicate_bitmap_neon_bw16(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 16) {
+        return Err(CodecError::Decompress(format!(
+            "neon bw16 fused: dict_mask must be ≥ 65536 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 16).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "neon bw16 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    // bw=16 staging helper does one 16B load per block; final iter
+    // reads bytes 0..15, so packed.len() ≥ 16*full_blocks suffices.
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 16 * full_blocks {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_neon_bw16_into_staging(
+            packed,
+            safe_full_blocks,
+            &mut staging,
+            |idxs| {
+                *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+                blk_idx += 1;
+                Ok(())
+            },
+        )?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 16 / 8..], remaining, 16, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}
+
+/// Predicate-fused decode for bw=17: indices ∈ [0, 131072), `dict_mask`
+/// must be ≥ 131072 bytes.
+pub fn decode_predicate_bitmap_neon_bw17(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 17) {
+        return Err(CodecError::Decompress(format!(
+            "neon bw17 fused: dict_mask must be ≥ 131072 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 17).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "neon bw17 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 17 * (full_blocks - 1) + 24 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_neon_bw17_into_staging(
+            packed,
+            safe_full_blocks,
+            &mut staging,
+            |idxs| {
+                *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+                blk_idx += 1;
+                Ok(())
+            },
+        )?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 17 / 8..], remaining, 17, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}
+
+/// Predicate-fused decode for bw=18: indices ∈ [0, 262144), `dict_mask`
+/// must be ≥ 262144 bytes.
+pub fn decode_predicate_bitmap_neon_bw18(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 18) {
+        return Err(CodecError::Decompress(format!(
+            "neon bw18 fused: dict_mask must be ≥ 262144 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 18).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "neon bw18 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 18 * (full_blocks - 1) + 24 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_neon_bw18_into_staging(
+            packed,
+            safe_full_blocks,
+            &mut staging,
+            |idxs| {
+                *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+                blk_idx += 1;
+                Ok(())
+            },
+        )?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 18 / 8..], remaining, 18, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}
+
 /// NEON unpacker for bit_width = 17 — the dominant width for
 /// l_extendedprice (43%), l_partkey (67%), and l_orderkey (51%)
 /// dictionary-encoded data pages at SF=1 TPC-H. Per 8-row block:

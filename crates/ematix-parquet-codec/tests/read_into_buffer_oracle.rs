@@ -11,14 +11,14 @@
 
 use ematix_parquet_codec::read::{
     read_column_byte_array, read_column_byte_array_into, read_column_byte_array_offsets,
-    read_column_byte_array_offsets_into, read_column_f64, read_column_f64_into,
-    read_column_i32, read_column_i32_into, read_column_i32_with_range,
-    read_column_i32_with_range_into, read_column_i64, read_column_i64_into,
-    read_column_i64_with_range, read_column_i64_with_range_into,
+    read_column_byte_array_offsets_into, read_column_f64, read_column_f64_into, read_column_i32,
+    read_column_i32_into, read_column_i32_with_range, read_column_i32_with_range_into,
+    read_column_i64, read_column_i64_into, read_column_i64_with_range,
+    read_column_i64_with_range_into,
 };
 use ematix_parquet_codec::write::{
-    write_byte_array_column_dict_to_path, write_f64_column_to_path,
-    write_i32_column_to_path, write_i64_column_to_path,
+    write_byte_array_column_dict_to_path, write_f64_column_to_path, write_i32_column_to_path,
+    write_i64_column_to_path,
 };
 use ematix_parquet_format::types::CompressionCodec;
 use ematix_parquet_io::ParquetFile;
@@ -132,13 +132,8 @@ fn byte_array_offsets_into_matches_allocating_variant() {
     let path = dir.path().join("ba_off.parquet");
     let palette: [&[u8]; 3] = [b"A", b"R", b"N"];
     let values: Vec<&[u8]> = (0..1_000).map(|i| palette[i % 3]).collect();
-    write_byte_array_column_dict_to_path(
-        &path,
-        "v",
-        &values,
-        CompressionCodec::Uncompressed,
-    )
-    .unwrap();
+    write_byte_array_column_dict_to_path(&path, "v", &values, CompressionCodec::Uncompressed)
+        .unwrap();
 
     let file = ParquetFile::open(&path).unwrap();
     let (alloc_bytes, alloc_offsets) = read_column_byte_array_offsets(&file, 0, 0).unwrap();
@@ -158,13 +153,8 @@ fn byte_array_offsets_into_buffer_reuse() {
     let path = dir.path().join("ba_reuse.parquet");
     let palette: [&[u8]; 5] = [b"alpha", b"bravo", b"charlie", b"delta", b"echo"];
     let values: Vec<&[u8]> = (0..5_000).map(|i| palette[i % 5]).collect();
-    write_byte_array_column_dict_to_path(
-        &path,
-        "v",
-        &values,
-        CompressionCodec::Uncompressed,
-    )
-    .unwrap();
+    write_byte_array_column_dict_to_path(&path, "v", &values, CompressionCodec::Uncompressed)
+        .unwrap();
 
     let file = ParquetFile::open(&path).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
@@ -183,12 +173,12 @@ fn byte_array_offsets_into_buffer_reuse() {
 
 #[test]
 fn i64_with_range_into_matches_allocating_variant() {
-    use std::sync::Arc;
     use parquet::basic::{Compression, Repetition, Type as PhysicalType};
     use parquet::column::writer::ColumnWriter;
     use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
     use parquet::file::writer::SerializedFileWriter;
     use parquet::schema::types::Type as SchemaType;
+    use std::sync::Arc;
 
     // Need a paged file with column index — use parquet-rs.
     let dir = tempfile::tempdir().unwrap();

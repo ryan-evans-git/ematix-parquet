@@ -43,7 +43,10 @@ fn assert_rejects<E: ThriftEnum + std::fmt::Debug>(value: i32, type_name: &'stat
     let bytes = zz_bytes(value);
     let mut cur = Cursor::new(&bytes);
     match E::read(&mut cur) {
-        Err(FormatError::InvalidEnumValue { type_name: tn, value: v }) => {
+        Err(FormatError::InvalidEnumValue {
+            type_name: tn,
+            value: v,
+        }) => {
             assert_eq!(tn, type_name, "wrong type_name in error");
             assert_eq!(v, value, "wrong value in error");
         }

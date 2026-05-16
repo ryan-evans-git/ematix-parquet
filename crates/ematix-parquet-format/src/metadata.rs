@@ -98,11 +98,17 @@ pub struct PageHeader<'a> {
 }
 
 fn missing(struct_name: &'static str, field_id: i16) -> FormatError {
-    FormatError::MissingRequiredField { struct_name, field_id }
+    FormatError::MissingRequiredField {
+        struct_name,
+        field_id,
+    }
 }
 
 fn unknown(struct_name: &'static str, field_id: i16) -> FormatError {
-    FormatError::UnknownStructField { struct_name, field_id }
+    FormatError::UnknownStructField {
+        struct_name,
+        field_id,
+    }
 }
 
 /// Consume an empty thrift struct (just the STOP byte). Used as the
@@ -988,8 +994,7 @@ pub fn read_column_metadata<'a>(cur: &mut Cursor<'a>) -> Result<ColumnMetaData<'
         path_in_schema: path.ok_or_else(|| missing("ColumnMetaData", 3))?,
         codec: codec.ok_or_else(|| missing("ColumnMetaData", 4))?,
         num_values: num_values.ok_or_else(|| missing("ColumnMetaData", 5))?,
-        total_uncompressed_size: total_uncompressed
-            .ok_or_else(|| missing("ColumnMetaData", 6))?,
+        total_uncompressed_size: total_uncompressed.ok_or_else(|| missing("ColumnMetaData", 6))?,
         total_compressed_size: total_compressed.ok_or_else(|| missing("ColumnMetaData", 7))?,
         key_value_metadata: kv,
         data_page_offset: data_page_offset.ok_or_else(|| missing("ColumnMetaData", 9))?,

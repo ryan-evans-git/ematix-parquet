@@ -108,7 +108,9 @@ pub fn decode_delta_i32_from(cur: &mut Cursor<'_>) -> Result<Vec<i32>> {
                 if remaining == 0 {
                     break;
                 }
-                prev = prev.wrapping_add(block_min_delta).wrapping_add(delta_u as i64);
+                prev = prev
+                    .wrapping_add(block_min_delta)
+                    .wrapping_add(delta_u as i64);
                 out.push(prev as i32);
                 remaining -= 1;
             }

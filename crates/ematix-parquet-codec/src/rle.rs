@@ -174,11 +174,7 @@ pub fn encode_rle_bit_packed(indices: &[u32], bit_width: u8) -> Vec<u8> {
         // to align — but only if the residual run is still at
         // least RLE_THRESHOLD long.
         let pending_mod = pending.len() % 8;
-        let borrow = if pending_mod == 0 {
-            0
-        } else {
-            8 - pending_mod
-        };
+        let borrow = if pending_mod == 0 { 0 } else { 8 - pending_mod };
 
         if run_len >= RLE_THRESHOLD + borrow {
             // Borrow → flush aligned bit-pack → emit RLE for the
@@ -233,7 +229,12 @@ mod tests {
         let body = encode_rle_bit_packed_single_run(indices, bit_width);
         let decoded = decode_rle_bit_packed(&body, bit_width, indices.len()).unwrap();
         let want: Vec<u64> = indices.iter().map(|&i| i as u64).collect();
-        assert_eq!(decoded, want, "bit_width={bit_width}, len={}", indices.len());
+        assert_eq!(
+            decoded,
+            want,
+            "bit_width={bit_width}, len={}",
+            indices.len()
+        );
     }
 
     #[test]
@@ -305,7 +306,8 @@ mod tests {
         let decoded = decode_rle_bit_packed(&body, bit_width, indices.len()).unwrap();
         let want: Vec<u64> = indices.iter().map(|&i| i as u64).collect();
         assert_eq!(
-            decoded, want,
+            decoded,
+            want,
             "smart roundtrip failed: bit_width={bit_width}, len={}",
             indices.len()
         );
@@ -358,9 +360,13 @@ mod tests {
         // Three RLE runs interleaved with bit-pack groups.
         let mut indices: Vec<u32> = Vec::new();
         indices.extend(std::iter::repeat(5).take(20));
-        for v in 0..8 { indices.push(v); }
+        for v in 0..8 {
+            indices.push(v);
+        }
         indices.extend(std::iter::repeat(5).take(100));
-        for v in 8..16 { indices.push(v); }
+        for v in 8..16 {
+            indices.push(v);
+        }
         indices.extend(std::iter::repeat(5).take(50));
 
         smart_roundtrip(&indices, 12);
@@ -427,7 +433,9 @@ mod tests {
         // when the RLE flush happens. Exercises the empty-pending
         // branch.
         let mut indices: Vec<u32> = std::iter::repeat(42u32).take(50).collect();
-        for v in 0..8 { indices.push(v); }
+        for v in 0..8 {
+            indices.push(v);
+        }
         smart_roundtrip(&indices, 8);
     }
 
@@ -458,11 +466,7 @@ mod tests {
 /// Decode `num_values` values from a RLE/bit-packed hybrid stream.
 /// Values come out as `u64` regardless of declared bit_width — the
 /// caller narrows to u32/u16/u8 as needed.
-pub fn decode_rle_bit_packed(
-    bytes: &[u8],
-    bit_width: u8,
-    num_values: usize,
-) -> Result<Vec<u64>> {
+pub fn decode_rle_bit_packed(bytes: &[u8], bit_width: u8, num_values: usize) -> Result<Vec<u64>> {
     if bit_width > 64 {
         return Err(CodecError::BitWidthOutOfRange(bit_width));
     }

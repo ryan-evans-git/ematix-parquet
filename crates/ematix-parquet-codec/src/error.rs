@@ -62,10 +62,9 @@ impl fmt::Display for CodecError {
             ),
             Self::BitWidthOutOfRange(w) => write!(f, "bit_width {w} outside supported [0, 64]"),
             Self::EmptyDictPageBody => write!(f, "dictionary-encoded data page had an empty body"),
-            Self::DictIndexOutOfRange { index, dict_size } => write!(
-                f,
-                "dictionary index {index} ≥ dict size {dict_size}"
-            ),
+            Self::DictIndexOutOfRange { index, dict_size } => {
+                write!(f, "dictionary index {index} ≥ dict size {dict_size}")
+            }
             Self::InvalidInput(s) => write!(f, "invalid input: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
         }

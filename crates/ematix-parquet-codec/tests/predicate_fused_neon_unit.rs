@@ -119,10 +119,7 @@ fn fused_matches_reference_random_million() {
 
     // Also sanity-check the match count vs naive scan.
     let match_count: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
-    let expected_count = values
-        .iter()
-        .filter(|v| **v >= 1000 && **v < 1040)
-        .count();
+    let expected_count = values.iter().filter(|v| **v >= 1000 && **v < 1040).count();
     assert_eq!(match_count, expected_count);
 }
 

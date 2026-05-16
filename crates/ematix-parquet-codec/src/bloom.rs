@@ -173,7 +173,8 @@ pub fn parquet_xxh64_seed(input: &[u8], seed: u64) -> u64 {
             v4 = round(v4, read_u64_le(&input[i + 24..]));
             i += 32;
         }
-        acc = v1.rotate_left(1)
+        acc = v1
+            .rotate_left(1)
             .wrapping_add(v2.rotate_left(7))
             .wrapping_add(v3.rotate_left(12))
             .wrapping_add(v4.rotate_left(18));

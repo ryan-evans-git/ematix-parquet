@@ -41,11 +41,7 @@ pub enum Segment<T: Copy> {
 }
 
 impl<T: Copy> DictColumnChunk<T> {
-    pub fn new(
-        dict: Option<Arc<Vec<T>>>,
-        segments: Vec<Segment<T>>,
-        num_values: usize,
-    ) -> Self {
+    pub fn new(dict: Option<Arc<Vec<T>>>, segments: Vec<Segment<T>>, num_values: usize) -> Self {
         Self {
             dict,
             segments,

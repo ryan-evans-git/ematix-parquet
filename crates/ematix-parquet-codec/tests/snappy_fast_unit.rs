@@ -97,7 +97,9 @@ fn realistic_random_data_80kb() {
     let mut seed: u64 = 0xC0FFEECAFEDEADBE;
     let v: Vec<u8> = (0..n)
         .map(|_| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as u8
         })
         .collect();
@@ -118,7 +120,10 @@ fn alternating_run_with_some_compression() {
 
 #[test]
 fn assorted_lengths() {
-    for n in [1usize, 7, 16, 31, 32, 60, 61, 63, 64, 127, 128, 255, 256, 1000, 4095, 4096, 65535, 65536, 100_000] {
+    for n in [
+        1usize, 7, 16, 31, 32, 60, 61, 63, 64, 127, 128, 255, 256, 1000, 4095, 4096, 65535, 65536,
+        100_000,
+    ] {
         let v: Vec<u8> = (0..n as u32).map(|i| (i % 251) as u8).collect();
         check_roundtrip(&v);
     }
@@ -136,10 +141,7 @@ fn capacity_preserved_across_calls() {
     let cap_after_a = buf.capacity();
     decompress_snappy_fast_into(&cb, &mut buf).unwrap();
     assert_eq!(buf, b);
-    assert!(
-        buf.capacity() >= cap_after_a,
-        "capacity must not shrink"
-    );
+    assert!(buf.capacity() >= cap_after_a, "capacity must not shrink");
 }
 
 #[test]

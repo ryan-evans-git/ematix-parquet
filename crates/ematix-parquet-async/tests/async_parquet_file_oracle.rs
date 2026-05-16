@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use ematix_parquet_async::AsyncParquetFile;
-use ematix_parquet_codec::write::{write_i64_column_to_path, write_byte_array_column_to_path};
+use ematix_parquet_codec::write::{write_byte_array_column_to_path, write_i64_column_to_path};
 use ematix_parquet_io::ParquetFile;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as OsPath;
@@ -36,16 +36,15 @@ async fn open_matches_sync_file_size_and_footer() {
     let path = OsPath::from("v.parquet");
     let aps = AsyncParquetFile::open(store, path).await.unwrap();
 
+    assert_eq!(aps.file_size(), sync.file_size(), "file_size mismatch");
     assert_eq!(
-        aps.file_size(), sync.file_size(),
-        "file_size mismatch"
-    );
-    assert_eq!(
-        aps.footer_offset(), sync.footer_offset(),
+        aps.footer_offset(),
+        sync.footer_offset(),
         "footer_offset mismatch"
     );
     assert_eq!(
-        aps.footer_bytes(), sync.footer_bytes(),
+        aps.footer_bytes(),
+        sync.footer_bytes(),
         "footer bytes mismatch"
     );
 }
@@ -61,7 +60,9 @@ async fn metadata_decode_matches_sync() {
     let sync_md = sync_file.metadata().unwrap();
 
     let store = fs_store_for(tmp.path());
-    let aps = AsyncParquetFile::open(store, OsPath::from("v.parquet")).await.unwrap();
+    let aps = AsyncParquetFile::open(store, OsPath::from("v.parquet"))
+        .await
+        .unwrap();
     let async_md = aps.metadata().unwrap();
 
     assert_eq!(async_md.version, sync_md.version);
@@ -79,7 +80,9 @@ async fn read_range_matches_sync_byte_for_byte() {
 
     let sync = ParquetFile::open(&abs_path).unwrap();
     let store = fs_store_for(tmp.path());
-    let aps = AsyncParquetFile::open(store, OsPath::from("v.parquet")).await.unwrap();
+    let aps = AsyncParquetFile::open(store, OsPath::from("v.parquet"))
+        .await
+        .unwrap();
 
     // A handful of ranges spanning the first row group's column chunk.
     let md = sync.metadata().unwrap();
@@ -108,7 +111,9 @@ async fn out_of_range_read_errors() {
     write_i64_column_to_path(&abs_path, "v", &values).unwrap();
 
     let store = fs_store_for(tmp.path());
-    let aps = AsyncParquetFile::open(store, OsPath::from("v.parquet")).await.unwrap();
+    let aps = AsyncParquetFile::open(store, OsPath::from("v.parquet"))
+        .await
+        .unwrap();
     let size = aps.file_size();
 
     let r = aps.read_range(size, 1).await;
@@ -126,7 +131,9 @@ async fn zero_length_read_returns_empty() {
     write_i64_column_to_path(&abs_path, "v", &values).unwrap();
 
     let store = fs_store_for(tmp.path());
-    let aps = AsyncParquetFile::open(store, OsPath::from("v.parquet")).await.unwrap();
+    let aps = AsyncParquetFile::open(store, OsPath::from("v.parquet"))
+        .await
+        .unwrap();
 
     let bytes = aps.read_range(0, 0).await.unwrap();
     assert!(bytes.is_empty());
@@ -151,7 +158,9 @@ async fn large_footer_falls_back_to_two_round_trips() {
 
     let sync = ParquetFile::open(&abs_path).unwrap();
     let store = fs_store_for(tmp.path());
-    let aps = AsyncParquetFile::open(store, OsPath::from("big.parquet")).await.unwrap();
+    let aps = AsyncParquetFile::open(store, OsPath::from("big.parquet"))
+        .await
+        .unwrap();
 
     // Whether or not the footer fits in 8 KB suffix, the result
     // must be byte-identical.
@@ -164,7 +173,11 @@ async fn large_footer_falls_back_to_two_round_trips() {
 async fn not_a_parquet_file_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let abs_path = tmp.path().join("garbage.parquet");
-    std::fs::write(&abs_path, b"this is not a parquet file at all, it's just bytes").unwrap();
+    std::fs::write(
+        &abs_path,
+        b"this is not a parquet file at all, it's just bytes",
+    )
+    .unwrap();
 
     let store = fs_store_for(tmp.path());
     let r = AsyncParquetFile::open(store, OsPath::from("garbage.parquet")).await;

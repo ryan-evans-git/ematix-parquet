@@ -23,8 +23,7 @@ use common::CompactBuilder;
 use ematix_parquet_format::compact::Cursor;
 use ematix_parquet_format::error::FormatError;
 use ematix_parquet_format::metadata::{
-    read_schema_element, DecimalType, IntType, LogicalType, SchemaElement, TimeUnit,
-    TimestampType,
+    read_schema_element, DecimalType, IntType, LogicalType, SchemaElement, TimeUnit, TimestampType,
 };
 use ematix_parquet_format::types::{ConvertedType, FieldRepetitionType, ParquetType};
 
@@ -82,18 +81,18 @@ fn schema_element_with_converted_type_utf8_legacy_writer() {
 fn schema_element_decimal_with_logical_type() {
     // l_extendedprice: DECIMAL(12, 2) over FIXED_LEN_BYTE_ARRAY(6).
     let decimal_inner = CompactBuilder::new()
-        .i32_field(1, 2)  // scale
+        .i32_field(1, 2) // scale
         .i32_field(2, 12) // precision
         .stop();
     let lt = CompactBuilder::new().struct_field(5, &decimal_inner).stop();
 
     let bytes = CompactBuilder::new()
         .enum_field(1, 7) // FIXED_LEN_BYTE_ARRAY
-        .i32_field(2, 6)  // type_length = 6
+        .i32_field(2, 6) // type_length = 6
         .enum_field(3, 0) // REQUIRED
         .binary(4, b"l_extendedprice")
         .enum_field(6, 5) // ConvertedType::DECIMAL (legacy)
-        .i32_field(7, 2)  // scale
+        .i32_field(7, 2) // scale
         .i32_field(8, 12) // precision
         .struct_field(10, &lt)
         .stop();

@@ -111,7 +111,9 @@ fn neon_bw12_matches_scalar_short_lengths() {
         })
         .collect();
     let packed = pack(&values, 12);
-    for n in [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 128, 199] {
+    for n in [
+        0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 128, 199,
+    ] {
         let s = unpack_scalar(&packed, n, 12);
         let nv = unpack_neon_bw12(&packed, n);
         assert_eq!(nv, s, "mismatch at n={n}");
@@ -174,7 +176,9 @@ fn neon_bw17_matches_scalar_short_lengths() {
         })
         .collect();
     let packed = pack(&values, 17);
-    for n in [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 128, 199] {
+    for n in [
+        0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 128, 199,
+    ] {
         let s = unpack_scalar(&packed, n, 17);
         let nv = unpack_neon_bw17(&packed, n);
         assert_eq!(nv, s, "mismatch at n={n}");
@@ -186,7 +190,9 @@ fn neon_bw17_matches_scalar_edge_values() {
     let cases: Vec<Vec<u32>> = vec![
         vec![0; 64],
         vec![0x1FFFF; 64],
-        (0..64).map(|i| if i % 2 == 0 { 0x1FFFF } else { 0 }).collect(),
+        (0..64)
+            .map(|i| if i % 2 == 0 { 0x1FFFF } else { 0 })
+            .collect(),
         (0..64u32).collect(),
         (0..64u32).rev().collect(),
     ];
@@ -205,7 +211,9 @@ fn neon_bw12_matches_scalar_edge_values() {
     let cases: Vec<Vec<u32>> = vec![
         vec![0; 64],
         vec![0xFFF; 64],
-        (0..64).map(|i| if i % 2 == 0 { 0xFFF } else { 0 }).collect(),
+        (0..64)
+            .map(|i| if i % 2 == 0 { 0xFFF } else { 0 })
+            .collect(),
         (0..64u32).collect(),
         (0..64u32).rev().collect(),
     ];

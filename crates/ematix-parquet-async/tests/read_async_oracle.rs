@@ -46,8 +46,11 @@ async fn i64_plain_matches_sync() {
         &AsyncParquetFile::open(fs_store_for(tmp.path()), OsPath::from("v.parquet"))
             .await
             .unwrap(),
-        0, 0,
-    ).await.unwrap();
+        0,
+        0,
+    )
+    .await
+    .unwrap();
     assert_eq!(async_out, sync);
     assert_eq!(async_out, values);
 }
@@ -61,10 +64,9 @@ async fn i64_dict_matches_sync() {
     write_i64_column_dict_to_path(&abs, "v", &values, CompressionCodec::Snappy).unwrap();
 
     let sync = sync_i64(&ParquetFile::open(&abs).unwrap(), 0, 0).unwrap();
-    let aps =
-        AsyncParquetFile::open(fs_store_for(tmp.path()), OsPath::from("dict.parquet"))
-            .await
-            .unwrap();
+    let aps = AsyncParquetFile::open(fs_store_for(tmp.path()), OsPath::from("dict.parquet"))
+        .await
+        .unwrap();
     let async_out = read_column_i64_async(&aps, 0, 0).await.unwrap();
     assert_eq!(async_out, sync);
 }
@@ -76,15 +78,18 @@ async fn i64_async_into_reuses_buffer() {
     let values: Vec<i64> = (0..1_500i64).collect();
     write_i64_column_to_path(&abs, "v", &values).unwrap();
 
-    let aps =
-        AsyncParquetFile::open(fs_store_for(tmp.path()), OsPath::from("reuse.parquet"))
-            .await
-            .unwrap();
+    let aps = AsyncParquetFile::open(fs_store_for(tmp.path()), OsPath::from("reuse.parquet"))
+        .await
+        .unwrap();
     let mut buf: Vec<i64> = Vec::new();
-    read_column_i64_async_into(&aps, 0, 0, &mut buf).await.unwrap();
+    read_column_i64_async_into(&aps, 0, 0, &mut buf)
+        .await
+        .unwrap();
     let cap_first = buf.capacity();
     for _ in 0..5 {
-        read_column_i64_async_into(&aps, 0, 0, &mut buf).await.unwrap();
+        read_column_i64_async_into(&aps, 0, 0, &mut buf)
+            .await
+            .unwrap();
     }
     assert_eq!(buf.capacity(), cap_first, "buffer capacity must not grow");
     assert_eq!(buf, values);
@@ -122,7 +127,9 @@ async fn i32_dict_matches_sync() {
         .await
         .unwrap();
     let mut out = Vec::new();
-    read_column_i32_async_into(&aps, 0, 0, &mut out).await.unwrap();
+    read_column_i32_async_into(&aps, 0, 0, &mut out)
+        .await
+        .unwrap();
     assert_eq!(out, sync);
 }
 
@@ -167,21 +174,17 @@ async fn f64_dict_matches_sync() {
 
 #[tokio::test]
 async fn i64_multi_row_group_each_rg_independently() {
-    use ematix_parquet_codec::write::{
-        write_table_to_path_with_row_group_size, ColumnData,
-    };
+    use ematix_parquet_codec::write::{write_table_to_path_with_row_group_size, ColumnData};
 
     let tmp = tempfile::tempdir().unwrap();
     let abs = tmp.path().join("multi.parquet");
     let values: Vec<i64> = (0..3_000i64).collect();
     let cols = vec![("v", ColumnData::I64(&values))];
-    write_table_to_path_with_row_group_size(&abs, &cols, CompressionCodec::Snappy, 1_000)
-        .unwrap();
+    write_table_to_path_with_row_group_size(&abs, &cols, CompressionCodec::Snappy, 1_000).unwrap();
 
-    let aps =
-        AsyncParquetFile::open(fs_store_for(tmp.path()), OsPath::from("multi.parquet"))
-            .await
-            .unwrap();
+    let aps = AsyncParquetFile::open(fs_store_for(tmp.path()), OsPath::from("multi.parquet"))
+        .await
+        .unwrap();
     let md = aps.metadata().unwrap();
     assert_eq!(md.row_groups.len(), 3);
 

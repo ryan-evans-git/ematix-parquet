@@ -80,7 +80,9 @@ fn main() {
     let mut seed: u64 = 0xDEADBEEF_CAFEBABE;
     let random: Vec<u8> = (0..80 * 1024)
         .map(|_| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as u8
         })
         .collect();
@@ -111,7 +113,9 @@ fn main() {
     let mut s: u64 = 0x12345678ABCDEF01;
     while sim.len() < 80 * 1024 {
         // 90% random, 10% repeats.
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         if (s >> 60) == 0 {
             // Insert a short pattern.
             sim.extend_from_slice(b"PATTERN_");

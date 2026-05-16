@@ -589,10 +589,18 @@ pub fn gather_dict_at_bitmap_into<T: Clone>(
             // entirely.
             while block_row + 8 <= to_consume {
                 let bit_pos_base = bitmap_offset + row + block_row;
-                debug_assert_eq!(bit_pos_base % 8, 0, "fast path requires byte-aligned offset");
+                debug_assert_eq!(
+                    bit_pos_base % 8,
+                    0,
+                    "fast path requires byte-aligned offset"
+                );
                 let mask_byte = bitmap[bit_pos_base / 8];
                 if mask_byte != 0 {
-                    unpack_8_indices(&chunk[byte_cursor..byte_cursor + bytes_per_8], bit_width, &mut scratch);
+                    unpack_8_indices(
+                        &chunk[byte_cursor..byte_cursor + bytes_per_8],
+                        bit_width,
+                        &mut scratch,
+                    );
                     for lane in 0..8 {
                         if (mask_byte >> lane) & 1 == 1 {
                             let idx_u = scratch[lane] as usize;
@@ -656,7 +664,11 @@ pub fn gather_dict_at_bitmap_into<T: Clone>(
             // Count set bits in `bitmap[bitmap_offset + row .. + to_consume]`
             // and push `v` that many times. Faster than per-row test
             // for long RLE runs since `v` is constant.
-            let matched = popcount_range(bitmap, bitmap_offset + row, bitmap_offset + row + to_consume);
+            let matched = popcount_range(
+                bitmap,
+                bitmap_offset + row,
+                bitmap_offset + row + to_consume,
+            );
             for _ in 0..matched {
                 out.push(v.clone());
             }

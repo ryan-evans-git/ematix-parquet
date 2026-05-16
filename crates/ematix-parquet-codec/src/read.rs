@@ -24,27 +24,22 @@ use ematix_parquet_format::types::{CompressionCodec, Encoding, PageType};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
 use crate::compression::{
-    decompress_brotli_into, decompress_gzip_into, decompress_lz4_raw_into,
-    decompress_snappy_into, decompress_zstd_into,
+    decompress_brotli_into, decompress_gzip_into, decompress_lz4_raw_into, decompress_snappy_into,
+    decompress_zstd_into,
 };
 use crate::dict::{decode_rle_dictionary_into, gather_dict_at_bitmap_into};
 use crate::error::{CodecError, Result};
 use crate::page_index::{select_pages_overlapping_i32, select_pages_overlapping_i64};
 use crate::plain::{
-    decode_plain_byte_array, decode_plain_f64, decode_plain_fixed_len_byte_array,
-    decode_plain_i32, decode_plain_i64, decode_plain_int96,
-    plain_sparse_decode_byte_array_into, plain_sparse_decode_byte_array_offsets_into,
-    plain_sparse_decode_f64_into, plain_sparse_decode_i32_into,
-    plain_sparse_decode_i64_into, Int96,
+    decode_plain_byte_array, decode_plain_f64, decode_plain_fixed_len_byte_array, decode_plain_i32,
+    decode_plain_i64, decode_plain_int96, plain_sparse_decode_byte_array_into,
+    plain_sparse_decode_byte_array_offsets_into, plain_sparse_decode_f64_into,
+    plain_sparse_decode_i32_into, plain_sparse_decode_i64_into, Int96,
 };
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
 /// `Vec<i64>`. Requires the column's physical type to be INT64.
-pub fn read_column_i64(
-    file: &ParquetFile,
-    row_group: usize,
-    column: usize,
-) -> Result<Vec<i64>> {
+pub fn read_column_i64(file: &ParquetFile, row_group: usize, column: usize) -> Result<Vec<i64>> {
     let mut out = Vec::new();
     read_column_i64_into(file, row_group, column, &mut out)?;
     Ok(out)
@@ -60,16 +55,14 @@ pub fn read_column_i64_into(
     column: usize,
     out: &mut Vec<i64>,
 ) -> Result<()> {
-    decode_chunk_into(file, row_group, column, out, |bytes| decode_plain_i64(bytes))
+    decode_chunk_into(file, row_group, column, out, |bytes| {
+        decode_plain_i64(bytes)
+    })
 }
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
 /// `Vec<i32>`. Requires the column's physical type to be INT32.
-pub fn read_column_i32(
-    file: &ParquetFile,
-    row_group: usize,
-    column: usize,
-) -> Result<Vec<i32>> {
+pub fn read_column_i32(file: &ParquetFile, row_group: usize, column: usize) -> Result<Vec<i32>> {
     let mut out = Vec::new();
     read_column_i32_into(file, row_group, column, &mut out)?;
     Ok(out)
@@ -82,16 +75,14 @@ pub fn read_column_i32_into(
     column: usize,
     out: &mut Vec<i32>,
 ) -> Result<()> {
-    decode_chunk_into(file, row_group, column, out, |bytes| decode_plain_i32(bytes))
+    decode_chunk_into(file, row_group, column, out, |bytes| {
+        decode_plain_i32(bytes)
+    })
 }
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
 /// `Vec<f64>`. Requires the column's physical type to be DOUBLE.
-pub fn read_column_f64(
-    file: &ParquetFile,
-    row_group: usize,
-    column: usize,
-) -> Result<Vec<f64>> {
+pub fn read_column_f64(file: &ParquetFile, row_group: usize, column: usize) -> Result<Vec<f64>> {
     let mut out = Vec::new();
     read_column_f64_into(file, row_group, column, &mut out)?;
     Ok(out)
@@ -104,7 +95,9 @@ pub fn read_column_f64_into(
     column: usize,
     out: &mut Vec<f64>,
 ) -> Result<()> {
-    decode_chunk_into(file, row_group, column, out, |bytes| decode_plain_f64(bytes))
+    decode_chunk_into(file, row_group, column, out, |bytes| {
+        decode_plain_f64(bytes)
+    })
 }
 
 // ============================================================
@@ -137,7 +130,11 @@ pub fn read_column_i64_masked_into(
     out: &mut Vec<i64>,
 ) -> Result<()> {
     decode_chunk_row_masked_into(
-        file, row_group, column, mask, out,
+        file,
+        row_group,
+        column,
+        mask,
+        out,
         |bytes| decode_plain_i64(bytes),
         plain_sparse_decode_i64_into,
     )
@@ -152,7 +149,11 @@ pub fn read_column_i32_masked_into(
     out: &mut Vec<i32>,
 ) -> Result<()> {
     decode_chunk_row_masked_into(
-        file, row_group, column, mask, out,
+        file,
+        row_group,
+        column,
+        mask,
+        out,
         |bytes| decode_plain_i32(bytes),
         plain_sparse_decode_i32_into,
     )
@@ -167,7 +168,11 @@ pub fn read_column_f64_masked_into(
     out: &mut Vec<f64>,
 ) -> Result<()> {
     decode_chunk_row_masked_into(
-        file, row_group, column, mask, out,
+        file,
+        row_group,
+        column,
+        mask,
+        out,
         |bytes| decode_plain_f64(bytes),
         plain_sparse_decode_f64_into,
     )
@@ -222,7 +227,11 @@ pub fn read_column_byte_array_masked_into(
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode_byte_array_into(
-                            info.values, page_n, mask, row_cursor, out,
+                            info.values,
+                            page_n,
+                            mask,
+                            row_cursor,
+                            out,
                         )?;
                     }
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
@@ -234,7 +243,12 @@ pub fn read_column_byte_array_masked_into(
                         // gather_dict_at_bitmap_into is now T: Clone
                         // (was T: Copy in Π.9) — accepts Vec<u8>.
                         crate::dict::gather_dict_at_bitmap_into(
-                            info.values, page_n, mask, row_cursor, &dict, out,
+                            info.values,
+                            page_n,
+                            mask,
+                            row_cursor,
+                            &dict,
+                            out,
                         )?;
                     }
                     other => {
@@ -312,8 +326,12 @@ pub fn read_column_byte_array_offsets_masked_into(
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode_byte_array_offsets_into(
-                            info.values, page_n, mask, row_cursor,
-                            out_bytes, out_offsets,
+                            info.values,
+                            page_n,
+                            mask,
+                            row_cursor,
+                            out_bytes,
+                            out_offsets,
                         )?;
                     }
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
@@ -326,27 +344,26 @@ pub fn read_column_byte_array_offsets_masked_into(
                         // decoder, gather sparsely into the offsets
                         // shape. The Copy-based fused gather doesn't
                         // produce offsets directly, so we expand here.
-                        let indices = crate::dict::decode_rle_dictionary_indices(
-                            info.values, page_n,
-                        )?;
+                        let indices =
+                            crate::dict::decode_rle_dictionary_indices(info.values, page_n)?;
                         let mut running = *out_offsets.last().unwrap();
                         for (row, idx) in indices.iter().enumerate() {
                             let bit_pos = row_cursor + row;
                             let bit = (mask[bit_pos / 8] >> (bit_pos % 8)) & 1;
                             if bit == 1 {
                                 let i = *idx as usize;
-                                let v = dict.get(i).ok_or_else(|| {
-                                    CodecError::DictIndexOutOfRange {
+                                let v =
+                                    dict.get(i).ok_or_else(|| CodecError::DictIndexOutOfRange {
                                         index: *idx,
                                         dict_size: dict.len(),
-                                    }
-                                })?;
+                                    })?;
                                 out_bytes.extend_from_slice(v);
-                                running = running
-                                    .checked_add(v.len() as u32)
-                                    .ok_or_else(|| CodecError::InvalidInput(
-                                        "byte_array masked-decode: offset overflow > u32::MAX".into(),
-                                    ))?;
+                                running = running.checked_add(v.len() as u32).ok_or_else(|| {
+                                    CodecError::InvalidInput(
+                                        "byte_array masked-decode: offset overflow > u32::MAX"
+                                            .into(),
+                                    )
+                                })?;
                                 out_offsets.push(running);
                             }
                         }
@@ -440,14 +457,14 @@ pub fn read_column_byte_array_into(
                         }
                         // Vec<Vec<u8>> isn't Copy, so we go via the
                         // index decoder and gather by hand.
-                        let indices =
-                            crate::dict::decode_rle_dictionary_indices(info.values, info.num_values)?;
+                        let indices = crate::dict::decode_rle_dictionary_indices(
+                            info.values,
+                            info.num_values,
+                        )?;
                         out.reserve(info.num_values);
                         for idx in indices {
                             let v = dict.get(idx as usize).ok_or_else(|| {
-                                CodecError::InvalidInput(
-                                    "dictionary index out of range".into(),
-                                )
+                                CodecError::InvalidInput("dictionary index out of range".into())
                             })?;
                             out.push(v.clone());
                         }
@@ -566,9 +583,8 @@ pub fn read_column_byte_array_offsets_into(
                                     "PLAIN byte_array: truncated length prefix".into(),
                                 ));
                             }
-                            let len = u32::from_le_bytes(
-                                body[i..i + 4].try_into().unwrap(),
-                            ) as usize;
+                            let len =
+                                u32::from_le_bytes(body[i..i + 4].try_into().unwrap()) as usize;
                             i += 4;
                             if i + len > body.len() {
                                 return Err(CodecError::InvalidInput(
@@ -624,9 +640,7 @@ pub fn read_column_byte_array_offsets_into(
                                 let end = *dict_offsets_ptr.add(i + 1) as usize;
                                 let len = end - start;
                                 let src = dict_bytes_ptr.add(start);
-                                let dst = out_bytes
-                                    .as_mut_ptr()
-                                    .add(out_bytes.len());
+                                let dst = out_bytes.as_mut_ptr().add(out_bytes.len());
                                 std::ptr::copy_nonoverlapping(src, dst, len);
                                 out_bytes.set_len(out_bytes.len() + len);
                                 acc += len as u32;
@@ -675,7 +689,9 @@ pub fn read_column_int96_into(
     column: usize,
     out: &mut Vec<Int96>,
 ) -> Result<()> {
-    decode_chunk_into(file, row_group, column, out, |bytes| decode_plain_int96(bytes))
+    decode_chunk_into(file, row_group, column, out, |bytes| {
+        decode_plain_int96(bytes)
+    })
 }
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
@@ -743,9 +759,7 @@ pub fn read_column_flba_into(
                         out.reserve(info.num_values);
                         for idx in indices {
                             let v = dict.get(idx as usize).ok_or_else(|| {
-                                CodecError::InvalidInput(
-                                    "dictionary index out of range".into(),
-                                )
+                                CodecError::InvalidInput("dictionary index out of range".into())
                             })?;
                             out.push(v.clone());
                         }
@@ -804,7 +818,9 @@ pub fn read_column_i64_with_range_into(
     out: &mut Vec<i64>,
 ) -> Result<()> {
     let mask = page_mask_i64(file, row_group, column, lo, hi)?;
-    decode_chunk_masked_into(file, row_group, column, mask, out, |bytes| decode_plain_i64(bytes))
+    decode_chunk_masked_into(file, row_group, column, mask, out, |bytes| {
+        decode_plain_i64(bytes)
+    })
 }
 
 /// `read_column_i32` with page-index pruning by `[lo, hi]` (inclusive).
@@ -830,7 +846,9 @@ pub fn read_column_i32_with_range_into(
     out: &mut Vec<i32>,
 ) -> Result<()> {
     let mask = page_mask_i32(file, row_group, column, lo, hi)?;
-    decode_chunk_masked_into(file, row_group, column, mask, out, |bytes| decode_plain_i32(bytes))
+    decode_chunk_masked_into(file, row_group, column, mask, out, |bytes| {
+        decode_plain_i32(bytes)
+    })
 }
 
 fn page_mask_i64(
@@ -869,16 +887,19 @@ fn read_column_index_bytes(
     column: usize,
 ) -> Result<Option<Vec<u8>>> {
     let md = file.metadata().map_err(io_to_codec)?;
-    let rg = md.row_groups.get(row_group).ok_or_else(|| {
-        CodecError::InvalidInput(format!("row group {row_group} out of range"))
-    })?;
+    let rg = md
+        .row_groups
+        .get(row_group)
+        .ok_or_else(|| CodecError::InvalidInput(format!("row group {row_group} out of range")))?;
     let col = rg
         .columns
         .get(column)
         .ok_or_else(|| CodecError::InvalidInput(format!("column {column} out of range")))?;
     match (col.column_index_offset, col.column_index_length) {
         (Some(off), Some(len)) => {
-            let bytes = file.read_range(off as u64, len as u64).map_err(io_to_codec)?;
+            let bytes = file
+                .read_range(off as u64, len as u64)
+                .map_err(io_to_codec)?;
             Ok(Some(bytes))
         }
         _ => Ok(None),
@@ -907,9 +928,7 @@ fn decode_chunk_masked_into<T: Copy>(
     let mut dict: Vec<T> = Vec::new();
     out.reserve(total_values);
     let mut data_page_ix: usize = 0;
-    let total_kept_data_pages = page_mask
-        .as_ref()
-        .map(|m| m.iter().filter(|b| **b).count());
+    let total_kept_data_pages = page_mask.as_ref().map(|m| m.iter().filter(|b| **b).count());
 
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
@@ -936,12 +955,7 @@ fn decode_chunk_masked_into<T: Copy>(
                                 "dict-encoded data page before dictionary".into(),
                             ));
                         }
-                        decode_rle_dictionary_into(
-                            info.values,
-                            &dict,
-                            info.num_values,
-                            out,
-                        )?;
+                        decode_rle_dictionary_into(info.values, &dict, info.num_values, out)?;
                     }
                     other => {
                         return Err(CodecError::Unsupported(format!(
@@ -1084,12 +1098,7 @@ fn decode_chunk_into<T: Copy>(
                                 "dict-encoded data page before dictionary".into(),
                             ));
                         }
-                        decode_rle_dictionary_into(
-                            info.values,
-                            &dict,
-                            info.num_values,
-                            out,
-                        )?;
+                        decode_rle_dictionary_into(info.values, &dict, info.num_values, out)?;
                     }
                     other => {
                         return Err(CodecError::Unsupported(format!(
@@ -1237,12 +1246,14 @@ fn read_chunk_raw(
     column: usize,
 ) -> Result<(Vec<u8>, usize, CompressionCodec)> {
     let md = file.metadata().map_err(io_to_codec)?;
-    let rg = md.row_groups.get(row_group).ok_or_else(|| {
-        CodecError::InvalidInput(format!("row group {row_group} out of range"))
-    })?;
-    let col = rg.columns.get(column).ok_or_else(|| {
-        CodecError::InvalidInput(format!("column {column} out of range"))
-    })?;
+    let rg = md
+        .row_groups
+        .get(row_group)
+        .ok_or_else(|| CodecError::InvalidInput(format!("row group {row_group} out of range")))?;
+    let col = rg
+        .columns
+        .get(column)
+        .ok_or_else(|| CodecError::InvalidInput(format!("column {column} out of range")))?;
     let cm = col
         .meta_data
         .as_ref()

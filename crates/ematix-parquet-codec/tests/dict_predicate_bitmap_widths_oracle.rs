@@ -39,9 +39,7 @@ fn reference_bitmap(body: &[u8], num_values: usize, dict_mask: &[u8]) -> Vec<u8>
 fn check_width(bit_width: u8, num_values: usize, dict_size: usize, mask_seed: u64) {
     assert!(dict_size <= (1usize << bit_width));
     // Indices: deterministic round-robin over the dict.
-    let indices: Vec<u32> = (0..num_values)
-        .map(|i| (i % dict_size) as u32)
-        .collect();
+    let indices: Vec<u32> = (0..num_values).map(|i| (i % dict_size) as u32).collect();
     // dict_mask: pseudo-random bit per dict slot, padded to 1<<bw.
     let mask_len = 1usize << bit_width;
     let mut dict_mask = vec![0u8; mask_len];
@@ -114,7 +112,10 @@ fn all_zero_and_all_one_masks() {
         let mask = vec![0u8; 1usize << bw];
         let mut got = Vec::new();
         decode_rle_dictionary_predicate_bitmap(&body, n, &mask, &mut got).unwrap();
-        assert!(got.iter().all(|b| *b == 0), "bw={bw} all-zero mask: {got:?}");
+        assert!(
+            got.iter().all(|b| *b == 0),
+            "bw={bw} all-zero mask: {got:?}"
+        );
 
         // All-one mask within dict (rest stays zero — never indexed).
         let mut mask = vec![0u8; 1usize << bw];

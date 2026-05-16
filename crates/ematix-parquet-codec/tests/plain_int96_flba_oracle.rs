@@ -40,9 +40,7 @@ fn write_flba_via_parquet_rs(
     values: &[FixedLenByteArray],
     type_length: i32,
 ) {
-    let msg = format!(
-        "message s {{ REQUIRED FIXED_LEN_BYTE_ARRAY({type_length}) v; }}"
-    );
+    let msg = format!("message s {{ REQUIRED FIXED_LEN_BYTE_ARRAY({type_length}) v; }}");
     let schema = parse_message_type(&msg).unwrap();
     let props = WriterProperties::builder().build();
     let f = std::fs::File::create(path).unwrap();
@@ -62,22 +60,19 @@ fn write_flba_via_parquet_rs(
 /// doesn't yet dispatch INT96 or FLBA — that's intentional, since the
 /// generic interface needs a way to surface FLBA's type_length).
 fn first_data_page_body(path: &std::path::Path) -> Vec<u8> {
-    use ematix_parquet_codec::compression::{
-        decompress_snappy_into, decompress_zstd_into,
-    };
+    use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
     use ematix_parquet_format::types::{CompressionCodec, PageType};
 
     let file = ParquetFile::open(path).unwrap();
     let md = file.metadata().unwrap();
-    let cm = md.row_groups[0].columns[0]
-        .meta_data
-        .as_ref()
-        .unwrap();
+    let cm = md.row_groups[0].columns[0].meta_data.as_ref().unwrap();
     let start = cm
         .dictionary_page_offset
         .filter(|&d| d < cm.data_page_offset)
         .unwrap_or(cm.data_page_offset) as u64;
-    let chunk = file.read_range(start, cm.total_compressed_size as u64).unwrap();
+    let chunk = file
+        .read_range(start, cm.total_compressed_size as u64)
+        .unwrap();
     let mut walker = PageWalker::new(&chunk);
     let mut decomp = Vec::new();
     loop {
@@ -135,9 +130,7 @@ fn decode_plain_flba_matches_parquet_rs_len_4() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("flba4.parquet");
 
-    let raw: Vec<[u8; 4]> = (0..32)
-        .map(|i| [i, i + 1, i + 2, i + 3])
-        .collect();
+    let raw: Vec<[u8; 4]> = (0..32).map(|i| [i, i + 1, i + 2, i + 3]).collect();
     let values: Vec<FixedLenByteArray> = raw
         .iter()
         .map(|a| FixedLenByteArray::from(a.to_vec()))
@@ -167,8 +160,10 @@ fn decode_plain_flba_matches_parquet_rs_len_16() {
             row
         })
         .collect();
-    let values: Vec<FixedLenByteArray> =
-        raw.iter().map(|a| FixedLenByteArray::from(a.to_vec())).collect();
+    let values: Vec<FixedLenByteArray> = raw
+        .iter()
+        .map(|a| FixedLenByteArray::from(a.to_vec()))
+        .collect();
     write_flba_via_parquet_rs(&path, &values, 16);
 
     let body = first_data_page_body(&path);

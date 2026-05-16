@@ -28,8 +28,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ematix_parquet_codec::read::{
-    build_packed_mask, read_column_f64_into, read_column_f64_masked_into,
-    read_column_i32_into, read_column_i64_into, read_column_i64_masked_into,
+    build_packed_mask, read_column_f64_into, read_column_f64_masked_into, read_column_i32_into,
+    read_column_i64_into, read_column_i64_masked_into,
 };
 use ematix_parquet_io::ParquetFile;
 
@@ -40,10 +40,10 @@ const LO: i32 = 9374;
 const HI: i32 = 9404;
 
 // TPC-H lineitem column indices.
-const COL_PARTKEY: usize = 1;       // INT64
+const COL_PARTKEY: usize = 1; // INT64
 const COL_EXTENDEDPRICE: usize = 5; // DOUBLE
-const COL_DISCOUNT: usize = 6;      // DOUBLE
-const COL_SHIPDATE: usize = 10;     // INT32
+const COL_DISCOUNT: usize = 6; // DOUBLE
+const COL_SHIPDATE: usize = 10; // INT32
 
 const WARMUPS: usize = 3;
 const ITERS: usize = 12;
@@ -209,9 +209,15 @@ fn main() {
     // --- Strategy 1: baseline ---
     let (baseline_med, baseline_min, baseline_max) = bench(|| {
         baseline_full_decode(
-            &file, 0,
-            &mut shipdate_buf, &mut partkey_buf, &mut extprice_buf, &mut discount_buf,
-            &mut out_pk, &mut out_ep, &mut out_dc,
+            &file,
+            0,
+            &mut shipdate_buf,
+            &mut partkey_buf,
+            &mut extprice_buf,
+            &mut discount_buf,
+            &mut out_pk,
+            &mut out_ep,
+            &mut out_dc,
         );
     });
     let baseline_matches = out_pk.len();
@@ -219,9 +225,12 @@ fn main() {
     // --- Strategy 2: façade late-mat ---
     let (latemat_med, latemat_min, latemat_max) = bench(|| {
         late_mat_facade(
-            &file, 0,
+            &file,
+            0,
             &mut shipdate_buf,
-            &mut out_pk, &mut out_ep, &mut out_dc,
+            &mut out_pk,
+            &mut out_ep,
+            &mut out_dc,
         );
     });
     let latemat_matches = out_pk.len();
@@ -238,11 +247,15 @@ fn main() {
     println!();
     println!(
         "  baseline (4× full decode + filter): median {}  min {}  max {}",
-        fmt(baseline_med), fmt(baseline_min), fmt(baseline_max)
+        fmt(baseline_med),
+        fmt(baseline_min),
+        fmt(baseline_max)
     );
     println!(
         "  late-mat (façade _masked_into)    : median {}  min {}  max {}",
-        fmt(latemat_med), fmt(latemat_min), fmt(latemat_max)
+        fmt(latemat_med),
+        fmt(latemat_min),
+        fmt(latemat_max)
     );
 
     let speedup = baseline_med.as_secs_f64() / latemat_med.as_secs_f64();

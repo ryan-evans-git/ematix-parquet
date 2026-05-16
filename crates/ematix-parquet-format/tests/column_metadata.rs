@@ -229,9 +229,9 @@ fn column_chunk_with_file_path_and_index_offsets() {
         .binary(1, b"part-0.parquet")
         .i64_field(2, 555)
         .i64_field(4, 100) // offset_index_offset
-        .i32_field(5, 50)  // offset_index_length
+        .i32_field(5, 50) // offset_index_length
         .i64_field(6, 200) // column_index_offset
-        .i32_field(7, 75)  // column_index_length
+        .i32_field(7, 75) // column_index_length
         .stop();
     let mut cur = Cursor::new(&bytes);
     let cc = read_column_chunk(&mut cur).unwrap();

@@ -6,11 +6,7 @@ use std::sync::Arc;
 
 use ematix_parquet_codec::column::{DictColumnChunk, Segment};
 
-fn dict_chunk_i32(
-    dict: Vec<i32>,
-    segments: Vec<Segment<i32>>,
-    n: usize,
-) -> DictColumnChunk<i32> {
+fn dict_chunk_i32(dict: Vec<i32>, segments: Vec<Segment<i32>>, n: usize) -> DictColumnChunk<i32> {
     DictColumnChunk::new(Some(Arc::new(dict)), segments, n)
 }
 

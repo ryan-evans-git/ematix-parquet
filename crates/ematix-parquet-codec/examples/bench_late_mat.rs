@@ -203,9 +203,17 @@ fn bench<R>(label: &str, mut f: impl FnMut() -> R) -> (Duration, Duration, Durat
 fn pretty_ratio(label: &str, ours: Duration, ref_: Duration) {
     let r = ours.as_secs_f64() / ref_.as_secs_f64();
     if r < 1.0 {
-        println!("  ✓ {label}: {:.2}× (we're {:.0}% faster)", r, (1.0 - r) * 100.0);
+        println!(
+            "  ✓ {label}: {:.2}× (we're {:.0}% faster)",
+            r,
+            (1.0 - r) * 100.0
+        );
     } else {
-        println!("  ✗ {label}: {:.2}× (we're {:.0}% slower)", r, (r - 1.0) * 100.0);
+        println!(
+            "  ✗ {label}: {:.2}× (we're {:.0}% slower)",
+            r,
+            (r - 1.0) * 100.0
+        );
     }
 }
 
@@ -312,7 +320,9 @@ fn main() {
     println!();
 
     println!("Phase 6: Q14 full lever — shipdate bitmap → sparse l_extendedprice gather");
-    println!("(Phase 5 fused-NEON filter + bitmap-driven gather; produces Vec<f64> of matching rows)");
+    println!(
+        "(Phase 5 fused-NEON filter + bitmap-driven gather; produces Vec<f64> of matching rows)"
+    );
 
     // Correctness check: ours vs parquet-rs baseline must match
     // up to f64 order (both walk rows in row-group order).
@@ -339,13 +349,13 @@ fn main() {
         sum_ours
     );
 
-    let (q14_full, _, _) = bench(
-        "Q14 fused-filter + sparse-gather",
-        || q14_lever_shipdate_then_extprice(&path),
-    );
-    let (pr_q14, _, _) = bench("parquet-rs (read shipdate + read extprice, filter + gather)", || {
-        parquet_rs_q14_baseline(&path)
+    let (q14_full, _, _) = bench("Q14 fused-filter + sparse-gather", || {
+        q14_lever_shipdate_then_extprice(&path)
     });
+    let (pr_q14, _, _) = bench(
+        "parquet-rs (read shipdate + read extprice, filter + gather)",
+        || parquet_rs_q14_baseline(&path),
+    );
     pretty_ratio("Phase 6 vs parquet-rs (Q14 lever)", q14_full, pr_q14);
 }
 
@@ -361,14 +371,18 @@ fn parquet_rs_q14_baseline(path: &Path) -> Vec<f64> {
         ColumnReader::Int32ColumnReader(t) => t,
         _ => panic!(),
     };
-    sd_reader.read_records(total, None, None, &mut shipdate).unwrap();
+    sd_reader
+        .read_records(total, None, None, &mut shipdate)
+        .unwrap();
 
     let mut extprice: Vec<f64> = Vec::with_capacity(total);
     let mut ep_reader = match rgr.get_column_reader(5).unwrap() {
         ColumnReader::DoubleColumnReader(t) => t,
         _ => panic!(),
     };
-    ep_reader.read_records(total, None, None, &mut extprice).unwrap();
+    ep_reader
+        .read_records(total, None, None, &mut extprice)
+        .unwrap();
 
     let mut out: Vec<f64> = Vec::new();
     for (i, &d) in shipdate.iter().enumerate() {
@@ -387,7 +401,11 @@ fn q14_lever_shipdate_then_extprice(path: &Path) -> Vec<f64> {
     let file = ParquetFile::open(path).unwrap();
     let total = {
         let md = file.metadata().unwrap();
-        md.row_groups[0].columns[10].meta_data.as_ref().unwrap().num_values as usize
+        md.row_groups[0].columns[10]
+            .meta_data
+            .as_ref()
+            .unwrap()
+            .num_values as usize
     };
 
     // Step 1: shipdate → bitmap (mirrors Phase 5 helper, inlined to
@@ -431,7 +449,8 @@ fn q14_lever_shipdate_then_extprice(path: &Path) -> Vec<f64> {
         Vec::new()
     };
 
-    let mut out: Vec<f64> = Vec::with_capacity(bitmap.iter().map(|b| b.count_ones() as usize).sum());
+    let mut out: Vec<f64> =
+        Vec::with_capacity(bitmap.iter().map(|b| b.count_ones() as usize).sum());
     let mut ep_emitted: usize = 0;
     while ep_emitted < total {
         let (hdr, body) = walker.next_page().unwrap().unwrap();

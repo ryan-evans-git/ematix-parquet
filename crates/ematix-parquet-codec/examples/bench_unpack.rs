@@ -17,9 +17,8 @@ use std::time::Instant;
 use ematix_parquet_codec::bitpack::unpack_indices_into;
 #[cfg(target_arch = "aarch64")]
 use ematix_parquet_codec::bitpack_neon::{
-    unpack_indices_into_neon_bw12, unpack_indices_into_neon_bw14,
-    unpack_indices_into_neon_bw15, unpack_indices_into_neon_bw16,
-    unpack_indices_into_neon_bw17, unpack_indices_into_neon_bw18,
+    unpack_indices_into_neon_bw12, unpack_indices_into_neon_bw14, unpack_indices_into_neon_bw15,
+    unpack_indices_into_neon_bw16, unpack_indices_into_neon_bw17, unpack_indices_into_neon_bw18,
 };
 
 const N_VALUES: usize = 1_000_000;
@@ -142,7 +141,10 @@ fn run_predicate_fused_compare(
     let dict_size = 1usize << bit_width;
     let mut dict_mask = vec![0u8; dict_size];
     let match_lo = dict_size / 100;
-    for slot in dict_mask.iter_mut().take(match_lo + (dict_size / 100).max(40)) {
+    for slot in dict_mask
+        .iter_mut()
+        .take(match_lo + (dict_size / 100).max(40))
+    {
         *slot = 1;
     }
     // Reset the lower window to zero, then mark a small middle band.
@@ -202,7 +204,10 @@ fn run_predicate_fused_compare(
             fused_match = bitmap2.iter().map(|b| b.count_ones() as usize).sum();
         }
     }
-    assert_eq!(baseline_match, fused_match, "fused vs baseline match-count mismatch");
+    assert_eq!(
+        baseline_match, fused_match,
+        "fused vs baseline match-count mismatch"
+    );
 
     let speedup = best_baseline / best_fused;
     let baseline_ns = best_baseline * 1e9 / N_VALUES as f64;
@@ -400,8 +405,16 @@ fn run_neon_bw14() {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn run_neon_simple(label: &str, bit_width: u8, kernel: fn(&[u8], usize, &mut Vec<u32>) -> ematix_parquet_codec::error::Result<()>) {
-    let mask: u32 = if bit_width == 32 { u32::MAX } else { (1u32 << bit_width) - 1 };
+fn run_neon_simple(
+    label: &str,
+    bit_width: u8,
+    kernel: fn(&[u8], usize, &mut Vec<u32>) -> ematix_parquet_codec::error::Result<()>,
+) {
+    let mask: u32 = if bit_width == 32 {
+        u32::MAX
+    } else {
+        (1u32 << bit_width) - 1
+    };
     let mut seed: u32 = 0xC0FFEE ^ (bit_width as u32);
     let values: Vec<u32> = (0..N_VALUES)
         .map(|_| {

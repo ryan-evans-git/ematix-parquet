@@ -153,9 +153,16 @@ fn lineitem_rg0_l_returnflag_matches_parquet_rs() {
          first 5: {:?})",
         ours.len(),
         distinct.len(),
-        ours.iter().take(5).map(|v| String::from_utf8_lossy(v).into_owned()).collect::<Vec<_>>()
+        ours.iter()
+            .take(5)
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .collect::<Vec<_>>()
     );
-    assert_eq!(distinct.len(), 3, "l_returnflag should have exactly 3 distinct values");
+    assert_eq!(
+        distinct.len(),
+        3,
+        "l_returnflag should have exactly 3 distinct values"
+    );
 }
 
 #[test]

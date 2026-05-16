@@ -94,10 +94,7 @@ fn ours_decode_delta_i32_column(file: &ParquetFile, rg_idx: usize, col_idx: usiz
     let mut decomp: Vec<u8> = Vec::new();
     let mut out = Vec::new();
     while let Some((hdr, body)) = walker.next_page().unwrap() {
-        let dph = hdr
-            .data_page_header
-            .as_ref()
-            .expect("v1 data page");
+        let dph = hdr.data_page_header.as_ref().expect("v1 data page");
         decompress_snappy_into(body, &mut decomp).unwrap();
         match dph.encoding {
             EmEncoding::DeltaBinaryPacked => {

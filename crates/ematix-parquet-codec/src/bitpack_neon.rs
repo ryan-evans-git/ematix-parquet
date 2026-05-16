@@ -92,9 +92,8 @@ unsafe fn unpack_neon_bw12_unchecked(packed: &[u8], full_blocks: usize, out: &mu
     // Shuffle table: assembles a u8x16 representing u16x8 (little-endian)
     // sourced from byte offsets [0,1,3,4,6,7,9,10] of the 13-byte
     // window. Lane i reads bytes [src_byte[i], src_byte[i]+1].
-    let shuffle: uint8x16_t = vld1q_u8(
-        [0u8, 1, 1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11].as_ptr(),
-    );
+    let shuffle: uint8x16_t =
+        vld1q_u8([0u8, 1, 1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11].as_ptr());
     // Per-lane right-shift amounts. NEON's `vshlq_u16` treats negative
     // shifts as right shifts.
     let shifts: int16x8_t = vld1q_s16([0i16, -4, 0, -4, 0, -4, 0, -4].as_ptr());
@@ -109,10 +108,8 @@ unsafe fn unpack_neon_bw12_unchecked(packed: &[u8], full_blocks: usize, out: &mu
         let shuffled: uint8x16_t = vqtbl1q_u8(bytes16, shuffle);
         let as_u16: uint16x8_t = vreinterpretq_u16_u8(shuffled);
         // Variable per-lane shift via signed vshl on the unsigned vec.
-        let shifted: uint16x8_t = vreinterpretq_u16_s16(vshlq_s16(
-            vreinterpretq_s16_u16(as_u16),
-            shifts,
-        ));
+        let shifted: uint16x8_t =
+            vreinterpretq_u16_s16(vshlq_s16(vreinterpretq_s16_u16(as_u16), shifts));
         let masked: uint16x8_t = vandq_u16(shifted, mask);
         let lo: uint32x4_t = vmovl_u16(vget_low_u16(masked));
         let hi: uint32x4_t = vmovl_u16(vget_high_u16(masked));
@@ -260,9 +257,8 @@ where
     F: FnMut(&[u32; 8]) -> Result<()>,
 {
     use std::arch::aarch64::*;
-    let shuffle: uint8x16_t = vld1q_u8(
-        [0u8, 1, 1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11].as_ptr(),
-    );
+    let shuffle: uint8x16_t =
+        vld1q_u8([0u8, 1, 1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11].as_ptr());
     let shifts: int16x8_t = vld1q_s16([0i16, -4, 0, -4, 0, -4, 0, -4].as_ptr());
     let mask: uint16x8_t = vdupq_n_u16(0x0FFF);
     let mut src_ptr = packed.as_ptr();
@@ -272,10 +268,7 @@ where
         let bytes16 = vld1q_u8(src_ptr);
         let shuffled = vqtbl1q_u8(bytes16, shuffle);
         let as_u16 = vreinterpretq_u16_u8(shuffled);
-        let shifted = vreinterpretq_u16_s16(vshlq_s16(
-            vreinterpretq_s16_u16(as_u16),
-            shifts,
-        ));
+        let shifted = vreinterpretq_u16_s16(vshlq_s16(vreinterpretq_s16_u16(as_u16), shifts));
         let masked = vandq_u16(shifted, mask);
         let lo = vmovl_u16(vget_low_u16(masked));
         let hi = vmovl_u16(vget_high_u16(masked));
@@ -392,9 +385,8 @@ unsafe fn fused_predicate_neon_bw12(
     debug_assert!(dict_mask.len() >= 4096);
     debug_assert_eq!(bitmap_out.len(), full_blocks);
 
-    let shuffle: uint8x16_t = vld1q_u8(
-        [0u8, 1, 1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11].as_ptr(),
-    );
+    let shuffle: uint8x16_t =
+        vld1q_u8([0u8, 1, 1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11].as_ptr());
     let shifts: int16x8_t = vld1q_s16([0i16, -4, 0, -4, 0, -4, 0, -4].as_ptr());
     let idx_mask: uint16x8_t = vdupq_n_u16(0x0FFF);
 
@@ -405,10 +397,7 @@ unsafe fn fused_predicate_neon_bw12(
         let bytes16 = vld1q_u8(src_ptr);
         let shuffled = vqtbl1q_u8(bytes16, shuffle);
         let as_u16 = vreinterpretq_u16_u8(shuffled);
-        let shifted = vreinterpretq_u16_s16(vshlq_s16(
-            vreinterpretq_s16_u16(as_u16),
-            shifts,
-        ));
+        let shifted = vreinterpretq_u16_s16(vshlq_s16(vreinterpretq_s16_u16(as_u16), shifts));
         let masked = vandq_u16(shifted, idx_mask);
 
         // 8 lane gathers + bit-pack. LLVM keeps these independent
@@ -431,14 +420,8 @@ unsafe fn fused_predicate_neon_bw12(
         let b5 = *mask_ptr.add(i5);
         let b6 = *mask_ptr.add(i6);
         let b7 = *mask_ptr.add(i7);
-        let byte = b0
-            | (b1 << 1)
-            | (b2 << 2)
-            | (b3 << 3)
-            | (b4 << 4)
-            | (b5 << 5)
-            | (b6 << 6)
-            | (b7 << 7);
+        let byte =
+            b0 | (b1 << 1) | (b2 << 2) | (b3 << 3) | (b4 << 4) | (b5 << 5) | (b6 << 6) | (b7 << 7);
         *bitmap_out.get_unchecked_mut(blk) = byte;
 
         src_ptr = src_ptr.add(12);
@@ -510,16 +493,11 @@ pub fn decode_predicate_bitmap_neon_bw14(
     unsafe {
         let bitmap_ptr = out.as_mut_ptr().add(out_start);
         let mut blk_idx = 0usize;
-        unpack_neon_bw14_into_staging(
-            packed,
-            safe_full_blocks,
-            &mut staging,
-            |idxs| {
-                *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
-                blk_idx += 1;
-                Ok(())
-            },
-        )?;
+        unpack_neon_bw14_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
     }
 
     let processed = safe_full_blocks * 8;
@@ -581,16 +559,11 @@ pub fn decode_predicate_bitmap_neon_bw15(
     unsafe {
         let bitmap_ptr = out.as_mut_ptr().add(out_start);
         let mut blk_idx = 0usize;
-        unpack_neon_bw15_into_staging(
-            packed,
-            safe_full_blocks,
-            &mut staging,
-            |idxs| {
-                *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
-                blk_idx += 1;
-                Ok(())
-            },
-        )?;
+        unpack_neon_bw15_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
     }
 
     let processed = safe_full_blocks * 8;
@@ -654,16 +627,11 @@ pub fn decode_predicate_bitmap_neon_bw16(
     unsafe {
         let bitmap_ptr = out.as_mut_ptr().add(out_start);
         let mut blk_idx = 0usize;
-        unpack_neon_bw16_into_staging(
-            packed,
-            safe_full_blocks,
-            &mut staging,
-            |idxs| {
-                *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
-                blk_idx += 1;
-                Ok(())
-            },
-        )?;
+        unpack_neon_bw16_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
     }
 
     let processed = safe_full_blocks * 8;
@@ -725,16 +693,11 @@ pub fn decode_predicate_bitmap_neon_bw17(
     unsafe {
         let bitmap_ptr = out.as_mut_ptr().add(out_start);
         let mut blk_idx = 0usize;
-        unpack_neon_bw17_into_staging(
-            packed,
-            safe_full_blocks,
-            &mut staging,
-            |idxs| {
-                *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
-                blk_idx += 1;
-                Ok(())
-            },
-        )?;
+        unpack_neon_bw17_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
     }
 
     let processed = safe_full_blocks * 8;
@@ -796,16 +759,11 @@ pub fn decode_predicate_bitmap_neon_bw18(
     unsafe {
         let bitmap_ptr = out.as_mut_ptr().add(out_start);
         let mut blk_idx = 0usize;
-        unpack_neon_bw18_into_staging(
-            packed,
-            safe_full_blocks,
-            &mut staging,
-            |idxs| {
-                *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
-                blk_idx += 1;
-                Ok(())
-            },
-        )?;
+        unpack_neon_bw18_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
     }
 
     let processed = safe_full_blocks * 8;
@@ -896,9 +854,7 @@ pub fn unpack_indices_into_neon_bw17(
 unsafe fn unpack_neon_bw17_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
     use std::arch::aarch64::*;
 
-    let shuffle: uint8x16_t = vld1q_u8(
-        [0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr(),
-    );
+    let shuffle: uint8x16_t = vld1q_u8([0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr());
     let shifts_lo: int32x4_t = vld1q_s32([0i32, -1, -2, -3].as_ptr());
     let shifts_hi: int32x4_t = vld1q_s32([-4i32, -5, -6, -7].as_ptr());
     let mask: uint32x4_t = vdupq_n_u32(0x1_FFFF);
@@ -914,14 +870,8 @@ unsafe fn unpack_neon_bw17_unchecked(packed: &[u8], full_blocks: usize, out: &mu
         let hi_b = vqtbl1q_u8(v1, shuffle);
         let lo = vreinterpretq_u32_u8(lo_b);
         let hi = vreinterpretq_u32_u8(hi_b);
-        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(lo),
-            shifts_lo,
-        ));
-        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(hi),
-            shifts_hi,
-        ));
+        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(lo), shifts_lo));
+        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(hi), shifts_hi));
         let lo_masked = vandq_u32(lo_shifted, mask);
         let hi_masked = vandq_u32(hi_shifted, mask);
 
@@ -1050,9 +1000,7 @@ where
     F: FnMut(&[u32; 8]) -> Result<()>,
 {
     use std::arch::aarch64::*;
-    let shuffle: uint8x16_t = vld1q_u8(
-        [0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr(),
-    );
+    let shuffle: uint8x16_t = vld1q_u8([0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr());
     let shifts_lo: int32x4_t = vld1q_s32([0i32, -1, -2, -3].as_ptr());
     let shifts_hi: int32x4_t = vld1q_s32([-4i32, -5, -6, -7].as_ptr());
     let mask: uint32x4_t = vdupq_n_u32(0x1_FFFF);
@@ -1066,14 +1014,8 @@ where
         let hi_b = vqtbl1q_u8(v1, shuffle);
         let lo = vreinterpretq_u32_u8(lo_b);
         let hi = vreinterpretq_u32_u8(hi_b);
-        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(lo),
-            shifts_lo,
-        ));
-        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(hi),
-            shifts_hi,
-        ));
+        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(lo), shifts_lo));
+        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(hi), shifts_hi));
         let lo_masked = vandq_u32(lo_shifted, mask);
         let hi_masked = vandq_u32(hi_shifted, mask);
         vst1q_u32(staging_ptr, lo_masked);
@@ -1159,13 +1101,11 @@ unsafe fn unpack_neon_bw14_unchecked(packed: &[u8], full_blocks: usize, out: &mu
     use std::arch::aarch64::*;
 
     // Lanes 0-3: u32 windows starting at bytes 0/1/3/5.
-    let shuffle_lo: uint8x16_t = vld1q_u8(
-        [0u8, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8].as_ptr(),
-    );
+    let shuffle_lo: uint8x16_t =
+        vld1q_u8([0u8, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8].as_ptr());
     // Lanes 4-7: u32 windows starting at bytes 7/8/10/12.
-    let shuffle_hi: uint8x16_t = vld1q_u8(
-        [7u8, 8, 9, 10, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15].as_ptr(),
-    );
+    let shuffle_hi: uint8x16_t =
+        vld1q_u8([7u8, 8, 9, 10, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15].as_ptr());
     // Per-lane right shifts (negative for vshlq_s32). Symmetric
     // between halves: [0, 6, 4, 2] bit shifts inside the u32 window.
     let shifts: int32x4_t = vld1q_s32([0i32, -6, -4, -2].as_ptr());
@@ -1181,14 +1121,8 @@ unsafe fn unpack_neon_bw14_unchecked(packed: &[u8], full_blocks: usize, out: &mu
         let hi_b = vqtbl1q_u8(v0, shuffle_hi);
         let lo = vreinterpretq_u32_u8(lo_b);
         let hi = vreinterpretq_u32_u8(hi_b);
-        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(lo),
-            shifts,
-        ));
-        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(hi),
-            shifts,
-        ));
+        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(lo), shifts));
+        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(hi), shifts));
         let lo_masked = vandq_u32(lo_shifted, mask);
         let hi_masked = vandq_u32(hi_shifted, mask);
 
@@ -1322,12 +1256,10 @@ where
     F: FnMut(&[u32; 8]) -> Result<()>,
 {
     use std::arch::aarch64::*;
-    let shuffle_lo: uint8x16_t = vld1q_u8(
-        [0u8, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8].as_ptr(),
-    );
-    let shuffle_hi: uint8x16_t = vld1q_u8(
-        [7u8, 8, 9, 10, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15].as_ptr(),
-    );
+    let shuffle_lo: uint8x16_t =
+        vld1q_u8([0u8, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8].as_ptr());
+    let shuffle_hi: uint8x16_t =
+        vld1q_u8([7u8, 8, 9, 10, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15].as_ptr());
     let shifts: int32x4_t = vld1q_s32([0i32, -6, -4, -2].as_ptr());
     let mask: uint32x4_t = vdupq_n_u32(0x3FFF);
     let mut src_ptr = packed.as_ptr();
@@ -1339,14 +1271,8 @@ where
         let hi_b = vqtbl1q_u8(v0, shuffle_hi);
         let lo = vreinterpretq_u32_u8(lo_b);
         let hi = vreinterpretq_u32_u8(hi_b);
-        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(lo),
-            shifts,
-        ));
-        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(hi),
-            shifts,
-        ));
+        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(lo), shifts));
+        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(hi), shifts));
         let lo_masked = vandq_u32(lo_shifted, mask);
         let hi_masked = vandq_u32(hi_shifted, mask);
         vst1q_u32(staging_ptr, lo_masked);
@@ -1381,7 +1307,9 @@ pub fn unpack_indices_into_neon_bw16(
     let full_blocks = num_values / 8;
 
     // bw=16 is exactly 16 bytes per block; no overrun risk.
-    unsafe { unpack_neon_bw16_unchecked(packed, full_blocks, out); }
+    unsafe {
+        unpack_neon_bw16_unchecked(packed, full_blocks, out);
+    }
 
     let processed = full_blocks * 8;
     let remaining = num_values - processed;
@@ -1571,7 +1499,9 @@ pub fn unpack_indices_into_neon_bw15(
         full_blocks - 1
     };
 
-    unsafe { unpack_neon_bw15_unchecked(packed, safe_full_blocks, out); }
+    unsafe {
+        unpack_neon_bw15_unchecked(packed, safe_full_blocks, out);
+    }
 
     let processed = safe_full_blocks * 8;
     let remaining = num_values - processed;
@@ -1587,14 +1517,12 @@ unsafe fn unpack_neon_bw15_unchecked(packed: &[u8], full_blocks: usize, out: &mu
     use std::arch::aarch64::*;
     // Lanes 0-3: u32 windows from v0 (bytes 0..16) at byte offsets
     // [0, 1, 3, 5]. Same shuffle as bw=14.
-    let shuffle_lo: uint8x16_t = vld1q_u8(
-        [0u8, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8].as_ptr(),
-    );
+    let shuffle_lo: uint8x16_t =
+        vld1q_u8([0u8, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8].as_ptr());
     // Lanes 4-7: u32 windows from v_hi (bytes 7..23) at byte offsets
     // [0, 2, 4, 6] within v_hi (= [7, 9, 11, 13] in the original block).
-    let shuffle_hi: uint8x16_t = vld1q_u8(
-        [0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr(),
-    );
+    let shuffle_hi: uint8x16_t =
+        vld1q_u8([0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr());
     // Per-lane right shifts (negative for vshlq_s32).
     let shifts_lo: int32x4_t = vld1q_s32([0i32, -7, -6, -5].as_ptr());
     let shifts_hi: int32x4_t = vld1q_s32([-4i32, -3, -2, -1].as_ptr());
@@ -1615,14 +1543,8 @@ unsafe fn unpack_neon_bw15_unchecked(packed: &[u8], full_blocks: usize, out: &mu
         let hi_b = vqtbl1q_u8(v_hi, shuffle_hi);
         let lo = vreinterpretq_u32_u8(lo_b);
         let hi = vreinterpretq_u32_u8(hi_b);
-        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(lo),
-            shifts_lo,
-        ));
-        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(hi),
-            shifts_hi,
-        ));
+        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(lo), shifts_lo));
+        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(hi), shifts_hi));
         let lo_masked = vandq_u32(lo_shifted, mask);
         let hi_masked = vandq_u32(hi_shifted, mask);
         vst1q_u32(out_ptr.add(blk * 8), lo_masked);
@@ -1746,12 +1668,10 @@ where
     F: FnMut(&[u32; 8]) -> Result<()>,
 {
     use std::arch::aarch64::*;
-    let shuffle_lo: uint8x16_t = vld1q_u8(
-        [0u8, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8].as_ptr(),
-    );
-    let shuffle_hi: uint8x16_t = vld1q_u8(
-        [0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr(),
-    );
+    let shuffle_lo: uint8x16_t =
+        vld1q_u8([0u8, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8].as_ptr());
+    let shuffle_hi: uint8x16_t =
+        vld1q_u8([0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr());
     let shifts_lo: int32x4_t = vld1q_s32([0i32, -7, -6, -5].as_ptr());
     let shifts_hi: int32x4_t = vld1q_s32([-4i32, -3, -2, -1].as_ptr());
     let mask: uint32x4_t = vdupq_n_u32(0x7FFF);
@@ -1766,14 +1686,8 @@ where
         let hi_b = vqtbl1q_u8(v_hi, shuffle_hi);
         let lo = vreinterpretq_u32_u8(lo_b);
         let hi = vreinterpretq_u32_u8(hi_b);
-        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(lo),
-            shifts_lo,
-        ));
-        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(hi),
-            shifts_hi,
-        ));
+        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(lo), shifts_lo));
+        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(hi), shifts_hi));
         let lo_masked = vandq_u32(lo_shifted, mask);
         let hi_masked = vandq_u32(hi_shifted, mask);
         vst1q_u32(staging_ptr, lo_masked);
@@ -1817,7 +1731,9 @@ pub fn unpack_indices_into_neon_bw18(
         full_blocks - 1
     };
 
-    unsafe { unpack_neon_bw18_unchecked(packed, safe_full_blocks, out); }
+    unsafe {
+        unpack_neon_bw18_unchecked(packed, safe_full_blocks, out);
+    }
 
     let processed = safe_full_blocks * 8;
     let remaining = num_values - processed;
@@ -1832,14 +1748,12 @@ pub fn unpack_indices_into_neon_bw18(
 unsafe fn unpack_neon_bw18_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
     use std::arch::aarch64::*;
     // Lanes 0-3: u32 windows from v0 at byte offsets [0, 2, 4, 6].
-    let shuffle_lo: uint8x16_t = vld1q_u8(
-        [0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr(),
-    );
+    let shuffle_lo: uint8x16_t =
+        vld1q_u8([0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr());
     // Lanes 4-7: u32 windows from v_hi (bytes 7..23) at indices
     // [2, 4, 6, 8] (= bytes 9, 11, 13, 15 in the original block).
-    let shuffle_hi: uint8x16_t = vld1q_u8(
-        [2u8, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9, 8, 9, 10, 11].as_ptr(),
-    );
+    let shuffle_hi: uint8x16_t =
+        vld1q_u8([2u8, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9, 8, 9, 10, 11].as_ptr());
     // Lane shifts (symmetric every 4 lanes).
     let shifts: int32x4_t = vld1q_s32([0i32, -2, -4, -6].as_ptr());
     let mask: uint32x4_t = vdupq_n_u32(0x3FFFF);
@@ -1860,14 +1774,8 @@ unsafe fn unpack_neon_bw18_unchecked(packed: &[u8], full_blocks: usize, out: &mu
         let hi_b = vqtbl1q_u8(v_hi, shuffle_hi);
         let lo = vreinterpretq_u32_u8(lo_b);
         let hi = vreinterpretq_u32_u8(hi_b);
-        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(lo),
-            shifts,
-        ));
-        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(hi),
-            shifts,
-        ));
+        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(lo), shifts));
+        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(hi), shifts));
         let lo_masked = vandq_u32(lo_shifted, mask);
         let hi_masked = vandq_u32(hi_shifted, mask);
         vst1q_u32(out_ptr.add(blk * 8), lo_masked);
@@ -1991,12 +1899,10 @@ where
     F: FnMut(&[u32; 8]) -> Result<()>,
 {
     use std::arch::aarch64::*;
-    let shuffle_lo: uint8x16_t = vld1q_u8(
-        [0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr(),
-    );
-    let shuffle_hi: uint8x16_t = vld1q_u8(
-        [2u8, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9, 8, 9, 10, 11].as_ptr(),
-    );
+    let shuffle_lo: uint8x16_t =
+        vld1q_u8([0u8, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9].as_ptr());
+    let shuffle_hi: uint8x16_t =
+        vld1q_u8([2u8, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8, 9, 8, 9, 10, 11].as_ptr());
     let shifts: int32x4_t = vld1q_s32([0i32, -2, -4, -6].as_ptr());
     let mask: uint32x4_t = vdupq_n_u32(0x3FFFF);
 
@@ -2010,14 +1916,8 @@ where
         let hi_b = vqtbl1q_u8(v_hi, shuffle_hi);
         let lo = vreinterpretq_u32_u8(lo_b);
         let hi = vreinterpretq_u32_u8(hi_b);
-        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(lo),
-            shifts,
-        ));
-        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(
-            vreinterpretq_s32_u32(hi),
-            shifts,
-        ));
+        let lo_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(lo), shifts));
+        let hi_shifted = vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(hi), shifts));
         let lo_masked = vandq_u32(lo_shifted, mask);
         let hi_masked = vandq_u32(hi_shifted, mask);
         vst1q_u32(staging_ptr, lo_masked);

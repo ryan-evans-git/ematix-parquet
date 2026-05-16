@@ -42,10 +42,7 @@ fn pq_read_f64_col(r: &SerializedFileReader<std::fs::File>, col_idx: usize) -> V
     out
 }
 
-fn pq_read_byte_array_col(
-    r: &SerializedFileReader<std::fs::File>,
-    col_idx: usize,
-) -> Vec<Vec<u8>> {
+fn pq_read_byte_array_col(r: &SerializedFileReader<std::fs::File>, col_idx: usize) -> Vec<Vec<u8>> {
     let rg = r.get_row_group(0).unwrap();
     let cr = rg.get_column_reader(col_idx).unwrap();
     let ColumnReader::ByteArrayColumnReader(mut typed) = cr else {

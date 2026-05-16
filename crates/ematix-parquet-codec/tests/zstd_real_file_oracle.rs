@@ -208,7 +208,9 @@ fn zstd_real_file_roundtrips_through_our_pipeline() {
         .collect();
     // String column with repetition to exercise dict encoding.
     let words = ["alpha", "beta", "gamma", "delta", "epsilon"];
-    let owned_strs: Vec<String> = (0..5_000).map(|i| words[i % words.len()].to_string()).collect();
+    let owned_strs: Vec<String> = (0..5_000)
+        .map(|i| words[i % words.len()].to_string())
+        .collect();
     let strs: Vec<&str> = owned_strs.iter().map(|s| s.as_str()).collect();
 
     write_zstd_file(&path, &longs, &strs);
@@ -227,7 +229,10 @@ fn zstd_real_file_roundtrips_through_our_pipeline() {
     assert_eq!(ours_str.len(), strs.len());
     let expected_str: Vec<Vec<u8>> = strs.iter().map(|s| s.as_bytes().to_vec()).collect();
     assert_eq!(ours_str, expected_str, "ours byte_array vs original");
-    assert_eq!(ours_str, theirs_str, "ours vs parquet-rs byte_array under ZSTD");
+    assert_eq!(
+        ours_str, theirs_str,
+        "ours vs parquet-rs byte_array under ZSTD"
+    );
 
     eprintln!(
         "PASS: {} i64 + {} byte_array values decoded via our pipeline (ZSTD pages) match parquet-rs",

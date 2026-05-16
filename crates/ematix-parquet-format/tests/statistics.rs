@@ -90,10 +90,7 @@ fn binary_empty_slice_is_distinct_from_absent() {
 #[test]
 fn min_max_value_v2_fields_only() {
     let mut b = CompactBuilder::new();
-    let bytes = b
-        .binary(5, &[0x01, 0x02])
-        .binary(6, &[0x03, 0x04])
-        .stop();
+    let bytes = b.binary(5, &[0x01, 0x02]).binary(6, &[0x03, 0x04]).stop();
 
     let mut cur = Cursor::new(&bytes);
     let stats = read_statistics(&mut cur).unwrap();

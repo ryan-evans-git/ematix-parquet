@@ -90,11 +90,7 @@ fn check_footer(table: &str) {
     let ours_created_by = our_md
         .created_by
         .map(|b| std::str::from_utf8(b).expect("created_by is valid UTF-8"));
-    assert_eq!(
-        ours_created_by,
-        pr_fm.created_by(),
-        "{table}: created_by"
-    );
+    assert_eq!(ours_created_by, pr_fm.created_by(), "{table}: created_by");
 
     let pr_leaves = pr_fm.schema_descr().num_columns();
     assert_eq!(
@@ -114,12 +110,7 @@ fn check_footer(table: &str) {
         "{table}: num row groups"
     );
 
-    for (i, (ours, theirs)) in our_md
-        .row_groups
-        .iter()
-        .zip(pr_md.row_groups())
-        .enumerate()
-    {
+    for (i, (ours, theirs)) in our_md.row_groups.iter().zip(pr_md.row_groups()).enumerate() {
         assert_eq!(ours.num_rows, theirs.num_rows(), "{table} rg {i} num_rows");
         assert_eq!(
             ours.total_byte_size,
@@ -132,9 +123,7 @@ fn check_footer(table: &str) {
             "{table} rg {i} column count"
         );
 
-        for (j, (our_col, their_col)) in
-            ours.columns.iter().zip(theirs.columns()).enumerate()
-        {
+        for (j, (our_col, their_col)) in ours.columns.iter().zip(theirs.columns()).enumerate() {
             let our_meta = our_col
                 .meta_data
                 .as_ref()
@@ -184,7 +173,11 @@ fn check_footer(table: &str) {
     eprintln!(
         "PASS {table}: {} row groups × {} columns × {} rows",
         our_md.row_groups.len(),
-        our_md.row_groups.first().map(|rg| rg.columns.len()).unwrap_or(0),
+        our_md
+            .row_groups
+            .first()
+            .map(|rg| rg.columns.len())
+            .unwrap_or(0),
         our_md.num_rows,
     );
 }

@@ -149,7 +149,10 @@ fn f64_stats_zero_normalisation() {
         panic!("expected Double stats");
     };
     // -0.0 < +0.0 by bit pattern, so:
-    assert_eq!(ts.min_opt().map(|x| x.to_bits()), Some((-0.0_f64).to_bits()));
+    assert_eq!(
+        ts.min_opt().map(|x| x.to_bits()),
+        Some((-0.0_f64).to_bits())
+    );
     assert_eq!(ts.max_opt().map(|x| x.to_bits()), Some(0.0_f64.to_bits()));
 }
 

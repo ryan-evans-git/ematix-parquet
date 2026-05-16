@@ -109,7 +109,9 @@ pub fn decompress_snappy_fast_into(compressed: &[u8], out: &mut Vec<u8>) -> Resu
                 if lit_len > 60 {
                     let extra = lit_len - 60;
                     if src_pos + extra > src_end {
-                        return Err(CodecError::Decompress("snappy: short literal length".into()));
+                        return Err(CodecError::Decompress(
+                            "snappy: short literal length".into(),
+                        ));
                     }
                     let mut len_acc: usize = 0;
                     for i in 0..extra {
@@ -141,10 +143,13 @@ pub fn decompress_snappy_fast_into(compressed: &[u8], out: &mut Vec<u8>) -> Resu
                     return Err(CodecError::Decompress("snappy: short copy-1".into()));
                 }
                 let len = (((tag >> 2) & 0b111) as usize) + 4;
-                let offset = (((tag >> 5) as usize) << 8) | (unsafe { *src_ptr.add(src_pos) } as usize);
+                let offset =
+                    (((tag >> 5) as usize) << 8) | (unsafe { *src_ptr.add(src_pos) } as usize);
                 src_pos += 1;
                 if offset == 0 || offset > written || written + len > dec_len {
-                    return Err(CodecError::Decompress("snappy: bad copy-1 offset/len".into()));
+                    return Err(CodecError::Decompress(
+                        "snappy: bad copy-1 offset/len".into(),
+                    ));
                 }
                 unsafe { copy_back_ref(dst_ptr, written, offset, len) };
                 written += len;
@@ -156,12 +161,13 @@ pub fn decompress_snappy_fast_into(compressed: &[u8], out: &mut Vec<u8>) -> Resu
                 }
                 let len = ((tag >> 2) as usize) + 1;
                 let offset = unsafe {
-                    (*src_ptr.add(src_pos) as usize)
-                        | ((*src_ptr.add(src_pos + 1) as usize) << 8)
+                    (*src_ptr.add(src_pos) as usize) | ((*src_ptr.add(src_pos + 1) as usize) << 8)
                 };
                 src_pos += 2;
                 if offset == 0 || offset > written || written + len > dec_len {
-                    return Err(CodecError::Decompress("snappy: bad copy-2 offset/len".into()));
+                    return Err(CodecError::Decompress(
+                        "snappy: bad copy-2 offset/len".into(),
+                    ));
                 }
                 unsafe { copy_back_ref(dst_ptr, written, offset, len) };
                 written += len;
@@ -180,7 +186,9 @@ pub fn decompress_snappy_fast_into(compressed: &[u8], out: &mut Vec<u8>) -> Resu
                 };
                 src_pos += 4;
                 if offset == 0 || offset > written || written + len > dec_len {
-                    return Err(CodecError::Decompress("snappy: bad copy-4 offset/len".into()));
+                    return Err(CodecError::Decompress(
+                        "snappy: bad copy-4 offset/len".into(),
+                    ));
                 }
                 unsafe { copy_back_ref(dst_ptr, written, offset, len) };
                 written += len;
@@ -268,7 +276,11 @@ unsafe fn copy_back_ref(dst_ptr: *mut u8, written: usize, offset: usize, len: us
     // dst[0..8]. Advance dst by 8 and copy from a new src that now
     // starts 8 bytes earlier in our output (which still maintains
     // the periodic pattern).
-    let new_offset = if offset == 1 { 8 } else { 8 - (8 % offset) + offset };
+    let new_offset = if offset == 1 {
+        8
+    } else {
+        8 - (8 % offset) + offset
+    };
     // Simpler: just byte-copy. Calling this case is rare and short.
     let mut i: usize = 8;
     while i < len {

@@ -56,7 +56,9 @@ async fn byte_array_dict_matches_sync() {
         .await
         .unwrap();
     let mut out = Vec::new();
-    read_column_byte_array_async_into(&aps, 0, 0, &mut out).await.unwrap();
+    read_column_byte_array_async_into(&aps, 0, 0, &mut out)
+        .await
+        .unwrap();
     assert_eq!(out, sync);
 }
 
@@ -74,7 +76,9 @@ async fn byte_array_offsets_plain_matches_sync() {
     let aps = AsyncParquetFile::open(fs_store_for(tmp.path()), OsPath::from("v.parquet"))
         .await
         .unwrap();
-    let (async_b, async_o) = read_column_byte_array_offsets_async(&aps, 0, 0).await.unwrap();
+    let (async_b, async_o) = read_column_byte_array_offsets_async(&aps, 0, 0)
+        .await
+        .unwrap();
     assert_eq!(async_b, sync_b);
     assert_eq!(async_o, sync_o);
     assert_eq!(async_o.len(), owned.len() + 1);
@@ -87,8 +91,7 @@ async fn byte_array_offsets_dict_matches_sync() {
     let palette: [&[u8]; 3] = [b"A", b"BB", b"CCC"];
     let owned: Vec<Vec<u8>> = (0..2_000).map(|i| palette[i % 3].to_vec()).collect();
     let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
-    write_byte_array_column_dict_to_path(&abs, "v", &refs, CompressionCodec::Uncompressed)
-        .unwrap();
+    write_byte_array_column_dict_to_path(&abs, "v", &refs, CompressionCodec::Uncompressed).unwrap();
 
     let (sync_b, sync_o) = sync_ba_offsets(&ParquetFile::open(&abs).unwrap(), 0, 0).unwrap();
     let aps = AsyncParquetFile::open(fs_store_for(tmp.path()), OsPath::from("d.parquet"))
@@ -96,7 +99,9 @@ async fn byte_array_offsets_dict_matches_sync() {
         .unwrap();
     let mut b = Vec::new();
     let mut o = Vec::new();
-    read_column_byte_array_offsets_async_into(&aps, 0, 0, &mut b, &mut o).await.unwrap();
+    read_column_byte_array_offsets_async_into(&aps, 0, 0, &mut b, &mut o)
+        .await
+        .unwrap();
     assert_eq!(b, sync_b);
     assert_eq!(o, sync_o);
 }
@@ -119,7 +124,11 @@ async fn byte_array_offsets_async_into_clears_buffers() {
     read_column_byte_array_offsets_async_into(&aps, 0, 0, &mut bytes, &mut offsets)
         .await
         .unwrap();
-    assert_eq!(offsets.len(), owned.len() + 1, "offsets must be cleared on each call");
+    assert_eq!(
+        offsets.len(),
+        owned.len() + 1,
+        "offsets must be cleared on each call"
+    );
     let (want_b, want_o) = sync_ba_offsets(&ParquetFile::open(&abs).unwrap(), 0, 0).unwrap();
     assert_eq!(bytes, want_b);
     assert_eq!(offsets, want_o);

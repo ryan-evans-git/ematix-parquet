@@ -9,8 +9,7 @@
 
 use ematix_parquet_codec::write::{
     write_byte_array_column_dict_to_path, write_byte_array_column_to_path_with_codec,
-    write_f64_column_dict_to_path, write_i32_column_dict_to_path,
-    write_i64_column_dict_to_path,
+    write_f64_column_dict_to_path, write_i32_column_dict_to_path, write_i64_column_dict_to_path,
 };
 use ematix_parquet_format::types::CompressionCodec;
 

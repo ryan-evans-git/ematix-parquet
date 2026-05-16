@@ -404,7 +404,8 @@ fn write_table_inner<W: Write>(
     let footer = write_file_metadata(&md);
     let footer_len = footer.len() as u32;
     out.write_all(&footer).map_err(io_to_codec)?;
-    out.write_all(&footer_len.to_le_bytes()).map_err(io_to_codec)?;
+    out.write_all(&footer_len.to_le_bytes())
+        .map_err(io_to_codec)?;
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
 
     Ok(())
@@ -413,27 +414,15 @@ fn write_table_inner<W: Write>(
 // ---- Public per-type entry points (uncompressed defaults) ----------
 
 /// Write a single-column INT64 file (PLAIN, uncompressed, REQUIRED).
-pub fn write_i64_column_to_path(
-    path: impl AsRef<Path>,
-    name: &str,
-    values: &[i64],
-) -> Result<()> {
+pub fn write_i64_column_to_path(path: impl AsRef<Path>, name: &str, values: &[i64]) -> Result<()> {
     write_i64_column_to_path_with_codec(path, name, values, CompressionCodec::Uncompressed)
 }
 
-pub fn write_i32_column_to_path(
-    path: impl AsRef<Path>,
-    name: &str,
-    values: &[i32],
-) -> Result<()> {
+pub fn write_i32_column_to_path(path: impl AsRef<Path>, name: &str, values: &[i32]) -> Result<()> {
     write_i32_column_to_path_with_codec(path, name, values, CompressionCodec::Uncompressed)
 }
 
-pub fn write_f64_column_to_path(
-    path: impl AsRef<Path>,
-    name: &str,
-    values: &[f64],
-) -> Result<()> {
+pub fn write_f64_column_to_path(path: impl AsRef<Path>, name: &str, values: &[f64]) -> Result<()> {
     write_f64_column_to_path_with_codec(path, name, values, CompressionCodec::Uncompressed)
 }
 
@@ -766,7 +755,8 @@ fn write_single_column<W: Write>(
     out.write_all(&footer).map_err(io_to_codec)?;
     written += footer.len() as u64;
 
-    out.write_all(&footer_len.to_le_bytes()).map_err(io_to_codec)?;
+    out.write_all(&footer_len.to_le_bytes())
+        .map_err(io_to_codec)?;
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
     written += 8;
 
@@ -1238,7 +1228,8 @@ fn write_single_column_dict<W: Write>(
     let footer_len = footer.len() as u32;
     out.write_all(&footer).map_err(io_to_codec)?;
     written += footer.len() as u64;
-    out.write_all(&footer_len.to_le_bytes()).map_err(io_to_codec)?;
+    out.write_all(&footer_len.to_le_bytes())
+        .map_err(io_to_codec)?;
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
     written += 8;
 

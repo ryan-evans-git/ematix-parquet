@@ -189,7 +189,10 @@ fn lineitem_rg0_l_shipdate_int32_matches_parquet_rs() {
         ours.len(),
         &ours[..5]
     );
-    assert!(min >= 8000 && max <= 10600, "values outside expected dbgen range");
+    assert!(
+        min >= 8000 && max <= 10600,
+        "values outside expected dbgen range"
+    );
 }
 
 #[test]
@@ -288,6 +291,9 @@ fn lineitem_physical_types_agree_with_parquet_rs() {
             PrType::BYTE_ARRAY => ParquetType::ByteArray,
             PrType::FIXED_LEN_BYTE_ARRAY => ParquetType::FixedLenByteArray,
         };
-        assert_eq!(ours, expect, "col {col_idx}: ours={ours:?}, theirs={theirs:?}");
+        assert_eq!(
+            ours, expect,
+            "col {col_idx}: ours={ours:?}, theirs={theirs:?}"
+        );
     }
 }

@@ -42,9 +42,7 @@ fn main() {
                 .get(col_idx)
                 .cloned()
                 .unwrap_or_else(|| format!("col_{col_idx}"));
-            let start = cm
-                .dictionary_page_offset
-                .unwrap_or(cm.data_page_offset) as u64;
+            let start = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
             let length = cm.total_compressed_size as u64;
             let chunk = file.read_range(start, length).unwrap();
             let mut walker = PageWalker::new(&chunk);

@@ -54,7 +54,9 @@ fn dictionary_page_header_basic_no_is_sorted() {
     assert_eq!(ph.compressed_page_size, 2048);
     assert!(ph.data_page_header.is_none());
     assert!(ph.data_page_header_v2.is_none());
-    let dph = ph.dictionary_page_header.expect("dictionary header present");
+    let dph = ph
+        .dictionary_page_header
+        .expect("dictionary header present");
     assert_eq!(dph.num_values, 100);
     assert_eq!(dph.encoding, Encoding::PlainDictionary);
     assert_eq!(dph.is_sorted, None);
@@ -190,7 +192,10 @@ fn data_page_header_v2_is_compressed_explicit_false() {
         .stop();
 
     let mut cur = Cursor::new(&bytes);
-    let v2 = read_page_header(&mut cur).unwrap().data_page_header_v2.unwrap();
+    let v2 = read_page_header(&mut cur)
+        .unwrap()
+        .data_page_header_v2
+        .unwrap();
     assert!(!v2.is_compressed);
 }
 

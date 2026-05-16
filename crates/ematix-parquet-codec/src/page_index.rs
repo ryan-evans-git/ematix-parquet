@@ -27,11 +27,7 @@ use crate::error::{CodecError, Result};
 ///
 /// Null pages always select `false` — a null page contributes no
 /// rows to a non-null predicate.
-pub fn select_pages_overlapping_i32(
-    idx: &ColumnIndex,
-    lo: i32,
-    hi: i32,
-) -> Result<Vec<bool>> {
+pub fn select_pages_overlapping_i32(idx: &ColumnIndex, lo: i32, hi: i32) -> Result<Vec<bool>> {
     if lo > hi {
         return Err(CodecError::Decompress(
             "select_pages_overlapping: lo > hi".into(),
@@ -57,11 +53,7 @@ pub fn select_pages_overlapping_i32(
 }
 
 /// INT64 variant of [`select_pages_overlapping_i32`].
-pub fn select_pages_overlapping_i64(
-    idx: &ColumnIndex,
-    lo: i64,
-    hi: i64,
-) -> Result<Vec<bool>> {
+pub fn select_pages_overlapping_i64(idx: &ColumnIndex, lo: i64, hi: i64) -> Result<Vec<bool>> {
     if lo > hi {
         return Err(CodecError::Decompress(
             "select_pages_overlapping: lo > hi".into(),

@@ -52,11 +52,7 @@ pub fn bit_width_for(max_level: u16) -> u8 {
 ///
 /// Otherwise: reads a 4-byte LE length prefix, then decodes the
 /// RLE/bit-packed stream of that length at the given bit width.
-pub fn decode_levels(
-    body: &[u8],
-    bit_width: u8,
-    num_values: usize,
-) -> Result<(Vec<u16>, usize)> {
+pub fn decode_levels(body: &[u8], bit_width: u8, num_values: usize) -> Result<(Vec<u16>, usize)> {
     if bit_width == 0 {
         return Ok((vec![0u16; num_values], 0));
     }

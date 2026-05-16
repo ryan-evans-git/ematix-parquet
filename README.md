@@ -261,22 +261,43 @@ ematix-parquet column chunks without going through `parquet-rs`'s
 
 ## What's still open
 
-v1.0 cut criteria are met: every Parquet shape we read or write is
-covered, predicate pushdown lights up end-to-end, and
-TPC-H lineitem decode beats `parquet-rs` and `polars-parquet`. The
-remaining roadmap items are performance polish, not correctness or
-interop gaps:
+v1.0 cut criteria for the codec are met: every Parquet shape we
+read or write is covered, predicate pushdown lights up end-to-end,
+and TPC-H lineitem decode beats `parquet-rs` and `polars-parquet`
+on Apple Silicon.
+
+The road from v0.2 to v2.0 broadens platform coverage and pushes
+the perf ceiling further — **see `docs/plans/CURRENT.md`** for
+the full Π.10 – Π.15 phase definitions. In summary:
+
+| Phase | Theme                                                              |
+| ----- | ------------------------------------------------------------------ |
+| Π.10  | Async / object-store integration (S3 / GCS / Azure)                |
+| Π.11  | x86 SIMD parity (AVX2 / AVX-512 kernels mirroring NEON)            |
+| Π.12  | Parquet Modular Encryption (read + write, AES-GCM)                 |
+| Π.13  | Adaptive runtime dispatch on observed selectivity                  |
+| Π.14  | NUMA awareness + work-stealing for multi-RG parallel decode        |
+| Π.15  | Custom LLVM codegen for hot decode paths (Photon-style, speculative) |
+
+Sequencing rationale: async (Π.10) and x86 (Π.11) come first
+because they unlock real consumer deployments (cloud storage and
+Linux server hardware). Encryption (Π.12) lands once those are in
+so the crypto work benefits the broadest deployment surface.
+Π.13 – Π.14 are server-class polish; Π.15 is the most speculative
+item and may never ship if const-generic monomorphization keeps
+covering the workloads we see.
+
+Smaller items picked up opportunistically (also in the plan doc):
 
 | Item                                                                  | Status   |
 | --------------------------------------------------------------------- | -------- |
-| Additional NEON kernels for small widths (1, 4, 5, 8, 20, 21)         | Open — scalar already at ~7-9 GB/s output; gather dominates on these columns. Revisit if a workload demands |
-| Per-column encoding choice on `write_table_to_path_*`                 | Open — single-column dict entry points exist; multi-column needs a `ColumnEncoding` opt-in |
-| Bloom-filter writer                                                   | Open — decoder ships; writer is the symmetric work |
-
-**Not on the v1.0 path**: encrypted modules (out of scope), async /
-object-store integration (the `io` crate is sync over `Read` —
-async is its own design choice), x86 SIMD targets (scalar fallback
-works on every target; NEON is the only hand-tuned path).
+| NEON prefetching in dict gather (Π.9d)                                | Open — pld one cache line ahead; benchmark first |
+| u8 dict indices when bw ≤ 8                                            | Open — saves Vec<u32> overhead on l_returnflag-class columns |
+| BYTE_ARRAY batched API                                                 | Open — needs `T: Clone`-based gather |
+| Per-column encoding choice on `write_table_*`                          | Open — single-column dict exists; multi-column needs `WriteOptions` |
+| Bloom-filter writer                                                    | Open — decoder ships; writer is the symmetric work |
+| Additional NEON kernels for small widths (1, 4, 5, 8, 20, 21)         | Open — scalar already at ~7-9 GB/s; gather dominates |
+| DELTA_BINARY_PACKED u64-output unpacker                                | Open (TODO in `delta.rs`) |
 
 ## Build
 

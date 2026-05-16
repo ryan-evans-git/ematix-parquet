@@ -271,7 +271,7 @@ fn unpack_chunks<const NUM_BITS: usize, T: Copy>(
                     let start_bit = i * NUM_BITS;
                     let start_byte = start_bit / 8;
                     let bit_in_byte = (start_bit % 8) as u32;
-                    let bytes_needed = (NUM_BITS + bit_in_byte as usize + 7) / 8;
+                    let bytes_needed = (NUM_BITS + bit_in_byte as usize).div_ceil(8);
                     let mut acc: u64 = 0;
                     for j in 0..bytes_needed {
                         acc |= (chunk[start_byte + j] as u64) << (j * 8);
@@ -289,7 +289,7 @@ fn unpack_chunks<const NUM_BITS: usize, T: Copy>(
                     let start_bit = i * NUM_BITS;
                     let start_byte = start_bit / 8;
                     let bit_in_byte = (start_bit % 8) as u32;
-                    let bytes_needed = (NUM_BITS + bit_in_byte as usize + 7) / 8;
+                    let bytes_needed = (NUM_BITS + bit_in_byte as usize).div_ceil(8);
                     let mut acc: u64 = 0;
                     for j in 0..bytes_needed {
                         acc |= (chunk[start_byte + j] as u64) << (j * 8);
@@ -316,7 +316,7 @@ fn unpack_chunks<const NUM_BITS: usize, T: Copy>(
 
     // Tail: 0..32 values, scalar-streaming bit buffer.
     if tail > 0 {
-        let tail_bytes = (tail * NUM_BITS + 7) / 8;
+        let tail_bytes = (tail * NUM_BITS).div_ceil(8);
         let chunk = &packed[packed_idx..packed_idx + tail_bytes];
         let mut buf: u64 = 0;
         let mut bits: u32 = 0;
@@ -380,7 +380,7 @@ fn unpack_chunks_indices<const NUM_BITS: usize>(
                 let start_bit = i * NUM_BITS;
                 let start_byte = start_bit / 8;
                 let bit_in_byte = (start_bit % 8) as u32;
-                let bytes_needed = (NUM_BITS + bit_in_byte as usize + 7) / 8;
+                let bytes_needed = (NUM_BITS + bit_in_byte as usize).div_ceil(8);
                 let mut acc: u64 = 0;
                 for j in 0..bytes_needed {
                     acc |= (chunk[start_byte + j] as u64) << (j * 8);
@@ -394,7 +394,7 @@ fn unpack_chunks_indices<const NUM_BITS: usize>(
     }
 
     if tail > 0 {
-        let tail_bytes = (tail * NUM_BITS + 7) / 8;
+        let tail_bytes = (tail * NUM_BITS).div_ceil(8);
         let chunk = &packed[packed_idx..packed_idx + tail_bytes];
         let mut buf: u64 = 0;
         let mut bits: u32 = 0;

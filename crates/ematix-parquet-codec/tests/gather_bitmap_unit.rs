@@ -6,6 +6,7 @@
 //!   - num_values: total rows in this page
 //!   - bitmap: row-mask covering the whole column (bit `bitmap_offset+row` = include row)
 //!   - dict: PLAIN-decoded dictionary values
+//!
 //! Produces:
 //!   - `out` appended with `dict[idx[row]]` for each row where the bitmap bit is set.
 //!
@@ -66,7 +67,7 @@ fn make_body_bitpacked(values: &[u32], bit_width: u8) -> Vec<u8> {
 fn make_body_rle(idx: u32, count: usize, bit_width: u8) -> Vec<u8> {
     let mut out = vec![bit_width];
     write_uvarint(&mut out, (count as u64) << 1);
-    let value_bytes = (bit_width as usize + 7) / 8;
+    let value_bytes = (bit_width as usize).div_ceil(8);
     for b in 0..value_bytes {
         out.push(((idx >> (b * 8)) & 0xFF) as u8);
     }
@@ -191,7 +192,7 @@ fn empty_bitmap_yields_nothing() {
     let n: usize = 1000;
     let values: Vec<u32> = (0..n as u32).collect();
     let body = make_body_bitpacked(&values, 17);
-    let dict: Vec<i32> = (0..100_000).map(|i| i).collect();
+    let dict: Vec<i32> = (0..100_000).collect();
     let bitmap = vec![0u8; n.div_ceil(8)];
 
     let mut out: Vec<i32> = Vec::new();

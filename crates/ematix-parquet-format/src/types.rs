@@ -126,6 +126,9 @@ thrift_enum! {
     }
 }
 
+// `thrift_enum!` macro doesn't support `#[default]` injection, so this
+// stays as a manual impl. Suppress the derivable_impls lint locally.
+#[allow(clippy::derivable_impls)]
 impl Default for BoundaryOrder {
     fn default() -> Self {
         Self::Unordered

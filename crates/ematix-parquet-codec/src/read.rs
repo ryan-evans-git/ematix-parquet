@@ -135,7 +135,7 @@ pub fn read_column_i64_masked_into(
         column,
         mask,
         out,
-        |bytes| decode_plain_i64(bytes),
+        decode_plain_i64,
         plain_sparse_decode_i64_into,
     )
 }
@@ -154,7 +154,7 @@ pub fn read_column_i32_masked_into(
         column,
         mask,
         out,
-        |bytes| decode_plain_i32(bytes),
+        decode_plain_i32,
         plain_sparse_decode_i32_into,
     )
 }
@@ -173,7 +173,7 @@ pub fn read_column_f64_masked_into(
         column,
         mask,
         out,
-        |bytes| decode_plain_f64(bytes),
+        decode_plain_f64,
         plain_sparse_decode_f64_into,
     )
 }
@@ -352,11 +352,10 @@ pub fn read_column_byte_array_offsets_masked_into(
                             let bit = (mask[bit_pos / 8] >> (bit_pos % 8)) & 1;
                             if bit == 1 {
                                 let i = *idx as usize;
-                                let v =
-                                    dict.get(i).ok_or_else(|| CodecError::DictIndexOutOfRange {
-                                        index: *idx,
-                                        dict_size: dict.len(),
-                                    })?;
+                                let v = dict.get(i).ok_or(CodecError::DictIndexOutOfRange {
+                                    index: *idx,
+                                    dict_size: dict.len(),
+                                })?;
                                 out_bytes.extend_from_slice(v);
                                 running = running.checked_add(v.len() as u32).ok_or_else(|| {
                                     CodecError::InvalidInput(
@@ -657,7 +656,7 @@ pub fn read_column_byte_array_offsets_into(
             }
             PageType::IndexPage => {}
         }
-        if out_offsets.len() - 1 >= total_values {
+        if out_offsets.len() > total_values {
             break;
         }
     }

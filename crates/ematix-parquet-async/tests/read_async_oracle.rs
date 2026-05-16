@@ -10,9 +10,8 @@
 use std::sync::Arc;
 
 use ematix_parquet_async::{
-    read_column_f64_async, read_column_f64_async_into, read_column_i32_async,
-    read_column_i32_async_into, read_column_i64_async, read_column_i64_async_into,
-    AsyncParquetFile,
+    read_column_f64_async, read_column_i32_async, read_column_i32_async_into,
+    read_column_i64_async, read_column_i64_async_into, AsyncParquetFile,
 };
 use ematix_parquet_codec::read::{
     read_column_f64 as sync_f64, read_column_i32 as sync_i32, read_column_i64 as sync_i64,

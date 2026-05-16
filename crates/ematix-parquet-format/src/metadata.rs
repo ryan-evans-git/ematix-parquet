@@ -1085,9 +1085,9 @@ fn read_data_page_header<'a>(cur: &mut Cursor<'a>) -> Result<DataPageHeader<'a>>
 }
 
 fn read_index_page_header(cur: &mut Cursor<'_>) -> Result<IndexPageHeader> {
-    // Spec marks the struct as "TODO" — no fields defined. Walk to STOP,
-    // erroring on any field that does appear so we notice format drift.
-    while let Some(h) = read_field_header(cur, 0)? {
+    // Spec marks the struct as "TODO" — no fields defined. Any field
+    // that does appear is unexpected; surface it as format drift.
+    if let Some(h) = read_field_header(cur, 0)? {
         return Err(unknown("IndexPageHeader", h.id));
     }
     Ok(IndexPageHeader)

@@ -116,9 +116,7 @@ fn mixed_runs_and_singletons_compress_better() {
     // Repeat 100 times → 100 × (500 hot + 4 cold) = 50400 rows.
     let mut values: Vec<&[u8]> = Vec::new();
     for cycle in 0..100 {
-        for _ in 0..500 {
-            values.push(hot);
-        }
+        values.resize(values.len() + 500, hot);
         for &c in &cold {
             values.push(c);
             // Use the cycle index to vary the cold values a bit.

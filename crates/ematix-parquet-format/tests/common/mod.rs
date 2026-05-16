@@ -27,7 +27,7 @@ impl CompactBuilder {
 
     fn header(&mut self, id: i16, type_nibble: u8) {
         let delta = id - self.prev_id;
-        if delta >= 1 && delta <= 15 {
+        if (1..=15).contains(&delta) {
             self.buf.push(((delta as u8) << 4) | type_nibble);
         } else {
             self.buf.push(type_nibble);

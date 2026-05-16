@@ -101,3 +101,6 @@ path = "examples/bench_snappy.rs"
 [[example]]
 name = "bench_q14_late_mat"
 path = "examples/bench_q14_late_mat.rs"
+
+[lints]
+workspace = true

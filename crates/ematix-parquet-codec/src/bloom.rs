@@ -26,7 +26,7 @@ use crate::error::{CodecError, Result};
 /// These come from the Parquet spec verbatim.
 const SALT: [u32; 8] = [
     0x47b6_137b,
-    0x44974_d91 & 0xFFFF_FFFF,
+    0x4497_4d91,
     0x8824_ad5b,
     0xa2b7_289d,
     0x7054_95c7,

@@ -56,7 +56,7 @@ pub fn decode_plain_i64(bytes: &[u8]) -> Result<Vec<i64>> {
     }
     #[cfg(target_endian = "little")]
     {
-        return Ok(plain_memcpy::<i64>(bytes, 8));
+        Ok(plain_memcpy::<i64>(bytes, 8))
     }
     #[cfg(not(target_endian = "little"))]
     {
@@ -83,7 +83,7 @@ pub fn decode_plain_i64_n(bytes: &[u8], n: usize) -> Result<Vec<i64>> {
     }
     #[cfg(target_endian = "little")]
     {
-        return Ok(plain_memcpy::<i64>(&bytes[..needed], 8));
+        Ok(plain_memcpy::<i64>(&bytes[..needed], 8))
     }
     #[cfg(not(target_endian = "little"))]
     {
@@ -105,7 +105,7 @@ pub fn decode_plain_i32(bytes: &[u8]) -> Result<Vec<i32>> {
     }
     #[cfg(target_endian = "little")]
     {
-        return Ok(plain_memcpy::<i32>(bytes, 4));
+        Ok(plain_memcpy::<i32>(bytes, 4))
     }
     #[cfg(not(target_endian = "little"))]
     {
@@ -129,7 +129,7 @@ pub fn decode_plain_i32_n(bytes: &[u8], n: usize) -> Result<Vec<i32>> {
     }
     #[cfg(target_endian = "little")]
     {
-        return Ok(plain_memcpy::<i32>(&bytes[..needed], 4));
+        Ok(plain_memcpy::<i32>(&bytes[..needed], 4))
     }
     #[cfg(not(target_endian = "little"))]
     {
@@ -151,7 +151,7 @@ pub fn decode_plain_f32(bytes: &[u8]) -> Result<Vec<f32>> {
     }
     #[cfg(target_endian = "little")]
     {
-        return Ok(plain_memcpy::<f32>(bytes, 4));
+        Ok(plain_memcpy::<f32>(bytes, 4))
     }
     #[cfg(not(target_endian = "little"))]
     {
@@ -175,7 +175,7 @@ pub fn decode_plain_f32_n(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     }
     #[cfg(target_endian = "little")]
     {
-        return Ok(plain_memcpy::<f32>(&bytes[..needed], 4));
+        Ok(plain_memcpy::<f32>(&bytes[..needed], 4))
     }
     #[cfg(not(target_endian = "little"))]
     {
@@ -197,7 +197,7 @@ pub fn decode_plain_f64(bytes: &[u8]) -> Result<Vec<f64>> {
     }
     #[cfg(target_endian = "little")]
     {
-        return Ok(plain_memcpy::<f64>(bytes, 8));
+        Ok(plain_memcpy::<f64>(bytes, 8))
     }
     #[cfg(not(target_endian = "little"))]
     {
@@ -221,7 +221,7 @@ pub fn decode_plain_f64_n(bytes: &[u8], n: usize) -> Result<Vec<f64>> {
     }
     #[cfg(target_endian = "little")]
     {
-        return Ok(plain_memcpy::<f64>(&bytes[..needed], 8));
+        Ok(plain_memcpy::<f64>(&bytes[..needed], 8))
     }
     #[cfg(not(target_endian = "little"))]
     {
@@ -390,7 +390,7 @@ pub fn plain_sparse_decode_f64_into(
 /// up-front because the padding makes the buffer ambiguous on its
 /// own (5 values pack into the same 1 byte as 8 values).
 pub fn decode_plain_bool(bytes: &[u8], num_values: usize) -> Result<Vec<bool>> {
-    let needed = (num_values + 7) / 8;
+    let needed = num_values.div_ceil(8);
     if bytes.len() < needed {
         return Err(CodecError::UnderflowingPlainBuffer {
             value_width: 1,
@@ -409,7 +409,7 @@ pub fn decode_plain_bool(bytes: &[u8], num_values: usize) -> Result<Vec<bool>> {
 /// PLAIN-encoded BYTE_ARRAY — each value is a `u32-LE` length prefix
 /// followed by that many raw bytes. Zero-copy: the returned slices
 /// borrow from `bytes`. Consumes the whole buffer.
-pub fn decode_plain_byte_array<'a>(bytes: &'a [u8]) -> Result<Vec<&'a [u8]>> {
+pub fn decode_plain_byte_array(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     let mut out = Vec::new();
     let mut cur = Cursor::new(bytes);
     while !cur.is_empty() {
@@ -423,7 +423,7 @@ pub fn decode_plain_byte_array<'a>(bytes: &'a [u8]) -> Result<Vec<&'a [u8]>> {
 /// Same as `decode_plain_byte_array` but stops after `n` values. Any
 /// trailing bytes are left untouched — useful when the buffer carries
 /// more than just the values (e.g. dict-followed-by-padding).
-pub fn decode_plain_byte_array_n<'a>(bytes: &'a [u8], n: usize) -> Result<Vec<&'a [u8]>> {
+pub fn decode_plain_byte_array_n(bytes: &[u8], n: usize) -> Result<Vec<&[u8]>> {
     let mut out = Vec::with_capacity(n);
     let mut cur = Cursor::new(bytes);
     for _ in 0..n {
@@ -441,7 +441,7 @@ pub fn decode_plain_byte_array_n<'a>(bytes: &'a [u8], n: usize) -> Result<Vec<&'
 /// Two output shapes — caller picks one:
 ///   - `plain_sparse_decode_byte_array_into(..., out: &mut Vec<Vec<u8>>)`
 ///     — one allocation per matched value (Arrow's BinaryArray is
-///       a flatter layout; prefer the offsets variant when possible).
+///     a flatter layout; prefer the offsets variant when possible).
 ///   - `plain_sparse_decode_byte_array_offsets_into(..., bytes, offsets)`
 ///     — Arrow-style flat bytes + N+1 offsets (zero-malloc per row).
 ///
@@ -561,10 +561,7 @@ pub fn decode_plain_int96(bytes: &[u8]) -> Result<Vec<Int96>> {
 ///
 /// Common usage: UUIDs (`type_length` = 16), DECIMAL(N, S) (binary
 /// two's-complement of fixed byte width), arbitrary opaque BLOBs.
-pub fn decode_plain_fixed_len_byte_array<'a>(
-    bytes: &'a [u8],
-    type_length: i32,
-) -> Result<Vec<&'a [u8]>> {
+pub fn decode_plain_fixed_len_byte_array(bytes: &[u8], type_length: i32) -> Result<Vec<&[u8]>> {
     if type_length <= 0 {
         return Err(CodecError::InvalidInput(format!(
             "FIXED_LEN_BYTE_ARRAY requires type_length > 0, got {type_length}"

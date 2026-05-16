@@ -1024,8 +1024,8 @@ fn compress_body(body: &[u8], codec: CompressionCodec) -> Result<Vec<u8>> {
 
 /// Build a unique-value dictionary preserving first-occurrence order
 /// + per-input indices. Same shape used by every per-type dict
-/// builder below; the closure converts each input element to a
-/// hashable key.
+///   builder below; the closure converts each input element to a
+///   hashable key.
 fn build_dict_with<T, K>(values: &[T], key_of: impl Fn(&T) -> K) -> (Vec<usize>, Vec<u32>)
 where
     K: Eq + std::hash::Hash,

@@ -45,7 +45,7 @@ pub fn decode_rle_dictionary_indices(body: &[u8], num_values: usize) -> Result<V
         return Ok(out);
     }
 
-    let value_bytes = (bit_width as usize + 7) / 8;
+    let value_bytes = (bit_width as usize).div_ceil(8);
     let mut cur = Cursor::new(&body[1..]);
     let mut emitted = 0usize;
 
@@ -56,7 +56,7 @@ pub fn decode_rle_dictionary_indices(body: &[u8], num_values: usize) -> Result<V
 
         if is_bit_packed {
             let total = count * 8;
-            let needed = (total * bit_width as usize + 7) / 8;
+            let needed = (total * bit_width as usize).div_ceil(8);
             let chunk = cur.take(needed)?;
             let to_emit = (num_values - emitted).min(total);
             unpack_indices_into(chunk, to_emit, bit_width, &mut out)?;
@@ -122,7 +122,7 @@ pub fn decode_rle_dictionary_into<T: Copy>(
         return Ok(());
     }
 
-    let value_bytes = (bit_width as usize + 7) / 8;
+    let value_bytes = (bit_width as usize).div_ceil(8);
     let mut cur = Cursor::new(&body[1..]);
     let mut emitted = 0usize;
 
@@ -133,7 +133,7 @@ pub fn decode_rle_dictionary_into<T: Copy>(
 
         if is_bit_packed {
             let total = count * 8;
-            let needed = (total * bit_width as usize + 7) / 8;
+            let needed = (total * bit_width as usize).div_ceil(8);
             let chunk = cur.take(needed)?;
             let to_emit = (num_values - emitted).min(total);
             // Hand off to the const-generic unpacker. For typical
@@ -264,7 +264,7 @@ pub fn decode_rle_dictionary_predicate_bitmap(
         return Ok(());
     }
 
-    let value_bytes = (bit_width as usize + 7) / 8;
+    let value_bytes = (bit_width as usize).div_ceil(8);
     let mut cur = Cursor::new(&body[1..]);
     let mut emitted: usize = 0;
 
@@ -276,7 +276,7 @@ pub fn decode_rle_dictionary_predicate_bitmap(
         if is_bit_packed {
             let total = count * 8;
             let to_emit = (num_values - emitted).min(total);
-            let needed = (total * bit_width as usize + 7) / 8;
+            let needed = (total * bit_width as usize).div_ceil(8);
             let chunk = cur.take(needed)?;
 
             // Common path: row-aligned + emit-aligned. NEON kernel
@@ -482,7 +482,7 @@ pub fn gather_dict_at_bitmap_into<T: Clone>(
         return Ok(());
     }
 
-    let value_bytes = (bit_width as usize + 7) / 8;
+    let value_bytes = (bit_width as usize).div_ceil(8);
     let mut cur = Cursor::new(&body[1..]);
     let mut row: usize = 0;
 
@@ -494,7 +494,7 @@ pub fn gather_dict_at_bitmap_into<T: Clone>(
         if is_bit_packed {
             let total = count * 8;
             let to_consume = (num_values - row).min(total);
-            let needed = (total * bit_width as usize + 7) / 8;
+            let needed = (total * bit_width as usize).div_ceil(8);
             let chunk = cur.take(needed)?;
 
             let bytes_per_8 = bit_width as usize;
@@ -514,7 +514,7 @@ pub fn gather_dict_at_bitmap_into<T: Clone>(
             let head_unaligned = (bitmap_offset + row) % 8;
             if head_unaligned != 0 {
                 let head_rows = (8 - head_unaligned).min(to_consume);
-                let head_bytes = (head_rows * bit_width as usize + 7) / 8;
+                let head_bytes = (head_rows * bit_width as usize).div_ceil(8);
                 let mut head_idxs: Vec<u32> = Vec::with_capacity(head_rows);
                 unpack_indices_into(
                     &chunk[byte_cursor..byte_cursor + head_bytes],
@@ -554,7 +554,7 @@ pub fn gather_dict_at_bitmap_into<T: Clone>(
                 // the whole run. Performance regression is bounded:
                 // misalignment only happens on Utf8 / byte-array
                 // columns where the page layout doesn't pre-align.
-                let total_bytes = (to_consume * bit_width as usize + 7) / 8;
+                let total_bytes = (to_consume * bit_width as usize).div_ceil(8);
                 let mut all_idxs: Vec<u32> = Vec::with_capacity(to_consume);
                 unpack_indices_into(
                     &chunk[byte_cursor..byte_cursor + total_bytes],
@@ -620,7 +620,7 @@ pub fn gather_dict_at_bitmap_into<T: Clone>(
             // Tail (< 8 rows) at the end of the run: scalar per-row.
             if block_row < to_consume {
                 let tail = to_consume - block_row;
-                let tail_bytes = (tail * bit_width as usize + 7) / 8;
+                let tail_bytes = (tail * bit_width as usize).div_ceil(8);
                 let mut tail_idxs: Vec<u32> = Vec::with_capacity(tail);
                 unpack_indices_into(
                     &chunk[byte_cursor..byte_cursor + tail_bytes],

@@ -17,3 +17,6 @@ name = "ematix_parquet_format"
 # decode the same parquet footer via parquet-rs and assert field-by-
 # field equality with our decoder. Lib consumers do not see this.
 parquet = { version = "58", default-features = false }
+
+[lints]
+workspace = true

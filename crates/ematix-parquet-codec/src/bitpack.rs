@@ -131,6 +131,11 @@ pub fn unpack_lookup_into<T: Copy>(
                         packed, num_values, dict, out,
                     );
                 }
+                17 => {
+                    return crate::bitpack_avx2::unpack_lookup_into_avx2_bw17(
+                        packed, num_values, dict, out,
+                    );
+                }
                 _ => {}
             }
         }
@@ -195,7 +200,7 @@ pub fn unpack_indices_into(
     }
 
     // AVX2 specializations on x86_64. Mirror of the lookup path
-    // above; bw=14, 15, 16 shipped; more widths in Π.12d–f.
+    // above; bw=14, 15, 16, 17 shipped; more widths in Π.12e–f.
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -212,6 +217,11 @@ pub fn unpack_indices_into(
                 }
                 16 => {
                     return crate::bitpack_avx2::unpack_indices_into_avx2_bw16(
+                        packed, num_values, out,
+                    )
+                }
+                17 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw17(
                         packed, num_values, out,
                     )
                 }

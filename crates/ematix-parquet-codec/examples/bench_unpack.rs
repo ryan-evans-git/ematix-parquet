@@ -17,7 +17,9 @@ use std::time::Instant;
 use ematix_parquet_codec::bitpack::unpack_indices_into;
 #[cfg(target_arch = "aarch64")]
 use ematix_parquet_codec::bitpack_neon::{
-    unpack_indices_into_neon_bw12, unpack_indices_into_neon_bw14, unpack_indices_into_neon_bw17,
+    unpack_indices_into_neon_bw12, unpack_indices_into_neon_bw14,
+    unpack_indices_into_neon_bw15, unpack_indices_into_neon_bw16,
+    unpack_indices_into_neon_bw17, unpack_indices_into_neon_bw18,
 };
 
 const N_VALUES: usize = 1_000_000;
@@ -288,6 +290,47 @@ fn run_neon_bw14() {
     );
 }
 
+#[cfg(target_arch = "aarch64")]
+fn run_neon_simple(label: &str, bit_width: u8, kernel: fn(&[u8], usize, &mut Vec<u32>) -> ematix_parquet_codec::error::Result<()>) {
+    let mask: u32 = if bit_width == 32 { u32::MAX } else { (1u32 << bit_width) - 1 };
+    let mut seed: u32 = 0xC0FFEE ^ (bit_width as u32);
+    let values: Vec<u32> = (0..N_VALUES)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & mask
+        })
+        .collect();
+    let packed = pack(&values, bit_width);
+
+    let mut out: Vec<u32> = Vec::with_capacity(N_VALUES);
+    for _ in 0..3 {
+        out.clear();
+        kernel(black_box(&packed), N_VALUES, &mut out).unwrap();
+    }
+    assert_eq!(&out[..16], &values[..16]);
+
+    let mut best: f64 = f64::INFINITY;
+    for _ in 0..ITERS {
+        out.clear();
+        let t0 = Instant::now();
+        kernel(black_box(&packed), N_VALUES, &mut out).unwrap();
+        let dt = t0.elapsed().as_secs_f64();
+        if dt < best {
+            best = dt;
+        }
+    }
+    let ns_per_value = best * 1e9 / N_VALUES as f64;
+    let gbps_out = (N_VALUES * 4) as f64 / best / 1e9;
+    let gbps_in = packed.len() as f64 / best / 1e9;
+    println!(
+        "  {label}: {:>7.3} ms  {:>5.2} ns/val  in={:>5.2} GB/s  out={:>5.2} GB/s",
+        best * 1e3,
+        ns_per_value,
+        gbps_in,
+        gbps_out
+    );
+}
+
 fn main() {
     println!(
         "bit-unpack microbench ({} values × {} iters, best-of)",
@@ -295,16 +338,18 @@ fn main() {
     );
     // Workload-relevant widths: l_shipdate ~14, dict-encoded
     // categorical columns 1..6, and full-width 32 for comparison.
-    let widths: &[u8] = &[1, 4, 8, 10, 12, 14, 16, 17, 20, 24, 32];
+    let widths: &[u8] = &[1, 4, 8, 10, 12, 14, 15, 16, 17, 18, 20, 24, 32];
     for &w in widths {
         run_one(w);
     }
     #[cfg(target_arch = "aarch64")]
-    run_neon_bw12();
-    #[cfg(target_arch = "aarch64")]
-    run_neon_bw14();
-    #[cfg(target_arch = "aarch64")]
-    run_neon_bw17();
-    #[cfg(target_arch = "aarch64")]
-    run_predicate_fused_bw12();
+    {
+        run_neon_bw12();
+        run_neon_bw14();
+        run_neon_simple("bw=15 NEON", 15, unpack_indices_into_neon_bw15);
+        run_neon_simple("bw=16 NEON", 16, unpack_indices_into_neon_bw16);
+        run_neon_bw17();
+        run_neon_simple("bw=18 NEON", 18, unpack_indices_into_neon_bw18);
+        run_predicate_fused_bw12();
+    }
 }

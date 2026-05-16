@@ -60,11 +60,16 @@ pub fn unpack_lookup_into<T: Copy>(
 
     out.reserve(num_values);
 
-    // NEON specializations for hot widths in TPC-H lineitem: bw=12
-    // covers shipdate / commitdate / receiptdate, bw=14 covers
-    // l_suppkey, bw=17 covers l_orderkey 51% / l_partkey 67% /
-    // l_extendedprice 43%. NEON unpack into a stack staging buffer,
-    // then scalar dict gather per lane.
+    // NEON specializations for hot widths in TPC-H lineitem.
+    // bw=12: shipdate / commitdate / receiptdate.
+    // bw=14: l_suppkey 100%.
+    // bw=15/16/18: tail of l_orderkey / l_partkey / l_extendedprice
+    //              / l_comment dict pages.
+    // bw=17: l_orderkey 51% / l_partkey 67% / l_extendedprice 43%.
+    //
+    // NEON unpack into a stack staging buffer, then scalar dict
+    // gather per lane (raw pointer writes, no per-element bounds
+    // or capacity checks).
     #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
     {
         match bit_width {
@@ -78,8 +83,23 @@ pub fn unpack_lookup_into<T: Copy>(
                     packed, num_values, dict, out,
                 );
             }
+            15 => {
+                return crate::bitpack_neon::unpack_lookup_into_neon_bw15(
+                    packed, num_values, dict, out,
+                );
+            }
+            16 => {
+                return crate::bitpack_neon::unpack_lookup_into_neon_bw16(
+                    packed, num_values, dict, out,
+                );
+            }
             17 => {
                 return crate::bitpack_neon::unpack_lookup_into_neon_bw17(
+                    packed, num_values, dict, out,
+                );
+            }
+            18 => {
+                return crate::bitpack_neon::unpack_lookup_into_neon_bw18(
                     packed, num_values, dict, out,
                 );
             }
@@ -114,16 +134,21 @@ pub fn unpack_indices_into(
     }
     out.reserve(num_values);
 
-    // NEON specializations. Profiled at ~10× scalar on M-series for
-    // bw=12 (l_shipdate / l_commitdate / l_receiptdate), bw=14
-    // (l_suppkey 100%), and bw=17 (l_extendedprice 43%, l_partkey
-    // 67%, l_orderkey 51%). Other widths fall through to scalar.
+    // NEON specializations on M-series: every kernel hits the
+    // ~78 GB/s output ceiling. Widths covered: bw=12 (date columns),
+    // bw=14 (l_suppkey), bw=15 / bw=16 / bw=18 (l_orderkey /
+    // l_partkey / l_extendedprice / l_comment tail), bw=17
+    // (l_extendedprice 43% / l_partkey 67% / l_orderkey 51%).
+    // Other widths fall through to scalar.
     #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
     {
         match bit_width {
             12 => return crate::bitpack_neon::unpack_indices_into_neon_bw12(packed, num_values, out),
             14 => return crate::bitpack_neon::unpack_indices_into_neon_bw14(packed, num_values, out),
+            15 => return crate::bitpack_neon::unpack_indices_into_neon_bw15(packed, num_values, out),
+            16 => return crate::bitpack_neon::unpack_indices_into_neon_bw16(packed, num_values, out),
             17 => return crate::bitpack_neon::unpack_indices_into_neon_bw17(packed, num_values, out),
+            18 => return crate::bitpack_neon::unpack_indices_into_neon_bw18(packed, num_values, out),
             _ => {}
         }
     }

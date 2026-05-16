@@ -15,7 +15,7 @@ Every release is reproducible from `main` at the tagged commit.
 2. **Open the release PR.** On a feature branch, bump the workspace
    version in `Cargo.toml` (workspace.package.version) and the
    inter-crate `version = "X.Y"` pins in
-   `crates/ematix-parquet-{io,codec}/Cargo.toml`. Update
+   `crates/ematix-parquet-{io,codec,async}/Cargo.toml`. Update
    `docs/plans/CURRENT.md` and the README `## Status` block.
    Open a PR titled `release: vX.Y.Z — <theme>`.
 
@@ -37,12 +37,14 @@ Every release is reproducible from `main` at the tagged commit.
    ```
 
    The `release.yml` workflow fires on the tag push and publishes
-   the four crates to crates.io in dependency order
-   (`format → io → codec → async`), with a 45 s sleep between
-   publishes so crates.io's index propagates.
+   the five crates to crates.io in dependency order
+   (`format → io → crypto → codec → async`), with a 45 s sleep
+   between publishes so crates.io's index propagates. `crypto`
+   slots before `codec` because codec optionally depends on it via
+   the `encryption` feature.
 
 6. **Verify.** After ~5 min check the workflow run and confirm
-   all four crates show the new version on crates.io. If a
+   all five crates show the new version on crates.io. If a
    publish fails midway, the workflow's order means the failed
    crate and everything downstream of it didn't ship — fix the
    issue, bump the patch version, and re-cut.

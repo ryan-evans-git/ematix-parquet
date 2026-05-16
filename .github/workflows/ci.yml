@@ -52,6 +52,16 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets
 
+      # Encryption feature is gated off by default; exercise it on
+      # both runners so the encrypted-page / encrypted-footer paths
+      # stay green and the feature gate keeps default builds crypto-
+      # free.
+      - name: Build workspace (encryption feature)
+        run: cargo build --workspace --all-targets --features ematix-parquet-codec/encryption
+
+      - name: Run tests (encryption feature)
+        run: cargo test --workspace --all-targets --features ematix-parquet-codec/encryption
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

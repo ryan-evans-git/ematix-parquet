@@ -11,7 +11,8 @@
 //!     5: optional list<KeyValue>         key_value_metadata
 //!     6: optional string                 created_by
 //!     7: optional list<ColumnOrder>      column_orders
-//!     // 8/9 (encryption) deferred — strict error
+//!     8: optional EncryptionAlgorithm    encryption_algorithm    (Π.13a)
+//!     9: optional binary                 footer_signing_key_metadata (Π.13a)
 //!   }
 
 #[path = "common/mod.rs"]
@@ -198,8 +199,9 @@ fn file_metadata_missing_required_schema() {
 }
 
 #[test]
-fn file_metadata_encryption_fields_errored_strictly() {
-    // Field 8 (encryption_algorithm union) not yet supported.
+fn file_metadata_empty_encryption_union_errors() {
+    // Field 8 (encryption_algorithm union) requires exactly one of
+    // its inner variants — an empty struct triggers EmptyUnion.
     let root = root_schema_element_bytes(0);
     let rg = minimal_row_group_bytes(1);
     let enc = CompactBuilder::empty_struct();
@@ -213,9 +215,8 @@ fn file_metadata_encryption_fields_errored_strictly() {
     let mut cur = Cursor::new(&bytes);
     assert!(matches!(
         read_file_metadata(&mut cur),
-        Err(FormatError::UnknownStructField {
-            struct_name: "FileMetaData",
-            field_id: 8,
+        Err(FormatError::EmptyUnion {
+            union_name: "EncryptionAlgorithm",
         })
     ));
 }

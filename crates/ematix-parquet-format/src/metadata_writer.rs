@@ -271,6 +271,16 @@ fn encode_file_metadata(w: &mut Writer, md: &FileMetaData<'_>) {
         panic!("FileMetaData.column_orders write not yet implemented");
     }
 
+    // 8/9: encryption — Π.13e/f scope. Reader supports parsing them
+    // already (Π.13a); writer panics until the encrypted-write path
+    // lands.
+    if md.encryption_algorithm.is_some() {
+        panic!("FileMetaData.encryption_algorithm write not yet implemented (Π.13e+)");
+    }
+    if md.footer_signing_key_metadata.is_some() {
+        panic!("FileMetaData.footer_signing_key_metadata write not yet implemented (Π.13e+)");
+    }
+
     let _ = prev;
     w.write_field_stop();
 }
@@ -438,6 +448,16 @@ fn encode_column_chunk(w: &mut Writer, cc: &ColumnChunk<'_>) {
         w.write_field_header(7, FieldType::I32, prev);
         w.write_zigzag_i32(v);
         prev = 7;
+    }
+
+    // 8/9: ColumnCryptoMetaData + encrypted_column_metadata — Π.13e/f.
+    // Reader supports parsing them already (Π.13a); writer panics
+    // until the encrypted-write path lands.
+    if cc.crypto_metadata.is_some() {
+        panic!("ColumnChunk.crypto_metadata write not yet implemented (Π.13e+)");
+    }
+    if cc.encrypted_column_metadata.is_some() {
+        panic!("ColumnChunk.encrypted_column_metadata write not yet implemented (Π.13e+)");
     }
 
     let _ = prev;
@@ -722,6 +742,8 @@ mod tests {
             offset_index_length: None,
             column_index_offset: None,
             column_index_length: None,
+            crypto_metadata: None,
+            encrypted_column_metadata: None,
         };
         let rg = RowGroup {
             columns: vec![cc],
@@ -740,6 +762,8 @@ mod tests {
             key_value_metadata: None,
             created_by: Some(b"ematix-parquet"),
             column_orders: None,
+            encryption_algorithm: None,
+            footer_signing_key_metadata: None,
         }
     }
 

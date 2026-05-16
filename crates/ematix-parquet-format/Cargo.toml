@@ -16,7 +16,15 @@ name = "ematix_parquet_format"
 # Byte-identical correctness oracle. Used only by tests/oracle.rs to
 # decode the same parquet footer via parquet-rs and assert field-by-
 # field equality with our decoder. Lib consumers do not see this.
-parquet = { version = "58", default-features = false }
+# `encryption` feature enables PME write APIs used by the Π.13a
+# encryption-metadata oracle (pulls `ring`; dev-only).
+parquet = { version = "58", default-features = false, features = ["encryption", "arrow"] }
+# Local fixture files for the encryption oracle.
+tempfile = "3"
+# parquet-rs's arrow writer is the ergonomic path to emit a small
+# encrypted Parquet file from a test.
+arrow-array = { version = "58", default-features = false }
+arrow-schema = { version = "58", default-features = false }
 
 [lints]
 workspace = true

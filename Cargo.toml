@@ -4,6 +4,7 @@ members = [
     "crates/ematix-parquet-format",
     "crates/ematix-parquet-io",
     "crates/ematix-parquet-codec",
+    "crates/ematix-parquet-async",
 ]
 
 [workspace.package]

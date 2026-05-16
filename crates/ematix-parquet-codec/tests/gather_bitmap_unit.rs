@@ -241,3 +241,80 @@ fn mixed_runs_with_sparse_bitmap() {
     let expected = reference_gather(&body, n, &bitmap, 0, &dict);
     assert_eq!(out, expected);
 }
+
+/// Regression: when `bitmap_offset` is not a multiple of 8, the
+/// bit-packed branch's "8-row block, one bitmap-byte lookup" fast path
+/// would silently read the wrong bitmap byte in release builds (the
+/// in-source `debug_assert_eq!(bit_pos_base % 8, 0)` only fired in
+/// debug). This happens in practice for any data page after page 0
+/// whose `num_values` is not a multiple of 8 — the cumulative
+/// `bitmap_offset` carried across pages goes out of alignment, and
+/// the byte-wise fast path's `bitmap[bit_pos_base/8]` reads pre-shifted
+/// bits. Manifested as "decoded N values, expected M" on TPC-H Q1
+/// l_returnflag (Utf8, dict-encoded, byte-array column).
+#[test]
+fn bw_bitpacked_with_misaligned_bitmap_offset() {
+    // Page of 1024 values, but call into the bitmap at a non-multiple-
+    // of-8 offset (5) — simulates a real "second page after a first
+    // page whose num_values % 8 == 5".
+    let n: usize = 1024;
+    let values: Vec<u32> = (0..n as u32).collect();
+    let body = make_body_bitpacked(&values, 17);
+    let dict: Vec<u64> = (0..100_000).map(|i| (i as u64) * 7).collect();
+
+    // Bitmap large enough to cover bitmap_offset (5) + n (1024) = 1029
+    // bits. Set bits at absolute positions 5, 10, 100, 1028.
+    let bitmap_offset = 5usize;
+    let total_bits = bitmap_offset + n;
+    let mut bitmap = vec![0u8; total_bits.div_ceil(8) + 1];
+    let absolute_set: &[usize] = &[5, 10, 100, 1028];
+    for &abs_pos in absolute_set {
+        bitmap[abs_pos / 8] |= 1u8 << (abs_pos % 8);
+    }
+
+    let mut out: Vec<u64> = Vec::new();
+    gather_dict_at_bitmap_into(&body, n, &bitmap, bitmap_offset, &dict, &mut out).unwrap();
+    let expected = reference_gather(&body, n, &bitmap, bitmap_offset, &dict);
+    assert_eq!(
+        out, expected,
+        "gather produced {} values, reference produced {} (bitmap_offset={bitmap_offset})",
+        out.len(),
+        expected.len()
+    );
+    let expected_count: usize = absolute_set.len();
+    assert_eq!(out.len(), expected_count);
+}
+
+/// Stress: every misaligned starting offset 1..=7, against random
+/// values and a random sparse bitmap — must match the reference.
+#[test]
+fn bw_bitpacked_all_misaligned_starting_offsets() {
+    let n: usize = 2_000;
+    let mut seed: u32 = 0xBEEF_0042;
+    let dict_size = 50_000u32;
+    let values: Vec<u32> = (0..n)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed % dict_size
+        })
+        .collect();
+    let body = make_body_bitpacked(&values, 17);
+    let dict: Vec<i64> = (0..dict_size as i64).map(|i| i * 11).collect();
+
+    for offset in 1usize..=7 {
+        let total_bits = offset + n + 7;
+        let mut bitmap = vec![0u8; total_bits.div_ceil(8) + 1];
+        let mut bm_seed: u32 = 0x1234 ^ (offset as u32);
+        for row in 0..n {
+            bm_seed = bm_seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            if bm_seed % 50 == 0 {
+                let abs_pos = offset + row;
+                bitmap[abs_pos / 8] |= 1u8 << (abs_pos % 8);
+            }
+        }
+        let mut out: Vec<i64> = Vec::new();
+        gather_dict_at_bitmap_into(&body, n, &bitmap, offset, &dict, &mut out).unwrap();
+        let expected = reference_gather(&body, n, &bitmap, offset, &dict);
+        assert_eq!(out, expected, "mismatch at bitmap_offset={offset}");
+    }
+}

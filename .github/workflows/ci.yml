@@ -24,11 +24,18 @@ env:
 
 jobs:
   build-test:
-    name: build-test
-    # macOS 14 for aarch64 NEON coverage — every NEON kernel runs on
-    # CI rather than only on a developer's laptop. Once Π.11 ships
-    # x86 SIMD parity we add a parallel ubuntu-latest matrix entry.
-    runs-on: macos-14
+    name: build-test (${{ matrix.os }})
+    # Per-arch matrix — every kernel is exercised on the hardware it
+    # targets:
+    #   macos-14      → aarch64 (Apple Silicon) NEON path
+    #   ubuntu-latest → x86_64 AVX2 path (Π.12 onward)
+    # Branch protection requires both `build-test (macos-14)` and
+    # `build-test (ubuntu-latest)` to pass.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4

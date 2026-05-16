@@ -107,6 +107,25 @@ pub fn unpack_lookup_into<T: Copy>(
         }
     }
 
+    // AVX2 specializations on x86_64. Runtime feature detection
+    // because pre-Haswell Intel + pre-Excavator AMD don't have AVX2;
+    // the dispatcher silently falls through to scalar on those.
+    // Π.12 ships bw=16 first (byte-aligned, simplest); future
+    // Π.12b–f add 12 / 14 / 15 / 17 / 18.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            match bit_width {
+                16 => {
+                    return crate::bitpack_avx2::unpack_lookup_into_avx2_bw16(
+                        packed, num_values, dict, out,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Dispatch once on bit_width; the chosen monomorphization drives
     // the whole page.
     dispatch_unpack!(bit_width, packed, num_values, dict, out)
@@ -150,6 +169,18 @@ pub fn unpack_indices_into(
             17 => return crate::bitpack_neon::unpack_indices_into_neon_bw17(packed, num_values, out),
             18 => return crate::bitpack_neon::unpack_indices_into_neon_bw18(packed, num_values, out),
             _ => {}
+        }
+    }
+
+    // AVX2 specializations on x86_64. Mirror of the lookup path
+    // above; bw=16 first, more widths in Π.12b–f.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            match bit_width {
+                16 => return crate::bitpack_avx2::unpack_indices_into_avx2_bw16(packed, num_values, out),
+                _ => {}
+            }
         }
     }
 

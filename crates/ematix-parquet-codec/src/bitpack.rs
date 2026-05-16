@@ -116,6 +116,11 @@ pub fn unpack_lookup_into<T: Copy>(
     {
         if is_x86_feature_detected!("avx2") {
             match bit_width {
+                14 => {
+                    return crate::bitpack_avx2::unpack_lookup_into_avx2_bw14(
+                        packed, num_values, dict, out,
+                    );
+                }
                 16 => {
                     return crate::bitpack_avx2::unpack_lookup_into_avx2_bw16(
                         packed, num_values, dict, out,
@@ -162,23 +167,44 @@ pub fn unpack_indices_into(
     #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
     {
         match bit_width {
-            12 => return crate::bitpack_neon::unpack_indices_into_neon_bw12(packed, num_values, out),
-            14 => return crate::bitpack_neon::unpack_indices_into_neon_bw14(packed, num_values, out),
-            15 => return crate::bitpack_neon::unpack_indices_into_neon_bw15(packed, num_values, out),
-            16 => return crate::bitpack_neon::unpack_indices_into_neon_bw16(packed, num_values, out),
-            17 => return crate::bitpack_neon::unpack_indices_into_neon_bw17(packed, num_values, out),
-            18 => return crate::bitpack_neon::unpack_indices_into_neon_bw18(packed, num_values, out),
+            12 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw12(packed, num_values, out)
+            }
+            14 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw14(packed, num_values, out)
+            }
+            15 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw15(packed, num_values, out)
+            }
+            16 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw16(packed, num_values, out)
+            }
+            17 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw17(packed, num_values, out)
+            }
+            18 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw18(packed, num_values, out)
+            }
             _ => {}
         }
     }
 
     // AVX2 specializations on x86_64. Mirror of the lookup path
-    // above; bw=16 first, more widths in Π.12b–f.
+    // above; bw=14 and bw=16 shipped; more widths in Π.12c–f.
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
             match bit_width {
-                16 => return crate::bitpack_avx2::unpack_indices_into_avx2_bw16(packed, num_values, out),
+                14 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw14(
+                        packed, num_values, out,
+                    )
+                }
+                16 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw16(
+                        packed, num_values, out,
+                    )
+                }
                 _ => {}
             }
         }

@@ -33,23 +33,8 @@ fn extract_footer(bytes: &[u8]) -> &[u8] {
     &bytes[n - 8 - footer_len..n - 8]
 }
 
-// parquet-rs interop test for our encrypted-write path.
-//
-// Status: marked `#[ignore]` for v0.6.0. Our file is spec-compliant at
-// the wire-format level (verified by the internal round-trip test
-// below + by hex-comparison against parquet-rs's own encrypted
-// output), but parquet-rs's reader rejects our file with a generic
-// `ring::error::Unspecified` GCM tag mismatch during page-header
-// decrypt. Footer-signature path passes, trailing PAR1/length frame
-// is correct, ColumnChunk + FileMetaData fields all round-trip
-// through both writers cleanly. Mismatch is at the per-page AAD
-// layer — likely a subtle interpretation of one of the AAD ordinals
-// or the file_aad construction that differs between our impl and the
-// parquet-rs reader's expectation. Tracked as follow-up; doesn't
-// block Π.13e since our internal round-trip + the negative tests
-// cover correctness.
+/// parquet-rs interop: end-to-end round-trip through their reader.
 #[test]
-#[ignore = "parquet-rs interop debug pending — internal round-trip + negative tests cover correctness"]
 fn we_write_encrypted_i32_parquet_rs_reads() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let values: Vec<i32> = (0..32).map(|i| i * 7 - 3).collect();

@@ -237,6 +237,155 @@ pub fn decode_plain_f64_n(bytes: &[u8], n: usize) -> Result<Vec<f64>> {
     }
 }
 
+/// Sparse PLAIN decode for INT64. Reads only rows where the
+/// corresponding bit in `mask` (interpreted at `bitmap_offset + row`)
+/// is set. Appends matched values to `out` in row order.
+///
+/// Used by `read_column_i64_masked_into` on PLAIN data pages. The
+/// 8-row block-skip mirrors `gather_dict_at_bitmap_into`: when the
+/// mask byte covering 8 consecutive rows is 0, skip the whole block
+/// (no value reads, one byte test). Pays off on selective scans.
+///
+/// `bitmap_offset` is the global row index of `bytes`'s row 0 within
+/// the chunk's row-mask address space; required to be byte-aligned
+/// (debug assertion). Real callers ensure this because parquet page
+/// boundaries are always multiples of 8 (page sizes are typically
+/// 20480 and dict-encoded chunks emit 8-row groups).
+pub fn plain_sparse_decode_i64_into(
+    bytes: &[u8],
+    num_values: usize,
+    mask: &[u8],
+    bitmap_offset: usize,
+    out: &mut Vec<i64>,
+) -> Result<()> {
+    let needed = num_values * 8;
+    if bytes.len() < needed {
+        return Err(CodecError::UnderflowingPlainBuffer {
+            value_width: 8,
+            buffer_len: bytes.len(),
+            requested_values: num_values,
+        });
+    }
+    let mut row = 0usize;
+    while row + 8 <= num_values {
+        let bit_pos_base = bitmap_offset + row;
+        debug_assert_eq!(bit_pos_base % 8, 0, "bitmap_offset must be byte-aligned");
+        let mask_byte = mask[bit_pos_base / 8];
+        if mask_byte != 0 {
+            for lane in 0..8 {
+                if (mask_byte >> lane) & 1 == 1 {
+                    let off = (row + lane) * 8;
+                    let v = i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+                    out.push(v);
+                }
+            }
+        }
+        row += 8;
+    }
+    while row < num_values {
+        let bit_pos = bitmap_offset + row;
+        let bit = (mask[bit_pos / 8] >> (bit_pos % 8)) & 1;
+        if bit == 1 {
+            let off = row * 8;
+            let v = i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+            out.push(v);
+        }
+        row += 1;
+    }
+    Ok(())
+}
+
+/// Sparse PLAIN decode for INT32. Same shape as the i64 variant; 4
+/// bytes per value.
+pub fn plain_sparse_decode_i32_into(
+    bytes: &[u8],
+    num_values: usize,
+    mask: &[u8],
+    bitmap_offset: usize,
+    out: &mut Vec<i32>,
+) -> Result<()> {
+    let needed = num_values * 4;
+    if bytes.len() < needed {
+        return Err(CodecError::UnderflowingPlainBuffer {
+            value_width: 4,
+            buffer_len: bytes.len(),
+            requested_values: num_values,
+        });
+    }
+    let mut row = 0usize;
+    while row + 8 <= num_values {
+        let bit_pos_base = bitmap_offset + row;
+        debug_assert_eq!(bit_pos_base % 8, 0, "bitmap_offset must be byte-aligned");
+        let mask_byte = mask[bit_pos_base / 8];
+        if mask_byte != 0 {
+            for lane in 0..8 {
+                if (mask_byte >> lane) & 1 == 1 {
+                    let off = (row + lane) * 4;
+                    let v = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                    out.push(v);
+                }
+            }
+        }
+        row += 8;
+    }
+    while row < num_values {
+        let bit_pos = bitmap_offset + row;
+        let bit = (mask[bit_pos / 8] >> (bit_pos % 8)) & 1;
+        if bit == 1 {
+            let off = row * 4;
+            let v = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            out.push(v);
+        }
+        row += 1;
+    }
+    Ok(())
+}
+
+/// Sparse PLAIN decode for DOUBLE. Same shape as the i64 variant.
+pub fn plain_sparse_decode_f64_into(
+    bytes: &[u8],
+    num_values: usize,
+    mask: &[u8],
+    bitmap_offset: usize,
+    out: &mut Vec<f64>,
+) -> Result<()> {
+    let needed = num_values * 8;
+    if bytes.len() < needed {
+        return Err(CodecError::UnderflowingPlainBuffer {
+            value_width: 8,
+            buffer_len: bytes.len(),
+            requested_values: num_values,
+        });
+    }
+    let mut row = 0usize;
+    while row + 8 <= num_values {
+        let bit_pos_base = bitmap_offset + row;
+        debug_assert_eq!(bit_pos_base % 8, 0, "bitmap_offset must be byte-aligned");
+        let mask_byte = mask[bit_pos_base / 8];
+        if mask_byte != 0 {
+            for lane in 0..8 {
+                if (mask_byte >> lane) & 1 == 1 {
+                    let off = (row + lane) * 8;
+                    let v = f64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+                    out.push(v);
+                }
+            }
+        }
+        row += 8;
+    }
+    while row < num_values {
+        let bit_pos = bitmap_offset + row;
+        let bit = (mask[bit_pos / 8] >> (bit_pos % 8)) & 1;
+        if bit == 1 {
+            let off = row * 8;
+            let v = f64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+            out.push(v);
+        }
+        row += 1;
+    }
+    Ok(())
+}
+
 /// PLAIN-encoded BOOLEAN — 1 bit per value, LSB-first within each
 /// byte. The wire form holds `ceil(num_values / 8)` bytes; any
 /// trailing bits in the last byte are padding and must be ignored.

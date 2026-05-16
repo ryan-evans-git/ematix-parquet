@@ -438,6 +438,80 @@ pub fn decode_plain_byte_array_n<'a>(bytes: &'a [u8], n: usize) -> Result<Vec<&'
     Ok(out)
 }
 
+/// Sparse PLAIN decode for BYTE_ARRAY. Walks length-prefixes
+/// sequentially (we can't skip ahead without parsing each prefix)
+/// and copies only mask-set values into `out`.
+///
+/// Two output shapes — caller picks one:
+///   - `plain_sparse_decode_byte_array_into(..., out: &mut Vec<Vec<u8>>)`
+///     — one allocation per matched value (Arrow's BinaryArray is
+///       a flatter layout; prefer the offsets variant when possible).
+///   - `plain_sparse_decode_byte_array_offsets_into(..., bytes, offsets)`
+///     — Arrow-style flat bytes + N+1 offsets (zero-malloc per row).
+///
+/// `bitmap_offset` is the global row index of the page's row 0
+/// within the chunk's mask address space.
+pub fn plain_sparse_decode_byte_array_into(
+    bytes: &[u8],
+    num_values: usize,
+    mask: &[u8],
+    bitmap_offset: usize,
+    out: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    let mut cur = Cursor::new(bytes);
+    for row in 0..num_values {
+        let len = read_u32_le(&mut cur)? as usize;
+        let value = cur.take(len)?;
+        let bit_pos = bitmap_offset + row;
+        let bit = (mask[bit_pos / 8] >> (bit_pos % 8)) & 1;
+        if bit == 1 {
+            out.push(value.to_vec());
+        }
+    }
+    Ok(())
+}
+
+/// Arrow-style sparse PLAIN decode for BYTE_ARRAY. Appends matched
+/// values' bytes to `out_bytes` and pushes a running offset to
+/// `out_offsets`.
+///
+/// On entry, if `out_offsets` is empty, the function pushes the
+/// initial `0` offset; otherwise it continues from the existing
+/// trailing offset (so multiple chunks can be concatenated into the
+/// same `(out_bytes, out_offsets)` pair). After return,
+/// `out_offsets.len() = previous_len + matched_in_this_call`
+/// (i.e. one new offset per matched value).
+pub fn plain_sparse_decode_byte_array_offsets_into(
+    bytes: &[u8],
+    num_values: usize,
+    mask: &[u8],
+    bitmap_offset: usize,
+    out_bytes: &mut Vec<u8>,
+    out_offsets: &mut Vec<u32>,
+) -> Result<()> {
+    if out_offsets.is_empty() {
+        out_offsets.push(0);
+    }
+    let mut cur = Cursor::new(bytes);
+    let mut running = *out_offsets.last().unwrap();
+    for row in 0..num_values {
+        let len = read_u32_le(&mut cur)? as usize;
+        let value = cur.take(len)?;
+        let bit_pos = bitmap_offset + row;
+        let bit = (mask[bit_pos / 8] >> (bit_pos % 8)) & 1;
+        if bit == 1 {
+            out_bytes.extend_from_slice(value);
+            running = running
+                .checked_add(len as u32)
+                .ok_or_else(|| CodecError::InvalidInput(
+                    "byte_array sparse-decode: offset overflow > u32::MAX".into(),
+                ))?;
+            out_offsets.push(running);
+        }
+    }
+    Ok(())
+}
+
 fn read_u32_le(cur: &mut Cursor<'_>) -> Result<u32> {
     let bytes = cur.take(4)?;
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))

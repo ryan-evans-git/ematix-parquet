@@ -481,3 +481,99 @@ fn io_to_async(e: ematix_parquet_io::IoError) -> AsyncError {
 fn codec_to_async(e: ematix_parquet_codec::error::CodecError) -> AsyncError {
     AsyncError::Format(format!("codec: {e}"))
 }
+
+// ============================================================
+// Π.11d — async streaming Stream API
+// ============================================================
+//
+// `read_column_*_async_stream(file, rg, col, batch_size)` returns
+// a `Stream<Item = Result<Vec<T>>>` that yields decoded values in
+// batches of (mostly) `batch_size` rows. Mirrors the sync
+// `ematix_parquet_codec::read::ColumnBatchIter` shape, lifted into
+// an async Stream so callers can `.next().await` and integrate
+// with `futures::stream` adapters (map, take_while, throttle, etc.).
+//
+// Shape: one async GET to fetch the chunk bytes, then sync
+// page-walk + decode produces an in-memory `Vec<T>` of all the
+// chunk's values, which the stream then yields in slices of
+// `batch_size`. This is simpler than yielding per-page (which
+// would tangle Stream poll semantics with page-walker state)
+// and adequate for the common consumer use case (Arrow
+// RecordBatch sizing).
+
+use futures_core::Stream;
+
+/// Stream INT64 batches asynchronously. Internally fetches the
+/// chunk once via one GET, decodes fully in memory, then yields
+/// `batch_size`-sized `Vec<i64>` until exhausted. The final batch
+/// may be shorter.
+///
+/// Pair with `futures::StreamExt` to consume: `s.next().await`,
+/// `s.try_collect().await`, etc.
+pub fn read_column_i64_async_stream(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+    batch_size: usize,
+) -> impl Stream<Item = Result<Vec<i64>>> + '_ {
+    async_stream::try_stream! {
+        if batch_size == 0 {
+            Err(AsyncError::Format("batch_size must be > 0".into()))?;
+        }
+        let mut full: Vec<i64> = Vec::new();
+        read_column_i64_async_into(file, row_group, column, &mut full).await?;
+        let mut cursor = 0usize;
+        while cursor < full.len() {
+            let end = (cursor + batch_size).min(full.len());
+            let batch = full[cursor..end].to_vec();
+            cursor = end;
+            yield batch;
+        }
+    }
+}
+
+/// Stream INT32 batches asynchronously.
+pub fn read_column_i32_async_stream(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+    batch_size: usize,
+) -> impl Stream<Item = Result<Vec<i32>>> + '_ {
+    async_stream::try_stream! {
+        if batch_size == 0 {
+            Err(AsyncError::Format("batch_size must be > 0".into()))?;
+        }
+        let mut full: Vec<i32> = Vec::new();
+        read_column_i32_async_into(file, row_group, column, &mut full).await?;
+        let mut cursor = 0usize;
+        while cursor < full.len() {
+            let end = (cursor + batch_size).min(full.len());
+            let batch = full[cursor..end].to_vec();
+            cursor = end;
+            yield batch;
+        }
+    }
+}
+
+/// Stream DOUBLE batches asynchronously.
+pub fn read_column_f64_async_stream(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+    batch_size: usize,
+) -> impl Stream<Item = Result<Vec<f64>>> + '_ {
+    async_stream::try_stream! {
+        if batch_size == 0 {
+            Err(AsyncError::Format("batch_size must be > 0".into()))?;
+        }
+        let mut full: Vec<f64> = Vec::new();
+        read_column_f64_async_into(file, row_group, column, &mut full).await?;
+        let mut cursor = 0usize;
+        while cursor < full.len() {
+            let end = (cursor + batch_size).min(full.len());
+            let batch = full[cursor..end].to_vec();
+            cursor = end;
+            yield batch;
+        }
+    }
+}

@@ -100,3 +100,88 @@ fn map_crypto_err(err: CryptoError) -> CodecError {
     // they stand out from generic decode errors in panics + logs.
     CodecError::Decompress(format!("PME decrypt failed: {err}"))
 }
+
+/// Decrypt an **encrypted-footer** Parquet file's footer (the
+/// ciphertext that lives between `FileCryptoMetaData` and the
+/// 4-byte trailing length prefix). Returns the plaintext
+/// `FileMetaData` Thrift bytes, ready to feed into
+/// `read_file_metadata`.
+///
+/// The encrypted-footer trailer layout is:
+///
+/// ```text
+/// [ FileCryptoMetaData (Thrift) ][ encrypted FileMetaData ][ len: u32 LE ][ PARE ]
+///   ^-- parsed first ----------- ^-- decrypted by this fn
+/// ```
+///
+/// Use `split_encrypted_footer_trailer` to peel off the cleartext
+/// `FileCryptoMetaData` slice and the encrypted-FileMetaData slice
+/// from a `bytes[..]` window covering the trailer.
+pub fn decrypt_footer(
+    encrypted_file_metadata: &[u8],
+    key: &Key,
+    aad_prefix: Option<&[u8]>,
+    aad_file_unique: &[u8],
+) -> Result<Vec<u8>> {
+    // The Footer module's AAD is just `file_aad || module_byte`
+    // (no rg/col/page). Build it via the shared helper.
+    let aad = build_module_aad(aad_prefix, aad_file_unique, ModuleType::Footer, 0, 0, None);
+
+    // The encrypted FileMetaData is wrapped in the same wire frame
+    // every other encrypted module uses:
+    //   [ size: u32 LE ][ nonce: 12B ][ ciphertext ][ tag: 16B ]
+    if encrypted_file_metadata.len() < SIZE_PREFIX_LEN {
+        return Err(map_crypto_err(CryptoError::ShortCiphertext {
+            got: encrypted_file_metadata.len(),
+            need: SIZE_PREFIX_LEN,
+        }));
+    }
+    let size = u32::from_le_bytes(
+        encrypted_file_metadata[..SIZE_PREFIX_LEN]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let total = SIZE_PREFIX_LEN + size;
+    if encrypted_file_metadata.len() < total {
+        return Err(map_crypto_err(CryptoError::ShortCiphertext {
+            got: encrypted_file_metadata.len(),
+            need: total,
+        }));
+    }
+    if size < NONCE_LEN + TAG_LEN {
+        return Err(map_crypto_err(CryptoError::ShortCiphertext {
+            got: size,
+            need: NONCE_LEN + TAG_LEN,
+        }));
+    }
+
+    let nonce = &encrypted_file_metadata[SIZE_PREFIX_LEN..SIZE_PREFIX_LEN + NONCE_LEN];
+    let ct_and_tag = &encrypted_file_metadata[SIZE_PREFIX_LEN + NONCE_LEN..total];
+
+    open(key, nonce, &aad, ct_and_tag).map_err(map_crypto_err)
+}
+
+/// Split the bytes between the `PARE` magic / length prefix and the
+/// start of the trailer into `(file_crypto_metadata_bytes,
+/// encrypted_file_metadata_bytes)`.
+///
+/// `trailer` must be the slice `[FileCryptoMetaData || encrypted
+/// FileMetaData]` — i.e. the `footer_len` bytes immediately before
+/// the trailing `[len: u32 LE][PARE]` (which is what
+/// `extract_encrypted_footer_trailer` produces from the full file
+/// bytes — see the oracle tests).
+///
+/// We find the boundary by parsing the `FileCryptoMetaData` Thrift
+/// and observing where the cursor stops; everything after is the
+/// encrypted `FileMetaData` ciphertext frame.
+pub fn split_encrypted_footer_trailer(trailer: &[u8]) -> Result<(&[u8], &[u8])> {
+    use ematix_parquet_format::compact::Cursor;
+    use ematix_parquet_format::metadata::read_file_crypto_metadata;
+
+    let mut cur = Cursor::new(trailer);
+    read_file_crypto_metadata(&mut cur).map_err(|e| {
+        CodecError::Decompress(format!("PME footer trailer: bad FileCryptoMetaData: {e:?}"))
+    })?;
+    let boundary = cur.position();
+    Ok((&trailer[..boundary], &trailer[boundary..]))
+}

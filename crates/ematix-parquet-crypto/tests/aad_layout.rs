@@ -8,7 +8,7 @@
 use ematix_parquet_crypto::aad::{build_module_aad, ModuleType};
 
 #[test]
-fn footer_has_no_page_ordinal_no_prefix() {
+fn footer_aad_is_module_byte_only() {
     let aad = build_module_aad(
         None,
         b"FU\x00\x00\x00\x00\x00\x00", // 8 bytes file_unique
@@ -17,8 +17,9 @@ fn footer_has_no_page_ordinal_no_prefix() {
         0,
         None,
     );
-    // Layout: file_unique (8) || module (0) || rg (0,0) || col (0,0).
-    assert_eq!(aad, b"FU\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+    // Footer is the special case: file_unique || module (0). No
+    // rg/col/page suffix per spec — matches parquet-rs.
+    assert_eq!(aad, b"FU\x00\x00\x00\x00\x00\x00\x00");
 }
 
 #[test]
@@ -29,12 +30,12 @@ fn data_page_has_page_ordinal_and_prefix() {
         ModuleType::DataPage, // module = 2
         7,                    // rg_ordinal LE = 07 00
         3,                    // col_ordinal LE = 03 00
-        Some(42),             // page_ordinal LE = 2a 00 00 00
+        Some(42),             // page_ordinal LE = 2a 00 (i16, 2 bytes)
     );
     let expected: Vec<u8> = b"PREFIX"
         .iter()
         .chain(b"FILEUNIQ".iter())
-        .chain([0x02u8, 0x07, 0x00, 0x03, 0x00, 0x2a, 0x00, 0x00, 0x00].iter())
+        .chain([0x02u8, 0x07, 0x00, 0x03, 0x00, 0x2a, 0x00].iter())
         .copied()
         .collect();
     assert_eq!(aad, expected);
@@ -73,11 +74,14 @@ fn module_type_byte_values_match_spec() {
 }
 
 #[test]
-fn has_page_ordinal_only_for_page_modules() {
+fn has_page_ordinal_only_for_data_page_modules() {
+    // Spec: only DataPage + DataPageHeader carry the page-ordinal
+    // suffix. Dictionary* don't (there's only one dict page per
+    // column chunk; the suffix would always be 0 → no extra signal).
     assert!(ModuleType::DataPage.has_page_ordinal());
-    assert!(ModuleType::DictionaryPage.has_page_ordinal());
     assert!(ModuleType::DataPageHeader.has_page_ordinal());
-    assert!(ModuleType::DictionaryPageHeader.has_page_ordinal());
+    assert!(!ModuleType::DictionaryPage.has_page_ordinal());
+    assert!(!ModuleType::DictionaryPageHeader.has_page_ordinal());
     assert!(!ModuleType::Footer.has_page_ordinal());
     assert!(!ModuleType::ColumnMetaData.has_page_ordinal());
     assert!(!ModuleType::ColumnIndex.has_page_ordinal());
@@ -101,7 +105,7 @@ fn aes_gcm_round_trip_uses_real_aad() {
         ModuleType::DataPage,
         0,
         1,
-        Some(0),
+        Some(0i16),
     );
 
     let pt = b"some page bytes worth protecting";

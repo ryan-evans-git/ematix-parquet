@@ -2,18 +2,23 @@
 //!
 //! Spec: https://github.com/apache/parquet-format/blob/master/Encryption.md
 //!
-//! Each encrypted module (page, page header, column metadata, …) is
-//! sealed with AES-GCM using a module-specific AAD computed as:
+//! Each encrypted module is sealed with AES-GCM under an AAD assembled
+//! according to the module's type. There are three shapes:
 //!
-//! ```text
-//! AAD = aad_prefix? || aad_file_unique || module_type (1 byte)
-//!         || row_group_ordinal (2 bytes LE)
-//!         || column_ordinal (2 bytes LE)
-//!         || page_ordinal? (4 bytes LE)
-//! ```
+//! - **Footer:** `file_aad || module_byte` (5 bytes beyond file_aad).
+//! - **DataPage / DataPageHeader:**
+//!   `file_aad || module || rg_ord_LE || col_ord_LE || page_ord_LE`
+//!   where every ordinal is `i16` little-endian (2 bytes each).
+//! - **Everything else (ColumnMetaData, Dictionary*, ColumnIndex,
+//!   OffsetIndex, BloomFilter*):**
+//!   `file_aad || module || rg_ord_LE || col_ord_LE`.
 //!
-//! The page-ordinal suffix is only present for pages/page-headers —
-//! footer, ColumnMetaData, indexes, and bloom filters omit it.
+//! Note that `DictionaryPage` and `DictionaryPageHeader` do **not**
+//! carry a page-ordinal suffix — the spec reserves that for data
+//! pages only. parquet-mr / parquet-rs agree.
+//!
+//! `file_aad` itself is `aad_prefix || aad_file_unique` (in that
+//! order); the builder concatenates them for you.
 
 /// Module type byte per the PME spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,30 +38,25 @@ pub enum ModuleType {
 
 impl ModuleType {
     /// `true` if this module's AAD includes a page-ordinal suffix.
+    /// Per spec: only `DataPage` and `DataPageHeader` get it.
     pub fn has_page_ordinal(self) -> bool {
-        matches!(
-            self,
-            Self::DataPage
-                | Self::DictionaryPage
-                | Self::DataPageHeader
-                | Self::DictionaryPageHeader
-        )
+        matches!(self, Self::DataPage | Self::DataPageHeader)
     }
 }
 
 /// Build the AAD bytes for one module-encrypt operation.
 ///
-/// Panics in debug if `module.has_page_ordinal()` mismatches whether
-/// `page_ordinal.is_some()` — that's a programmer error in the caller,
-/// not user-visible. Release builds silently follow whichever the
-/// caller passed.
+/// The `page_ordinal` arg is ignored for module types that don't
+/// carry one (Footer / Dictionary* / ColumnMetaData / indexes /
+/// bloom). Debug builds assert the caller passes
+/// `page_ordinal.is_some()` iff `module.has_page_ordinal()`.
 pub fn build_module_aad(
     aad_prefix: Option<&[u8]>,
     aad_file_unique: &[u8],
     module: ModuleType,
     rg_ordinal: i16,
     col_ordinal: i16,
-    page_ordinal: Option<i32>,
+    page_ordinal: Option<i16>,
 ) -> Vec<u8> {
     debug_assert_eq!(
         module.has_page_ordinal(),
@@ -64,10 +64,20 @@ pub fn build_module_aad(
         "module {module:?} page_ordinal contract violated",
     );
 
-    // Capacity: prefix? + file_unique + 1 (module) + 2 (rg) + 2 (col)
-    // + 4 (page?). Tight estimate avoids reallocation.
     let prefix_len = aad_prefix.map_or(0, |p| p.len());
-    let suffix_len = 1 + 2 + 2 + page_ordinal.map_or(0, |_| 4);
+
+    // Footer is the special case — module byte only, no rg/col/page.
+    if matches!(module, ModuleType::Footer) {
+        let mut buf = Vec::with_capacity(prefix_len + aad_file_unique.len() + 1);
+        if let Some(prefix) = aad_prefix {
+            buf.extend_from_slice(prefix);
+        }
+        buf.extend_from_slice(aad_file_unique);
+        buf.push(module as u8);
+        return buf;
+    }
+
+    let suffix_len = 1 + 2 + 2 + if module.has_page_ordinal() { 2 } else { 0 };
     let mut buf = Vec::with_capacity(prefix_len + aad_file_unique.len() + suffix_len);
 
     if let Some(prefix) = aad_prefix {
@@ -77,8 +87,10 @@ pub fn build_module_aad(
     buf.push(module as u8);
     buf.extend_from_slice(&rg_ordinal.to_le_bytes());
     buf.extend_from_slice(&col_ordinal.to_le_bytes());
-    if let Some(po) = page_ordinal {
-        buf.extend_from_slice(&po.to_le_bytes());
+    if module.has_page_ordinal() {
+        if let Some(po) = page_ordinal {
+            buf.extend_from_slice(&po.to_le_bytes());
+        }
     }
     buf
 }

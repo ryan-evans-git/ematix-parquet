@@ -25,6 +25,8 @@ pub mod column;
 pub mod compression;
 pub mod delta;
 pub mod dict;
+#[cfg(feature = "encryption")]
+pub mod encrypted;
 pub mod error;
 pub mod levels;
 pub mod page_index;

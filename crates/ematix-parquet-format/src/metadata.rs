@@ -674,9 +674,13 @@ pub fn read_column_order(cur: &mut Cursor<'_>) -> Result<ColumnOrder> {
     })
 }
 
-/// Top-level Parquet footer struct. Fields 8 (encryption_algorithm
-/// union) and 9 (footer_signing_key_metadata) are not yet modeled —
-/// they error strictly via `UnknownStructField`.
+/// Top-level Parquet footer struct.
+///
+/// Fields 8/9 carry the Parquet Modular Encryption (PME) descriptor on
+/// **plaintext-footer** files; on **encrypted-footer** files the whole
+/// footer lives inside `FileCryptoMetaData` instead and these are
+/// absent here. See `ematix-parquet-format/src/metadata.rs` PME section
+/// (`read_file_crypto_metadata`) for the encrypted-footer trailer.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FileMetaData<'a> {
     pub version: i32,
@@ -686,6 +690,16 @@ pub struct FileMetaData<'a> {
     pub key_value_metadata: Option<Vec<KeyValue<'a>>>,
     pub created_by: Option<&'a [u8]>,
     pub column_orders: Option<Vec<ColumnOrder>>,
+    /// `EncryptionAlgorithm` union present iff the file is PME-encrypted.
+    /// On plaintext-footer mode this describes how the column chunks
+    /// were encrypted; on encrypted-footer mode this field is in
+    /// `FileCryptoMetaData` instead.
+    pub encryption_algorithm: Option<EncryptionAlgorithm<'a>>,
+    /// Opaque caller-defined identifier for the key used to sign the
+    /// (plaintext) footer in plaintext-footer mode. Caller decides how
+    /// to map it back to key material. Absent on unencrypted files and
+    /// on encrypted-footer files.
+    pub footer_signing_key_metadata: Option<&'a [u8]>,
 }
 
 pub fn read_file_metadata<'a>(cur: &mut Cursor<'a>) -> Result<FileMetaData<'a>> {
@@ -696,6 +710,8 @@ pub fn read_file_metadata<'a>(cur: &mut Cursor<'a>) -> Result<FileMetaData<'a>> 
     let mut key_value_metadata = None;
     let mut created_by = None;
     let mut column_orders = None;
+    let mut encryption_algorithm = None;
+    let mut footer_signing_key_metadata = None;
     let mut prev = 0;
     while let Some(h) = read_field_header(cur, prev)? {
         prev = h.id;
@@ -711,6 +727,12 @@ pub fn read_file_metadata<'a>(cur: &mut Cursor<'a>) -> Result<FileMetaData<'a>> 
             (7, FieldType::List) => {
                 column_orders = Some(read_list_struct(cur, |c| read_column_order(c))?);
             }
+            (8, FieldType::Struct) => {
+                encryption_algorithm = Some(read_encryption_algorithm(cur)?);
+            }
+            (9, FieldType::Binary) => {
+                footer_signing_key_metadata = Some(read_binary(cur)?);
+            }
             _ => return Err(unknown("FileMetaData", h.id)),
         }
     }
@@ -722,6 +744,8 @@ pub fn read_file_metadata<'a>(cur: &mut Cursor<'a>) -> Result<FileMetaData<'a>> 
         key_value_metadata,
         created_by,
         column_orders,
+        encryption_algorithm,
+        footer_signing_key_metadata,
     })
 }
 
@@ -798,9 +822,19 @@ pub struct ColumnMetaData<'a> {
     pub size_statistics: Option<SizeStatistics>,
 }
 
-/// Top-level chunk descriptor in `RowGroup.columns`. Fields 8/9
-/// (ColumnCryptoMetaData union, encrypted_column_metadata) are not
-/// yet modeled.
+/// Top-level chunk descriptor in `RowGroup.columns`.
+///
+/// PME fields:
+/// - `crypto_metadata` (field 8) carries which key encrypts this column
+///   chunk's pages — either the file's footer key
+///   (`EncryptionWithFooterKey`) or a per-column key
+///   (`EncryptionWithColumnKey { path_in_schema, key_metadata }`).
+///   Present iff the file is encrypted *and* this column participates.
+/// - `encrypted_column_metadata` (field 9) is the AES-GCM ciphertext of
+///   the chunk's `ColumnMetaData`, used in plaintext-footer mode to
+///   keep per-column stats / offsets confidential. When present,
+///   `meta_data` is `None` and the caller decrypts these bytes into a
+///   `ColumnMetaData` itself.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ColumnChunk<'a> {
     pub file_path: Option<&'a [u8]>,
@@ -810,6 +844,8 @@ pub struct ColumnChunk<'a> {
     pub offset_index_length: Option<i32>,
     pub column_index_offset: Option<i64>,
     pub column_index_length: Option<i32>,
+    pub crypto_metadata: Option<ColumnCryptoMetaData<'a>>,
+    pub encrypted_column_metadata: Option<&'a [u8]>,
 }
 
 pub fn read_size_statistics(cur: &mut Cursor<'_>) -> Result<SizeStatistics> {
@@ -1016,6 +1052,8 @@ pub fn read_column_chunk<'a>(cur: &mut Cursor<'a>) -> Result<ColumnChunk<'a>> {
     let mut offset_index_length = None;
     let mut column_index_offset = None;
     let mut column_index_length = None;
+    let mut crypto_metadata = None;
+    let mut encrypted_column_metadata = None;
     let mut prev = 0;
     while let Some(h) = read_field_header(cur, prev)? {
         prev = h.id;
@@ -1027,6 +1065,12 @@ pub fn read_column_chunk<'a>(cur: &mut Cursor<'a>) -> Result<ColumnChunk<'a>> {
             (5, FieldType::I32) => offset_index_length = Some(read_zigzag_i32(cur)?),
             (6, FieldType::I64) => column_index_offset = Some(read_zigzag_i64(cur)?),
             (7, FieldType::I32) => column_index_length = Some(read_zigzag_i32(cur)?),
+            (8, FieldType::Struct) => {
+                crypto_metadata = Some(read_column_crypto_metadata(cur)?);
+            }
+            (9, FieldType::Binary) => {
+                encrypted_column_metadata = Some(read_binary(cur)?);
+            }
             _ => return Err(unknown("ColumnChunk", h.id)),
         }
     }
@@ -1038,6 +1082,8 @@ pub fn read_column_chunk<'a>(cur: &mut Cursor<'a>) -> Result<ColumnChunk<'a>> {
         offset_index_length,
         column_index_offset,
         column_index_length,
+        crypto_metadata,
+        encrypted_column_metadata,
     })
 }
 
@@ -1213,4 +1259,222 @@ pub fn read_statistics<'a>(cur: &mut Cursor<'a>) -> Result<Statistics<'a>> {
         }
     }
     Ok(stats)
+}
+
+// ============================================================
+// Parquet Modular Encryption (PME) — Π.13a
+//
+// Metadata-only support: parse the encryption descriptors on the
+// footer + per-column-chunk fields. Actual AES-GCM decrypt lives
+// in the `ematix-parquet-crypto` crate (Π.13b) and is wired into
+// `ematix-parquet-codec` under `--features encryption` (Π.13c+).
+//
+// Spec: https://github.com/apache/parquet-format/blob/master/Encryption.md
+// IDL:  EncryptionAlgorithm union, AesGcmV1, AesGcmCtrV1,
+//       FileCryptoMetaData, ColumnCryptoMetaData union,
+//       EncryptionWithFooterKey, EncryptionWithColumnKey.
+// ============================================================
+
+/// AES-GCM v1 parameters carried in `EncryptionAlgorithm`.
+///
+/// - `aad_prefix` is optional file-identifier bytes the writer chose
+///   to bind into every page's AAD. May be absent (caller-supplied
+///   instead — see `supply_aad_prefix`).
+/// - `aad_file_unique` is mandatory: 8-32 random bytes the writer
+///   generated for this specific file, mixed into every AAD so two
+///   files with identical content but different uniques produce
+///   incompatible ciphertexts.
+/// - `supply_aad_prefix` indicates the writer chose NOT to embed
+///   `aad_prefix` in the file; the reader must obtain it from the
+///   caller (usually because the prefix itself is sensitive, e.g.
+///   contains a customer ID).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AesGcmV1<'a> {
+    pub aad_prefix: Option<&'a [u8]>,
+    pub aad_file_unique: Option<&'a [u8]>,
+    pub supply_aad_prefix: Option<bool>,
+}
+
+/// AES-GCM-CTR v1 parameters. Same shape as `AesGcmV1` but indicates
+/// the column-data encryption is CTR mode (without authentication tag
+/// on the data; metadata is still authenticated).
+///
+/// v0.6.0 parses this so we can read parquet-rs's encrypted-footer
+/// trailers that advertise CTR mode for the column data, but the
+/// codec will reject CTR with `UnsupportedAlgorithm` until a real
+/// consumer asks for it. Tracked as a v0.6.x follow-up.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AesGcmCtrV1<'a> {
+    pub aad_prefix: Option<&'a [u8]>,
+    pub aad_file_unique: Option<&'a [u8]>,
+    pub supply_aad_prefix: Option<bool>,
+}
+
+/// Algorithm union — one of `AesGcmV1` or `AesGcmCtrV1`. The wire
+/// representation is a Thrift union: exactly one of fields 1 / 2 is
+/// set. Other fields are unknown/error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncryptionAlgorithm<'a> {
+    AesGcmV1(AesGcmV1<'a>),
+    AesGcmCtrV1(AesGcmCtrV1<'a>),
+}
+
+pub fn read_aes_gcm_v1<'a>(cur: &mut Cursor<'a>) -> Result<AesGcmV1<'a>> {
+    let mut out = AesGcmV1::default();
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Binary) => out.aad_prefix = Some(read_binary(cur)?),
+            (2, FieldType::Binary) => out.aad_file_unique = Some(read_binary(cur)?),
+            (3, FieldType::BoolTrue) => out.supply_aad_prefix = Some(true),
+            (3, FieldType::BoolFalse) => out.supply_aad_prefix = Some(false),
+            _ => return Err(unknown("AesGcmV1", h.id)),
+        }
+    }
+    Ok(out)
+}
+
+pub fn read_aes_gcm_ctr_v1<'a>(cur: &mut Cursor<'a>) -> Result<AesGcmCtrV1<'a>> {
+    let mut out = AesGcmCtrV1::default();
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Binary) => out.aad_prefix = Some(read_binary(cur)?),
+            (2, FieldType::Binary) => out.aad_file_unique = Some(read_binary(cur)?),
+            (3, FieldType::BoolTrue) => out.supply_aad_prefix = Some(true),
+            (3, FieldType::BoolFalse) => out.supply_aad_prefix = Some(false),
+            _ => return Err(unknown("AesGcmCtrV1", h.id)),
+        }
+    }
+    Ok(out)
+}
+
+pub fn read_encryption_algorithm<'a>(cur: &mut Cursor<'a>) -> Result<EncryptionAlgorithm<'a>> {
+    let mut chosen: Option<EncryptionAlgorithm<'a>> = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Struct) => {
+                chosen = Some(EncryptionAlgorithm::AesGcmV1(read_aes_gcm_v1(cur)?));
+            }
+            (2, FieldType::Struct) => {
+                chosen = Some(EncryptionAlgorithm::AesGcmCtrV1(read_aes_gcm_ctr_v1(cur)?));
+            }
+            _ => return Err(unknown("EncryptionAlgorithm", h.id)),
+        }
+    }
+    chosen.ok_or(FormatError::EmptyUnion {
+        union_name: "EncryptionAlgorithm",
+    })
+}
+
+/// `EncryptionWithColumnKey` — per-column key path. The
+/// `path_in_schema` is the dotted schema path naming the column being
+/// encrypted (matches `ColumnMetaData.path_in_schema`). `key_metadata`
+/// is caller-opaque bytes identifying the key.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EncryptionWithColumnKey<'a> {
+    pub path_in_schema: Vec<&'a [u8]>,
+    pub key_metadata: Option<&'a [u8]>,
+}
+
+/// `ColumnCryptoMetaData` union — exactly one of two variants:
+/// `EncryptionWithFooterKey` (this column uses the file's footer key)
+/// or `EncryptionWithColumnKey` (per-column key with optional metadata).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnCryptoMetaData<'a> {
+    EncryptionWithFooterKey,
+    EncryptionWithColumnKey(EncryptionWithColumnKey<'a>),
+}
+
+pub fn read_encryption_with_column_key<'a>(
+    cur: &mut Cursor<'a>,
+) -> Result<EncryptionWithColumnKey<'a>> {
+    let mut path_in_schema: Option<Vec<&'a [u8]>> = None;
+    let mut key_metadata: Option<&'a [u8]> = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::List) => path_in_schema = Some(read_list_binary(cur)?),
+            (2, FieldType::Binary) => key_metadata = Some(read_binary(cur)?),
+            _ => return Err(unknown("EncryptionWithColumnKey", h.id)),
+        }
+    }
+    Ok(EncryptionWithColumnKey {
+        path_in_schema: path_in_schema.ok_or_else(|| missing("EncryptionWithColumnKey", 1))?,
+        key_metadata,
+    })
+}
+
+/// `EncryptionWithFooterKey` is a marker struct (no fields) in the
+/// spec — the variant tag in the parent union is the entire payload.
+/// We accept it as an empty struct (STOP byte immediately) and error
+/// on any field.
+fn read_encryption_with_footer_key(cur: &mut Cursor<'_>) -> Result<()> {
+    if let Some(h) = read_field_header(cur, 0)? {
+        return Err(unknown("EncryptionWithFooterKey", h.id));
+    }
+    Ok(())
+}
+
+pub fn read_column_crypto_metadata<'a>(cur: &mut Cursor<'a>) -> Result<ColumnCryptoMetaData<'a>> {
+    let mut chosen: Option<ColumnCryptoMetaData<'a>> = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Struct) => {
+                read_encryption_with_footer_key(cur)?;
+                chosen = Some(ColumnCryptoMetaData::EncryptionWithFooterKey);
+            }
+            (2, FieldType::Struct) => {
+                chosen = Some(ColumnCryptoMetaData::EncryptionWithColumnKey(
+                    read_encryption_with_column_key(cur)?,
+                ));
+            }
+            _ => return Err(unknown("ColumnCryptoMetaData", h.id)),
+        }
+    }
+    chosen.ok_or(FormatError::EmptyUnion {
+        union_name: "ColumnCryptoMetaData",
+    })
+}
+
+/// `FileCryptoMetaData` — the **encrypted-footer** trailer that
+/// replaces `FileMetaData` on disk. The reader recognises this mode by
+/// the `PARE` magic (vs `PAR1`/`PAR2` for unencrypted/plaintext-footer
+/// files) and decodes this struct from the bytes immediately before
+/// the magic. `encryption_algorithm` describes how the actual
+/// `FileMetaData` ciphertext (which follows this struct, also before
+/// the magic) was encrypted; `key_metadata` identifies the key.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FileCryptoMetaData<'a> {
+    pub encryption_algorithm: Option<EncryptionAlgorithm<'a>>,
+    pub key_metadata: Option<&'a [u8]>,
+}
+
+pub fn read_file_crypto_metadata<'a>(cur: &mut Cursor<'a>) -> Result<FileCryptoMetaData<'a>> {
+    let mut encryption_algorithm = None;
+    let mut key_metadata = None;
+    let mut prev = 0;
+    while let Some(h) = read_field_header(cur, prev)? {
+        prev = h.id;
+        match (h.id, &h.field_type) {
+            (1, FieldType::Struct) => {
+                encryption_algorithm = Some(read_encryption_algorithm(cur)?);
+            }
+            (2, FieldType::Binary) => key_metadata = Some(read_binary(cur)?),
+            _ => return Err(unknown("FileCryptoMetaData", h.id)),
+        }
+    }
+    let encryption_algorithm =
+        Some(encryption_algorithm.ok_or_else(|| missing("FileCryptoMetaData", 1))?);
+    Ok(FileCryptoMetaData {
+        encryption_algorithm,
+        key_metadata,
+    })
 }

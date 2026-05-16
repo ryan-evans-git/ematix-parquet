@@ -724,6 +724,8 @@ off there.
 
 ## Π.13 — Parquet Modular Encryption (planned)
 
+See `PI-13-encryption-design.md` for sub-phase breakdown.
+
 **Goal.** Read and write files using Parquet Modular Encryption (PME)
 — the spec-defined per-column-chunk AES-GCM encryption used in
 regulated industries (finance, healthcare, government). Without

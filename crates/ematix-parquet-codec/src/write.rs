@@ -378,6 +378,8 @@ fn write_table_inner<W: Write>(
                 offset_index_length: None,
                 column_index_offset: None,
                 column_index_length: None,
+                crypto_metadata: None,
+                encrypted_column_metadata: None,
             });
             total_byte_size += prep.total_uncompressed_size;
         }
@@ -400,6 +402,8 @@ fn write_table_inner<W: Write>(
         key_value_metadata: None,
         created_by: Some(b"ematix-parquet 0.0.1"),
         column_orders: None,
+        encryption_algorithm: None,
+        footer_signing_key_metadata: None,
     };
     let footer = write_file_metadata(&md);
     let footer_len = footer.len() as u32;
@@ -731,6 +735,8 @@ fn write_single_column<W: Write>(
         offset_index_length: None,
         column_index_offset: None,
         column_index_length: None,
+        crypto_metadata: None,
+        encrypted_column_metadata: None,
     };
     let rg = RowGroup {
         columns: vec![cc],
@@ -749,6 +755,8 @@ fn write_single_column<W: Write>(
         key_value_metadata: None,
         created_by: Some(b"ematix-parquet 0.0.1"),
         column_orders: None,
+        encryption_algorithm: None,
+        footer_signing_key_metadata: None,
     };
     let footer = write_file_metadata(&md);
     let footer_len = footer.len() as u32;
@@ -1205,6 +1213,8 @@ fn write_single_column_dict<W: Write>(
         offset_index_length: None,
         column_index_offset: None,
         column_index_length: None,
+        crypto_metadata: None,
+        encrypted_column_metadata: None,
     };
     let rg = RowGroup {
         columns: vec![cc],
@@ -1223,6 +1233,8 @@ fn write_single_column_dict<W: Write>(
         key_value_metadata: None,
         created_by: Some(b"ematix-parquet 0.0.1"),
         column_orders: None,
+        encryption_algorithm: None,
+        footer_signing_key_metadata: None,
     };
     let footer = write_file_metadata(&md);
     let footer_len = footer.len() as u32;

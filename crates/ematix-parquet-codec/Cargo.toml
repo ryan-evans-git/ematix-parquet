@@ -23,16 +23,16 @@ no-neon = []
 encryption = ["dep:ematix-parquet-crypto"]
 
 [dependencies]
-ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.5" }
+ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.6" }
 # io provides ParquetFile + PageWalker, used by the high-level `read`
 # facade. Lower-level byte-slice decoders (plain/dict/delta/...) do
 # not require io — consumers that want pure byte-slice access can
 # bypass the facade.
-ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.5" }
+ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.6" }
 # AES-GCM + AAD construction for PME. Optional — only present when
 # `--features encryption` is set. The crypto crate itself stays
 # unconditionally compiled (it's small) but its surface is gated.
-ematix-parquet-crypto = { path = "../ematix-parquet-crypto", version = "0.5", optional = true }
+ematix-parquet-crypto = { path = "../ematix-parquet-crypto", version = "0.6", optional = true }
 # Snappy is the default codec for almost every parquet writer in the
 # wild (and the one TPC-H data uses). Pinning to a known-stable cut
 # of `snap` until benchmarks tell us we want a hand-rolled one.

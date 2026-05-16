@@ -16,7 +16,7 @@ Tracks the work between v0.1.1 and v2.0. Phases use the existing `Π.N` conventi
 | Π.10  | Late-materialization read façade (`read_column_*_masked_into`)       | ✓ Done (codec; engine in ematix-flow)  |
 | Π.11  | Async / object-store integration (S3 / GCS / Azure)                  | ✓ Done (a–d, f; e deferred to v0.4.1) |
 | Π.12  | x86 SIMD parity (AVX2 / AVX-512 kernels mirroring NEON)              | ✓ Done   |
-| Π.13  | Parquet Modular Encryption (read + write)                            | Planned  |
+| Π.13  | Parquet Modular Encryption (read + write)                            | ✓ Done   |
 | Π.14  | Adaptive runtime dispatch on observed selectivity                    | Planned  |
 | Π.15  | NUMA awareness and work-stealing for multi-RG parallel decode        | Planned  |
 | Π.16  | Custom LLVM codegen for hot decode paths (Photon-style)              | Speculative |
@@ -722,49 +722,64 @@ off there.
 
 ---
 
-## Π.13 — Parquet Modular Encryption (planned)
+## Π.13 — Parquet Modular Encryption ✓ DONE
 
-See `PI-13-encryption-design.md` for sub-phase breakdown.
+See `PI-13-encryption-design.md` for the design and full sub-phase
+breakdown. Shipped as v0.6.0.
 
 **Goal.** Read and write files using Parquet Modular Encryption (PME)
 — the spec-defined per-column-chunk AES-GCM encryption used in
-regulated industries (finance, healthcare, government). Without
-this, ematix-parquet can't be used in any environment that requires
-encrypted-at-rest columnar data.
+regulated industries (finance, healthcare, government).
 
-**Touches.**
-- New crate `ematix-parquet-crypto` for the AES-GCM primitives
-  (depends on `ring` or `aes-gcm`), kept separate so the rest of
-  the workspace stays crypto-free.
-- Footer-encryption mode (encrypted footer + encrypted columns)
-  and plaintext-footer mode (the two modes the spec defines).
-- Key-management abstraction: `trait DecryptionKeyRetriever` (KMS
-  integration is the caller's problem; we just receive bytes).
-- Column-chunk-level encrypted page reading + writing.
-- Crypto-config Thrift extensions in `ematix-parquet-format`.
+**Shipped.**
+- **Π.13a** — encryption metadata Thrift extensions (read + write)
+  in `ematix-parquet-format`: `EncryptionAlgorithm`,
+  `AesGcmV1` / `AesGcmCtrV1`, `ColumnCryptoMetaData`,
+  `FileCryptoMetaData`.
+- **Π.13b** — new `ematix-parquet-crypto` crate: AES-GCM primitives
+  (`seal` / `open` via `aes-gcm`), AAD construction
+  (`build_module_aad`), `Key`, `NonceSource` trait + `OsRng`-backed
+  default, `KeyRetriever` trait. Validated against NIST AES-GCM
+  test vectors.
+- **Π.13c** — per-page decrypt primitive (`decrypt_module`) and
+  `ColumnDecryptContext`. Wired through the read façade behind
+  `--features encryption`.
+- **Π.13d** — encrypted-footer (PARE magic) read path: trailer
+  parsing, `decrypt_footer`, end-to-end read of files produced by
+  the upstream Rust Parquet writer.
+- **Π.13e** — plaintext-footer (PAR1) write path: per-page seal,
+  28-byte trailing footer signature, façade entry point
+  `write_i32_column_to_path_encrypted`. Round-trips through the
+  upstream Rust Parquet reader.
+- **Π.13f** — encrypted-footer (PARE magic) write path: emits the
+  `FileCryptoMetaData` trailer + encrypted-FileMetaData wire frame.
+  `examples/key_rotation.rs` demos end-to-end key rotation
+  (write under OLD_KEY → decrypt + decode → re-write under NEW_KEY
+  → confirm OLD_KEY no longer decrypts).
+- **Π.13g** — release wiring: 5-crate publish order in
+  `release.yml` (`format → io → crypto → codec → async`), CI
+  matrix exercises `--features encryption` on every PR, version
+  bump 0.5.0 → 0.6.0.
 
-**Acceptance.**
-1. Round-trip oracle: parquet-rs writes a PME-encrypted file with
-   per-column keys; we read it back with the same keys and recover
-   every value.
-2. Inverse: we write a PME-encrypted file; parquet-rs reads it
-   back identically.
-3. Both encryption modes (encrypted footer, plaintext footer)
-   covered by oracle tests.
-4. Key-rotation flow documented (rewrite a file under new keys).
-5. Crypto code path is `#[cfg(feature = "encryption")]`-gated on
-   `ematix-parquet-codec` so the default build has zero crypto
-   deps.
+**Acceptance — all met.**
+1. ✓ Round-trip oracle: the upstream Rust Parquet writer emits a
+   PME-encrypted file; we read it back and recover every value.
+2. ✓ Inverse: we write PME-encrypted files; the upstream Rust
+   Parquet reader reads them back identically.
+3. ✓ Both encryption modes (encrypted footer, plaintext footer)
+   covered by oracle tests on read + write.
+4. ✓ Key-rotation flow demonstrated by
+   `examples/key_rotation.rs` (runnable from the workspace).
+5. ✓ Crypto code path is `#[cfg(feature = "encryption")]`-gated on
+   `ematix-parquet-codec`; default build pulls no crypto deps
+   (verified by `cargo tree`).
 
-**Estimate.** 4-6 weeks. PME is a substantial spec extension and
-requires careful AES-GCM key management; round-trip parity with
-parquet-rs is non-trivial because the key-derivation rules are
-intricate.
+**Out of scope (followups).** `AES_GCM_CTR_V1` algorithm,
+encrypted page-index / encrypted bloom filter, encrypted async
+reads exercised end-to-end, KMS integrations, footer-only mode
+where data pages stay plaintext.
 
-**Why third.** Required for enterprise / compliance customers, but
-not on the critical path for analytical-workload performance. Lands
-after async (broader reach) and x86 (broader hardware) so the
-encryption work benefits the maximum number of deployments.
+**Released as v0.6.0.**
 
 ---
 

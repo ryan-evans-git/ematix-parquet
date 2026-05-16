@@ -14,6 +14,13 @@ name = "ematix_parquet_async"
 
 [dependencies]
 ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.3" }
+# Sync io provides PageWalker (in-memory page iteration after the
+# chunk bytes have been fetched). Page walk is pure CPU work over
+# a byte slice; we don't re-implement it.
+ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.3" }
+# Codec provides every byte-slice decoder (plain, dict, compression,
+# data_page_view) the async façade composes on top of read_range.
+ematix-parquet-codec = { path = "../ematix-parquet-codec", version = "0.3" }
 # Wraps every async byte-range source (S3, GCS, Azure, HTTP, local
 # FS, in-memory) behind a single trait. Pinned tight per Π.11 plan;
 # bump every 6-12 months as object_store releases.
@@ -28,11 +35,5 @@ bytes = "1"
 [dev-dependencies]
 # Async test runtime macros + an in-memory ObjectStore for fixtures.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util"] }
-# Used to write fixture parquet files for round-trip tests. Dev-only
-# so the production async crate stays codec-free.
-ematix-parquet-codec = { path = "../ematix-parquet-codec", version = "0.3" }
-# Used to cross-check async open/read_range vs the sync ParquetFile
-# implementation. Dev-only.
-ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.3" }
 # Local files for fixtures.
 tempfile = "3"

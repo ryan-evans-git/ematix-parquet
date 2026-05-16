@@ -1,0 +1,29 @@
+[package]
+name = "ematix-parquet-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AES-GCM primitives, AAD construction, and key-retrieval trait for Parquet Modular Encryption support in ematix-parquet."
+readme = "../../README.md"
+
+[lib]
+name = "ematix_parquet_crypto"
+
+[dependencies]
+# RustCrypto AES-GCM. Pure Rust, no FFI build-script needed.
+# Runtime AES-NI / ARMv8 Crypto Extensions detection in `aes` flows
+# through transparently. Matches the no-FFI preference visible in
+# codec's compression deps (snap / lz4_flex / brotli all pure-Rust).
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# `aes-gcm` re-exports `Aes128Gcm` / `Aes256Gcm` from this crate. Pinned
+# so a `Cargo.lock`-less consumer pulls a known-good AES kernel.
+aes = { version = "0.8", default-features = false }
+# `getrandom` for production nonce generation. Test code uses a
+# fixed-nonce source instead so vectors are reproducible.
+getrandom = { version = "0.2", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

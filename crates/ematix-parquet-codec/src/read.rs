@@ -33,6 +33,7 @@ use crate::page_index::{select_pages_overlapping_i32, select_pages_overlapping_i
 use crate::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_fixed_len_byte_array,
     decode_plain_i32, decode_plain_i64, decode_plain_int96,
+    plain_sparse_decode_byte_array_into, plain_sparse_decode_byte_array_offsets_into,
     plain_sparse_decode_f64_into, plain_sparse_decode_i32_into,
     plain_sparse_decode_i64_into, Int96,
 };
@@ -170,6 +171,201 @@ pub fn read_column_f64_masked_into(
         |bytes| decode_plain_f64(bytes),
         plain_sparse_decode_f64_into,
     )
+}
+
+/// Decode BYTE_ARRAY only at rows where `mask` is set, returning
+/// owned `Vec<u8>` per matched value. Appends to `out`.
+///
+/// For an allocation-light path use the offsets variant.
+pub fn read_column_byte_array_masked_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    mask: &[u8],
+    out: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+
+    let required_mask_bytes = total_values.div_ceil(8);
+    if mask.len() < required_mask_bytes {
+        return Err(CodecError::InvalidInput(format!(
+            "mask too small: {} bytes for {} rows (need ≥ {})",
+            mask.len(),
+            total_values,
+            required_mask_bytes,
+        )));
+    }
+
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+    let mut dict: Vec<Vec<u8>> = Vec::new();
+    let mut row_cursor: usize = 0;
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
+                let slices = decode_plain_byte_array(&decomp)?;
+                dict = slices.into_iter().map(|s| s.to_vec()).collect();
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let page_n = info.num_values;
+                let matched_in_page = popcount_mask_range(mask, row_cursor, row_cursor + page_n);
+                if matched_in_page == 0 {
+                    row_cursor += page_n;
+                    if row_cursor >= total_values {
+                        break;
+                    }
+                    continue;
+                }
+                match info.encoding {
+                    Encoding::Plain => {
+                        plain_sparse_decode_byte_array_into(
+                            info.values, page_n, mask, row_cursor, out,
+                        )?;
+                    }
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        if dict.is_empty() {
+                            return Err(CodecError::InvalidInput(
+                                "dict-encoded data page before dictionary".into(),
+                            ));
+                        }
+                        // gather_dict_at_bitmap_into is now T: Clone
+                        // (was T: Copy in Π.9) — accepts Vec<u8>.
+                        crate::dict::gather_dict_at_bitmap_into(
+                            info.values, page_n, mask, row_cursor, &dict, out,
+                        )?;
+                    }
+                    other => {
+                        return Err(CodecError::Unsupported(format!(
+                            "encoding not yet dispatched by façade: {other:?}"
+                        )));
+                    }
+                }
+                row_cursor += page_n;
+                if row_cursor >= total_values {
+                    break;
+                }
+            }
+            PageType::IndexPage => {}
+        }
+    }
+    Ok(())
+}
+
+/// Arrow-style BYTE_ARRAY masked-decode: appends matched values'
+/// bytes to `out_bytes` and pushes one offset per matched value to
+/// `out_offsets`. If `out_offsets` is empty on entry, the initial
+/// `0` offset is pushed automatically; otherwise this continues
+/// from the existing trailing offset (multi-chunk concatenation
+/// works naturally — call this per row-group with the same
+/// `(out_bytes, out_offsets)` pair).
+pub fn read_column_byte_array_offsets_masked_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    mask: &[u8],
+    out_bytes: &mut Vec<u8>,
+    out_offsets: &mut Vec<u32>,
+) -> Result<()> {
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+
+    let required_mask_bytes = total_values.div_ceil(8);
+    if mask.len() < required_mask_bytes {
+        return Err(CodecError::InvalidInput(format!(
+            "mask too small: {} bytes for {} rows (need ≥ {})",
+            mask.len(),
+            total_values,
+            required_mask_bytes,
+        )));
+    }
+
+    if out_offsets.is_empty() {
+        out_offsets.push(0);
+    }
+
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+    // Dict stored as owned Vec<u8> to outlive the page-buffer scope.
+    let mut dict: Vec<Vec<u8>> = Vec::new();
+    let mut row_cursor: usize = 0;
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
+                let slices = decode_plain_byte_array(&decomp)?;
+                dict = slices.into_iter().map(|s| s.to_vec()).collect();
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let page_n = info.num_values;
+                let matched_in_page = popcount_mask_range(mask, row_cursor, row_cursor + page_n);
+                if matched_in_page == 0 {
+                    row_cursor += page_n;
+                    if row_cursor >= total_values {
+                        break;
+                    }
+                    continue;
+                }
+                match info.encoding {
+                    Encoding::Plain => {
+                        plain_sparse_decode_byte_array_offsets_into(
+                            info.values, page_n, mask, row_cursor,
+                            out_bytes, out_offsets,
+                        )?;
+                    }
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        if dict.is_empty() {
+                            return Err(CodecError::InvalidInput(
+                                "dict-encoded data page before dictionary".into(),
+                            ));
+                        }
+                        // Walk dict indices via the existing index
+                        // decoder, gather sparsely into the offsets
+                        // shape. The Copy-based fused gather doesn't
+                        // produce offsets directly, so we expand here.
+                        let indices = crate::dict::decode_rle_dictionary_indices(
+                            info.values, page_n,
+                        )?;
+                        let mut running = *out_offsets.last().unwrap();
+                        for (row, idx) in indices.iter().enumerate() {
+                            let bit_pos = row_cursor + row;
+                            let bit = (mask[bit_pos / 8] >> (bit_pos % 8)) & 1;
+                            if bit == 1 {
+                                let i = *idx as usize;
+                                let v = dict.get(i).ok_or_else(|| {
+                                    CodecError::DictIndexOutOfRange {
+                                        index: *idx,
+                                        dict_size: dict.len(),
+                                    }
+                                })?;
+                                out_bytes.extend_from_slice(v);
+                                running = running
+                                    .checked_add(v.len() as u32)
+                                    .ok_or_else(|| CodecError::InvalidInput(
+                                        "byte_array masked-decode: offset overflow > u32::MAX".into(),
+                                    ))?;
+                                out_offsets.push(running);
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(CodecError::Unsupported(format!(
+                            "encoding not yet dispatched by façade: {other:?}"
+                        )));
+                    }
+                }
+                row_cursor += page_n;
+                if row_cursor >= total_values {
+                    break;
+                }
+            }
+            PageType::IndexPage => {}
+        }
+    }
+    Ok(())
 }
 
 /// Build a packed bitmap of length `ceil(num_rows / 8)` bytes where

@@ -444,7 +444,7 @@ fn fused_bitmap_chunk(
 ///
 /// `bitmap_offset` is the global row index of `num_values=0`. Used
 /// when the same bitmap covers multiple pages of a row group.
-pub fn gather_dict_at_bitmap_into<T: Copy>(
+pub fn gather_dict_at_bitmap_into<T: Clone>(
     body: &[u8],
     num_values: usize,
     bitmap: &[u8],
@@ -471,12 +471,12 @@ pub fn gather_dict_at_bitmap_into<T: Copy>(
                 dict_size: 0,
             });
         }
-        let v = dict[0];
+        let v = &dict[0];
         for row in 0..num_values {
             let bit_pos = bitmap_offset + row;
             let bit = (bitmap[bit_pos / 8] >> (bit_pos % 8)) & 1;
             if bit == 1 {
-                out.push(v);
+                out.push(v.clone());
             }
         }
         return Ok(());
@@ -525,7 +525,7 @@ pub fn gather_dict_at_bitmap_into<T: Copy>(
                                     dict_size,
                                 });
                             }
-                            out.push(dict[idx_u]);
+                            out.push(dict[idx_u].clone());
                         }
                     }
                 }
@@ -554,7 +554,7 @@ pub fn gather_dict_at_bitmap_into<T: Copy>(
                                 dict_size,
                             });
                         }
-                        out.push(dict[idx_u]);
+                        out.push(dict[idx_u].clone());
                     }
                 }
             }
@@ -574,14 +574,14 @@ pub fn gather_dict_at_bitmap_into<T: Copy>(
                     dict_size,
                 });
             }
-            let v = dict[idx_u];
+            let v = &dict[idx_u];
             let to_consume = (num_values - row).min(count);
             // Count set bits in `bitmap[bitmap_offset + row .. + to_consume]`
             // and push `v` that many times. Faster than per-row test
             // for long RLE runs since `v` is constant.
             let matched = popcount_range(bitmap, bitmap_offset + row, bitmap_offset + row + to_consume);
             for _ in 0..matched {
-                out.push(v);
+                out.push(v.clone());
             }
             row += to_consume;
         }

@@ -1,0 +1,38 @@
+[package]
+name = "ematix-parquet-async"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Async / object-store integration for ematix-parquet. Provides AsyncParquetFile on top of object_store::ObjectStore, plus async read façade entry points mirroring the sync crate's surface."
+readme = "../../README.md"
+
+[lib]
+name = "ematix_parquet_async"
+
+[dependencies]
+ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.3" }
+# Wraps every async byte-range source (S3, GCS, Azure, HTTP, local
+# FS, in-memory) behind a single trait. Pinned tight per Π.11 plan;
+# bump every 6-12 months as object_store releases.
+object_store = "0.11"
+# Required runtime for object_store. Pin to the major; minor bumps
+# are routine.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+# bytes::Bytes is the payload type object_store returns; re-using
+# it everywhere avoids needless Vec<u8> conversions.
+bytes = "1"
+
+[dev-dependencies]
+# Async test runtime macros + an in-memory ObjectStore for fixtures.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util"] }
+# Used to write fixture parquet files for round-trip tests. Dev-only
+# so the production async crate stays codec-free.
+ematix-parquet-codec = { path = "../ematix-parquet-codec", version = "0.3" }
+# Used to cross-check async open/read_range vs the sync ParquetFile
+# implementation. Dev-only.
+ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.3" }
+# Local files for fixtures.
+tempfile = "3"

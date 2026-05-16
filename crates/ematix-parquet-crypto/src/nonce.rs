@@ -17,6 +17,16 @@ pub trait NonceSource {
     fn next(&mut self) -> Result<[u8; NONCE_LEN]>;
 }
 
+/// Generate `N` random bytes via the OS CSPRNG. Used by the codec
+/// write path for `aad_file_unique` (16 bytes per spec
+/// recommendation) and anywhere else a one-shot random buffer is
+/// needed. Caller doesn't need to depend on `getrandom` directly.
+pub fn random_bytes<const N: usize>() -> Result<[u8; N]> {
+    let mut buf = [0u8; N];
+    getrandom::getrandom(&mut buf).map_err(|_| CryptoError::MalformedNonce { got: 0 })?;
+    Ok(buf)
+}
+
 /// CSPRNG-backed nonce source. Default production choice.
 #[derive(Debug, Default)]
 pub struct RandomNonceSource;

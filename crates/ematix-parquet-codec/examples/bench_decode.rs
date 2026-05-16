@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use ematix_parquet_codec::compression::decompress_snappy_into;
 use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_into};
+use ematix_parquet_codec::read::read_column_byte_array_offsets;
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_byte_array_n, decode_plain_f64, decode_plain_i32,
     decode_plain_i64,
@@ -171,6 +172,11 @@ fn ours_decode_f64(path: &Path, col_idx: usize) -> Vec<f64> {
         }
     }
     out
+}
+
+fn ours_decode_byte_array_offsets(path: &Path, col_idx: usize) -> (Vec<u8>, Vec<u32>) {
+    let file = ParquetFile::open(path).unwrap();
+    read_column_byte_array_offsets(&file, 0, col_idx).unwrap()
 }
 
 fn ours_decode_byte_array(path: &Path, col_idx: usize) -> Vec<Vec<u8>> {
@@ -383,8 +389,11 @@ fn main() {
 
     println!("l_returnflag  BYTE_ARRAY  (3 distinct, all dict, 1,048,576 values)");
     let (o_med, _, _) = bench("ours", || ours_decode_byte_array(&path, 8));
+    let (off_med, _, _) = bench("ours (offsets API)", || ours_decode_byte_array_offsets(&path, 8));
     let (pr_med, _, _) = bench("parquet-rs", || pr_decode_byte_array(&path, 8));
     let (po_med, _, _) = bench("polars (eager)", || polars_decode_byte_array(&path, "l_returnflag"));
-    compare("ours vs parquet-rs", o_med, pr_med);
-    compare("ours vs polars    ", o_med, po_med);
+    compare("ours        vs parquet-rs", o_med, pr_med);
+    compare("ours offsets vs parquet-rs", off_med, pr_med);
+    compare("ours offsets vs ours       ", off_med, o_med);
+    compare("ours offsets vs polars     ", off_med, po_med);
 }

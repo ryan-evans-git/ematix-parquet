@@ -138,6 +138,166 @@ pub fn read_column_byte_array(
     Ok(out)
 }
 
+/// Read a BYTE_ARRAY column into Arrow-style flat bytes + offsets.
+///
+/// Returns `(values, offsets)` where row `i` is the byte slice
+/// `values[offsets[i] as usize .. offsets[i + 1] as usize]`. Offsets
+/// has length `num_rows + 1` (the trailing offset is the total
+/// values length, matching Arrow's BinaryArray convention).
+///
+/// This is the zero-allocation-per-row alternative to
+/// `read_column_byte_array`. For low-cardinality dict-encoded columns
+/// (e.g. l_returnflag with 3 distinct one-byte values × 1M rows),
+/// the per-row allocation in `Vec<Vec<u8>>.push(dict[i].clone())` is
+/// the dominant cost; this entry point amortises into a single
+/// growing `Vec<u8>`.
+///
+/// `u32` offsets cap a single chunk at 4 GiB of decoded byte_array
+/// content — adequate for any reasonable parquet column. Use
+/// `read_column_byte_array` if you need owned per-row Vecs.
+pub fn read_column_byte_array_offsets(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<(Vec<u8>, Vec<u32>)> {
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+
+    // Dictionary as flat bytes + per-entry offsets. dict_offsets has
+    // length dict_len + 1; entry i is dict_bytes[dict_offsets[i] .. dict_offsets[i+1]].
+    let mut dict_bytes: Vec<u8> = Vec::new();
+    let mut dict_offsets: Vec<u32> = vec![0];
+
+    let mut out_bytes: Vec<u8> = Vec::new();
+    let mut out_offsets: Vec<u32> = Vec::with_capacity(total_values + 1);
+    out_offsets.push(0);
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
+                // Flatten the dict slices into our own bytes+offsets.
+                let slices = decode_plain_byte_array(&decomp)?;
+                let total_dict_bytes: usize = slices.iter().map(|s| s.len()).sum();
+                dict_bytes.clear();
+                dict_bytes.reserve(total_dict_bytes);
+                dict_offsets.clear();
+                dict_offsets.reserve(slices.len() + 1);
+                dict_offsets.push(0);
+                let mut acc: u32 = 0;
+                for s in &slices {
+                    dict_bytes.extend_from_slice(s);
+                    acc += s.len() as u32;
+                    dict_offsets.push(acc);
+                }
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                match info.encoding {
+                    Encoding::Plain => {
+                        // PLAIN body: u32_le length + bytes, repeated.
+                        // Walk it inline rather than going through
+                        // decode_plain_byte_array (which allocates a
+                        // Vec<&[u8]>).
+                        let body = info.values;
+                        let mut i = 0usize;
+                        let mut emitted = 0usize;
+                        let cap_target = info.num_values;
+                        out_bytes.reserve(body.len()); // upper bound
+                        out_offsets.reserve(cap_target);
+                        let mut acc: u32 = *out_offsets.last().unwrap();
+                        while i < body.len() && emitted < cap_target {
+                            if i + 4 > body.len() {
+                                return Err(CodecError::InvalidInput(
+                                    "PLAIN byte_array: truncated length prefix".into(),
+                                ));
+                            }
+                            let len = u32::from_le_bytes(
+                                body[i..i + 4].try_into().unwrap(),
+                            ) as usize;
+                            i += 4;
+                            if i + len > body.len() {
+                                return Err(CodecError::InvalidInput(
+                                    "PLAIN byte_array: value runs past page end".into(),
+                                ));
+                            }
+                            out_bytes.extend_from_slice(&body[i..i + len]);
+                            i += len;
+                            acc += len as u32;
+                            out_offsets.push(acc);
+                            emitted += 1;
+                        }
+                    }
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        if dict_offsets.len() < 2 {
+                            return Err(CodecError::InvalidInput(
+                                "dict-encoded data page before dictionary".into(),
+                            ));
+                        }
+                        let indices = crate::dict::decode_rle_dictionary_indices(
+                            info.values,
+                            info.num_values,
+                        )?;
+                        // Pre-compute total bytes needed to do a
+                        // single allocation grow.
+                        let dict_len = dict_offsets.len() - 1;
+                        let mut total_bytes_needed: usize = 0;
+                        for &idx in &indices {
+                            let i = idx as usize;
+                            if i >= dict_len {
+                                return Err(CodecError::InvalidInput(
+                                    "dictionary index out of range".into(),
+                                ));
+                            }
+                            let start = dict_offsets[i] as usize;
+                            let end = dict_offsets[i + 1] as usize;
+                            total_bytes_needed += end - start;
+                        }
+                        out_bytes.reserve(total_bytes_needed);
+                        out_offsets.reserve(indices.len());
+
+                        // Hot loop: bounds were validated in the
+                        // pre-pass above, so we can use unchecked
+                        // accesses here. SAFETY: every idx < dict_len
+                        // by the loop above.
+                        let mut acc: u32 = *out_offsets.last().unwrap();
+                        let dict_offsets_ptr = dict_offsets.as_ptr();
+                        let dict_bytes_ptr = dict_bytes.as_ptr();
+                        unsafe {
+                            for &idx in &indices {
+                                let i = idx as usize;
+                                let start = *dict_offsets_ptr.add(i) as usize;
+                                let end = *dict_offsets_ptr.add(i + 1) as usize;
+                                let len = end - start;
+                                let src = dict_bytes_ptr.add(start);
+                                let dst = out_bytes
+                                    .as_mut_ptr()
+                                    .add(out_bytes.len());
+                                std::ptr::copy_nonoverlapping(src, dst, len);
+                                out_bytes.set_len(out_bytes.len() + len);
+                                acc += len as u32;
+                                out_offsets.push(acc);
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(CodecError::Unsupported(format!(
+                            "encoding not yet dispatched by façade: {other:?}"
+                        )));
+                    }
+                }
+            }
+            PageType::IndexPage => {}
+        }
+        if out_offsets.len() - 1 >= total_values {
+            break;
+        }
+    }
+
+    Ok((out_bytes, out_offsets))
+}
+
 /// Read the entire column chunk at (`row_group`, `column`) into a
 /// `Vec<Int96>`. Requires the column's physical type to be INT96.
 ///

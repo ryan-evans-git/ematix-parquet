@@ -14,6 +14,7 @@
 //!      DELTA_BYTE_ARRAY. (Not yet.)
 //!   5. `byte_stream_split` — Parquet v2 numeric encoding. (Not yet.)
 
+pub mod adaptive;
 pub mod bitpack;
 #[cfg(target_arch = "x86_64")]
 pub mod bitpack_avx2;

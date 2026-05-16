@@ -31,9 +31,16 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 # bytes::Bytes is the payload type object_store returns; re-using
 # it everywhere avoids needless Vec<u8> conversions.
 bytes = "1"
+# Stream trait for the *_async_stream entries. Lightweight; just the
+# core trait, no executor.
+futures-core = "0.3"
+# Macro for writing async Streams as if they were async fns with yield.
+async-stream = "0.3"
 
 [dev-dependencies]
 # Async test runtime macros + an in-memory ObjectStore for fixtures.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util"] }
 # Local files for fixtures.
 tempfile = "3"
+# StreamExt for .next().await in tests.
+futures-util = "0.3"

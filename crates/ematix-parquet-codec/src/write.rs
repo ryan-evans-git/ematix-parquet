@@ -37,7 +37,7 @@ use ematix_parquet_format::types::{
     CompressionCodec, Encoding, FieldRepetitionType, PageType, ParquetType,
 };
 
-use crate::rle::{encode_rle_bit_packed_single_run, min_bit_width_for_dict};
+use crate::rle::{encode_rle_bit_packed, min_bit_width_for_dict};
 
 use crate::compression::{
     compress_brotli, compress_gzip, compress_lz4_raw, compress_snappy, compress_zstd,
@@ -1125,7 +1125,7 @@ fn write_single_column_dict<W: Write>(
     let bit_width = min_bit_width_for_dict(dict_len);
     let mut data_body = Vec::with_capacity(1 + indices.len());
     data_body.push(bit_width);
-    data_body.extend_from_slice(&encode_rle_bit_packed_single_run(indices, bit_width));
+    data_body.extend_from_slice(&encode_rle_bit_packed(indices, bit_width));
 
     let data_uncomp_size = data_body.len();
     let data_compressed = compress_body(&data_body, codec)?;

@@ -53,7 +53,9 @@ pub fn unpack_indices_into_avx2_bw16(
     // instruction _mm256_cvtepu16_epi32 reads a 128-bit register
     // (8 u16) and produces a 256-bit register (8 u32). No overrun
     // risk: total input is exactly `num_values * 2` bytes.
-    unsafe { unpack_avx2_bw16_unchecked(packed, full_blocks, out); }
+    unsafe {
+        unpack_avx2_bw16_unchecked(packed, full_blocks, out);
+    }
 
     let processed = full_blocks * 8;
     let remaining = num_values - processed;
@@ -259,7 +261,9 @@ pub fn unpack_indices_into_avx2_bw14(
         full_blocks - 1
     };
 
-    unsafe { unpack_avx2_bw14_unchecked(packed, safe_full_blocks, out); }
+    unsafe {
+        unpack_avx2_bw14_unchecked(packed, safe_full_blocks, out);
+    }
 
     let processed = safe_full_blocks * 8;
     let remaining = num_values - processed;
@@ -276,13 +280,10 @@ unsafe fn unpack_avx2_bw14_unchecked(packed: &[u8], full_blocks: usize, out: &mu
 
     // Byte-level shuffle indices — identical to NEON bw=14.
     // Lanes 0-3: u32 windows starting at bytes 0 / 1 / 3 / 5.
-    let shuffle_lo: __m128i = _mm_setr_epi8(
-        0, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8,
-    );
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8);
     // Lanes 4-7: u32 windows starting at bytes 7 / 8 / 10 / 12.
-    let shuffle_hi: __m128i = _mm_setr_epi8(
-        7, 8, 9, 10, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15,
-    );
+    let shuffle_hi: __m128i =
+        _mm_setr_epi8(7, 8, 9, 10, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15);
     // Per-lane right shift counts, applied via _mm_srlv_epi32.
     // Magnitudes match NEON's [0, 6, 4, 2] (NEON uses negative
     // shifts on vshlq_s32 to mean right-shift; AVX2 takes
@@ -428,12 +429,9 @@ where
     F: FnMut(&[u32; 8]) -> Result<()>,
 {
     use std::arch::x86_64::*;
-    let shuffle_lo: __m128i = _mm_setr_epi8(
-        0, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8,
-    );
-    let shuffle_hi: __m128i = _mm_setr_epi8(
-        7, 8, 9, 10, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15,
-    );
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8);
+    let shuffle_hi: __m128i =
+        _mm_setr_epi8(7, 8, 9, 10, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15);
     let shifts: __m128i = _mm_setr_epi32(0, 6, 4, 2);
     let mask: __m128i = _mm_set1_epi32(0x3FFF);
 

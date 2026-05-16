@@ -12,8 +12,8 @@
 #![cfg(target_arch = "x86_64")]
 
 use ematix_parquet_codec::bitpack_avx2::{
-    unpack_indices_into_avx2_bw14, unpack_indices_into_avx2_bw16,
-    unpack_lookup_into_avx2_bw14, unpack_lookup_into_avx2_bw16,
+    unpack_indices_into_avx2_bw14, unpack_indices_into_avx2_bw16, unpack_lookup_into_avx2_bw14,
+    unpack_lookup_into_avx2_bw16,
 };
 
 /// Pack `n` u16 values into LE bytes — the on-wire bw=16 form.
@@ -158,7 +158,9 @@ fn matches_scalar_dispatcher() {
     }
     use ematix_parquet_codec::bitpack::unpack_indices_into;
 
-    let values: Vec<u32> = (0..2_048u32).map(|i| i.wrapping_mul(31337) & 0xFFFF).collect();
+    let values: Vec<u32> = (0..2_048u32)
+        .map(|i| i.wrapping_mul(31337) & 0xFFFF)
+        .collect();
     let packed = pack_bw16(&values);
 
     // unpack_indices_into routes through the AVX2 kernel on x86_64
@@ -169,7 +171,10 @@ fn matches_scalar_dispatcher() {
     let mut via_direct: Vec<u32> = Vec::new();
     unpack_indices_into_avx2_bw16(&packed, values.len(), &mut via_direct).unwrap();
 
-    assert_eq!(via_dispatcher, via_direct, "dispatcher and direct AVX2 disagree");
+    assert_eq!(
+        via_dispatcher, via_direct,
+        "dispatcher and direct AVX2 disagree"
+    );
     assert_eq!(via_dispatcher, values, "round trip mismatch");
 }
 
@@ -183,7 +188,11 @@ fn pack_bwn(values: &[u32], bw: u8) -> Vec<u8> {
     let total_bits = values.len() * bw as usize;
     let total_bytes = total_bits.div_ceil(8);
     let mut out = vec![0u8; total_bytes];
-    let mask: u64 = if bw == 32 { u32::MAX as u64 } else { (1u64 << bw) - 1 };
+    let mask: u64 = if bw == 32 {
+        u32::MAX as u64
+    } else {
+        (1u64 << bw) - 1
+    };
     for (i, &v) in values.iter().enumerate() {
         let v = (v as u64) & mask;
         let start_bit = i * bw as usize;
@@ -224,9 +233,7 @@ fn bw14_indices_round_trip_with_tail() {
         return;
     }
     for n in [1usize, 7, 13, 17, 35, 100, 1003] {
-        let values: Vec<u32> = (0..n as u32)
-            .map(|i| i.wrapping_mul(13) & 0x3FFF)
-            .collect();
+        let values: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(13) & 0x3FFF).collect();
         let packed = pack_bwn(&values, 14);
 
         let mut out: Vec<u32> = Vec::new();
@@ -273,7 +280,9 @@ fn bw14_matches_scalar_dispatcher() {
     }
     use ematix_parquet_codec::bitpack::unpack_indices_into;
 
-    let values: Vec<u32> = (0..2_048u32).map(|i| i.wrapping_mul(31337) & 0x3FFF).collect();
+    let values: Vec<u32> = (0..2_048u32)
+        .map(|i| i.wrapping_mul(31337) & 0x3FFF)
+        .collect();
     let packed = pack_bwn(&values, 14);
 
     let mut via_dispatcher: Vec<u32> = Vec::new();
@@ -282,6 +291,9 @@ fn bw14_matches_scalar_dispatcher() {
     let mut via_direct: Vec<u32> = Vec::new();
     unpack_indices_into_avx2_bw14(&packed, values.len(), &mut via_direct).unwrap();
 
-    assert_eq!(via_dispatcher, via_direct, "bw14 dispatcher and direct AVX2 disagree");
+    assert_eq!(
+        via_dispatcher, via_direct,
+        "bw14 dispatcher and direct AVX2 disagree"
+    );
     assert_eq!(via_dispatcher, values, "bw14 round trip mismatch");
 }

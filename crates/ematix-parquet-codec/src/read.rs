@@ -487,6 +487,146 @@ pub fn read_column_byte_array_into(
     Ok(())
 }
 
+/// Dict-preserving decode of a BYTE_ARRAY column chunk.
+///
+/// Returns the parquet dictionary (as flat bytes + offsets) plus the
+/// raw `Vec<u32>` of per-row indices — no per-row materialisation.
+/// Lets Arrow consumers build a `DictionaryArray<UInt32, Utf8/Binary>`
+/// directly, preserving the dict structure end-to-end so downstream
+/// operators (filter / group-by / join) can stay on dict codes rather
+/// than paying the gather + hash at every operator boundary.
+///
+/// Errors if the column chunk has no `DictionaryPage` (pure-PLAIN
+/// encoding) or if any data page falls back to `PLAIN` after a
+/// dictionary page — in both cases the chunk cannot be represented as
+/// `(dict, indices)` and the caller must fall back to one of the
+/// materialising entry points (`read_column_byte_array_offsets` /
+/// `read_column_byte_array`).
+#[derive(Debug, Clone, Default)]
+pub struct DictPreservedColumn {
+    /// Concatenated dictionary entries, addressed by `dict_offsets`.
+    pub dict_bytes: Vec<u8>,
+    /// Offset i,i+1 delimit entry i in `dict_bytes`. Length = dict_len + 1.
+    pub dict_offsets: Vec<u32>,
+    /// One u32 per row in the chunk. `indices[row]` < dict_len.
+    pub indices: Vec<u32>,
+}
+
+/// See `DictPreservedColumn`. Allocates a fresh column; for hot paths
+/// use `read_column_byte_array_dict_preserved_into` to reuse buffers.
+pub fn read_column_byte_array_dict_preserved(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<DictPreservedColumn> {
+    let mut col = DictPreservedColumn::default();
+    read_column_byte_array_dict_preserved_into(
+        file,
+        row_group,
+        column,
+        &mut col.dict_bytes,
+        &mut col.dict_offsets,
+        &mut col.indices,
+    )?;
+    Ok(col)
+}
+
+/// `read_column_byte_array_dict_preserved` writing into caller-
+/// provided buffers (each cleared then filled). Mirrors the
+/// `_offsets_into` shape so steady-state hot paths are
+/// zero-allocation once buffers have grown.
+pub fn read_column_byte_array_dict_preserved_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    dict_bytes: &mut Vec<u8>,
+    dict_offsets: &mut Vec<u32>,
+    indices: &mut Vec<u32>,
+) -> Result<()> {
+    dict_bytes.clear();
+    dict_offsets.clear();
+    indices.clear();
+
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+
+    let mut have_dict = false;
+    dict_offsets.push(0);
+    indices.reserve(total_values);
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
+                let slices = decode_plain_byte_array(&decomp)?;
+                let total_dict_bytes: usize = slices.iter().map(|s| s.len()).sum();
+                dict_bytes.reserve(total_dict_bytes);
+                dict_offsets.reserve(slices.len());
+                let mut acc: u32 = 0;
+                for s in &slices {
+                    dict_bytes.extend_from_slice(s);
+                    acc = acc.checked_add(s.len() as u32).ok_or_else(|| {
+                        CodecError::InvalidInput("dict bytes exceed u32::MAX".into())
+                    })?;
+                    dict_offsets.push(acc);
+                }
+                have_dict = true;
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                if !have_dict {
+                    return Err(CodecError::InvalidInput(
+                        "dict-preserved read: data page before dictionary (column has no DictionaryPage)".into(),
+                    ));
+                }
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                match info.encoding {
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        let mut page_indices = crate::dict::decode_rle_dictionary_indices(
+                            info.values,
+                            info.num_values,
+                        )?;
+                        // Validate every index lands inside the dict.
+                        // The downstream Arrow consumer relies on this
+                        // invariant; checking once here keeps the hot
+                        // path on the gather side branch-free.
+                        let dict_len = dict_offsets.len() - 1;
+                        if let Some(bad) = page_indices.iter().find(|&&i| (i as usize) >= dict_len)
+                        {
+                            return Err(CodecError::InvalidInput(format!(
+                                "dictionary index {bad} out of range (dict_len = {dict_len})"
+                            )));
+                        }
+                        indices.append(&mut page_indices);
+                    }
+                    Encoding::Plain => {
+                        return Err(CodecError::InvalidInput(
+                            "dict-preserved read: data page is PLAIN-encoded (writer fell back from dict — chunk cannot be expressed as one dict + indices)".into(),
+                        ));
+                    }
+                    other => {
+                        return Err(CodecError::Unsupported(format!(
+                            "dict-preserved read: data page encoding not supported: {other:?}"
+                        )));
+                    }
+                }
+            }
+            PageType::IndexPage => {}
+        }
+        if indices.len() >= total_values {
+            break;
+        }
+    }
+
+    if !have_dict {
+        return Err(CodecError::InvalidInput(
+            "dict-preserved read: column chunk has no DictionaryPage".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Read a BYTE_ARRAY column into Arrow-style flat bytes + offsets.
 ///
 /// Returns `(values, offsets)` where row `i` is the byte slice

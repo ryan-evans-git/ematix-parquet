@@ -13,7 +13,7 @@ Tracks the work between v0.1.1 and v2.0. Phases use the existing `Π.N` conventi
 | Π.7   | BYTE_STREAM_SPLIT + first NEON wave (bw=14, gather opt, bw=17 lookup) | ✓ Done   |
 | Π.8   | Performance polish: byte_array zero-copy, more NEON widths, RLE coalesce | ✓ Done |
 | Π.9   | Photon-inspired: decode-into-buffer, predicate fusion, batched API   | ✓ Done   |
-| Π.10  | Late-materialization read façade (`read_column_*_masked_into`)       | Planned  |
+| Π.10  | Late-materialization read façade (`read_column_*_masked_into`)       | Active (a, b, c shipped — codec side)  |
 | Π.11  | Async / object-store integration (S3 / GCS / Azure)                  | Planned  |
 | Π.12  | x86 SIMD parity (AVX2 / AVX-512 kernels mirroring NEON)              | Planned  |
 | Π.13  | Parquet Modular Encryption (read + write)                            | Planned  |
@@ -513,7 +513,7 @@ scope" to **Π.11 through Π.16** — see below.
 
 ---
 
-## Π.10 — Late-materialization read façade (planned)
+## Π.10 — Late-materialization read façade (active)
 
 **Goal.** Close a measured ~2 ms Q14 gap to Polars by adding
 top-level "decode a column with a row-mask" entry points. Today
@@ -522,59 +522,80 @@ filter — Polars decodes the filter column first, builds a mask,
 then sparse-decodes only matching rows in the other columns
 (99% of the decode work skipped at Q14's ~1.4% selectivity).
 
-**Shovel-ready.** Every building block already exists in
-`ematix-parquet-codec` from Π.9:
-- `gather_dict_at_bitmap_into<T>` — dict-encoded sparse gather
-- `decode_rle_dictionary_predicate_bitmap` — filter-col → bitmap
-- `decode_*_into(&mut Vec<T>)` — caller-buffer reuse
+See `docs/plans/PI-10-late-mat-design.md` for the full design.
 
-What's missing is the top-level façade that composes them and
-the PLAIN sparse-decode primitive.
+### Π.10a — read_column_*_masked_into for scalar types ✓ DONE
 
-**Touches.**
-- `crates/ematix-parquet-codec/src/read.rs` — add
-  `read_column_{i32,i64,f64,byte_array}_masked_into(file, rg,
-  col, mask: &[u8], out: &mut Vec<T>)` entry points. Per-page
-  popcount-skip; dict-encoded pages dispatch to
-  `gather_dict_at_bitmap_into`; PLAIN pages use new sparse-
-  decode helpers.
-- `crates/ematix-parquet-codec/src/plain.rs` — add
-  `plain_sparse_decode_{i32,i64,f64}_into` and
-  `plain_sparse_decode_byte_array_offsets_into`.
-- `crates/ematix-parquet-codec/src/dict.rs` — add a
-  `gather_dict_at_bitmap_into_clone<T: Clone>` sibling for
-  `Vec<u8>` (byte_array dict).
-- New bench example `bench_q14_late_mat` for end-to-end
-  measurement.
+**Shipped.**
+- `read::read_column_{i32,i64,f64}_masked_into(file, rg, col, &mask,
+  &mut out)` — appends matched values to caller's buffer (does NOT
+  clear). Mask is a packed bitmap (`&[u8]`, 1 bit per chunk row).
+- `read::build_packed_mask(num_rows, |i| pred(i)) -> Vec<u8>` — helper.
+- `plain::plain_sparse_decode_{i32,i64,f64}_into` — 8-row block-skip
+  + per-lane gather. Mirrors `gather_dict_at_bitmap_into`.
+- Internal `decode_chunk_row_masked_into` walker: per-page popcount-
+  skip; dict pages dispatch to `gather_dict_at_bitmap_into`;
+  PLAIN pages use the new sparse-decode primitives.
+- 12 oracle tests in `tests/read_masked_oracle.rs`:
+  selectivity sweep (0/0.1/1/10/50/100%) per type × encoding;
+  append semantics; multi-page mask transitions; per-page popcount-
+  skip edge case; undersized/empty/full mask edges.
 
-**Sub-phases.**
-- **Π.10a** — `read_column_*_masked_into` for i32/i64/f64
-  (3-4 days). Façade entry points; dict path reuses existing
-  primitive; PLAIN path adds the three scalar sparse-decoders.
-  Per-page popcount-skip. Oracle tests across encodings ×
-  selectivities.
-- **Π.10b** — `read_column_byte_array_masked_into` + offsets
-  variant (2-3 days). Variable-length sparse-decode for the
-  PLAIN path; dict path reuses the clone-based sibling.
-- **Π.10c** — Q14 bench + ematix-flow bridge integration
-  (3-4 days). Bridge orders the decode behind a `with_late_mat`
-  builder flag for A/B; full TPC-H sweep for 0 regressions.
+### Π.10b — read_column_byte_array_masked_into + offsets variant ✓ DONE
 
-**Acceptance.**
-1. Bit-identical equivalence vs full-decode-then-filter,
-   across types × encodings × selectivities (0–100% in a sweep).
-2. End-to-end Q14 (in ematix-flow) ≤ 13.0 ms (beats Polars's
-   12.53 ms with breathing room). Stretch: ≤ 11.0 ms.
-3. 0 regressions on the full TPC-H sweep.
+**Shipped.**
+- `read::read_column_byte_array_masked_into(.., &mut Vec<Vec<u8>>)` —
+  one allocation per matched value.
+- `read::read_column_byte_array_offsets_masked_into(.., &mut bytes,
+  &mut offsets)` — Arrow-style flat-bytes + N+1 offsets, zero
+  malloc per row. Multi-call concatenation: continues offsets from
+  the previous trailing value (doesn't re-push leading 0).
+- `plain::plain_sparse_decode_byte_array_into` + offsets variant —
+  walks length-prefixes sequentially (variable-length forces this).
+- Relaxed `dict::gather_dict_at_bitmap_into` bound from `T: Copy` →
+  `T: Clone`. Strictly more permissive (Copy: Clone); for existing
+  Copy callers `.clone()` inlines to a trivial copy — no perf cost.
+  Enables `Vec<u8>` to flow through the dict path.
+- 8 oracle tests in `tests/read_byte_array_masked_oracle.rs`:
+  selectivity sweep × shapes; multi-call concatenation; edge cases.
 
-**Estimate.** 8-11 dev days, ~1.5 calendar weeks. See
-`docs/plans/PI-10-late-mat-design.md` for the full design.
+### Π.10c — Q14 bench + ematix-flow bridge integration ✓ codec-side DONE
 
-**Why first.** Π.10 ships as v0.3.0 because it's the smallest
-high-impact item on the roadmap. The building blocks all exist;
-the work is exposing them at the façade layer. Lands before
-async/x86/encryption (which are multi-week lifts) so the
-release flow gets exercised on a low-risk PR sequence.
+**Shipped (codec side).**
+- `examples/bench_q14_late_mat.rs` — end-to-end Q14 bench using
+  the new façade. Compares baseline (4× full decode + filter)
+  vs late-mat (decode shipdate → mask → 3× masked decode).
+- Measured on TPC-H lineitem SF=1, row-group 0 (~6M rows,
+  ~84K matches @ 1.4% selectivity):
+  - **baseline (4× full decode + filter)**: 14.03 ms median
+  - **late-mat (façade _masked_into)**:    13.26 ms median
+  - **5.5% faster (1.06×)**
+
+**Why "only" 5.5% at the codec layer.** The chunk-bytes I/O +
+Snappy decompression cost is the same in both paths (we
+decompress every page either way; per-page popcount-skip can't
+help at uniform selectivity because Q14's matches are spread
+across every page). The win is bounded by per-row output
+materialization savings: ~98.6% × 3 columns × 8 bytes ≈ ~480 KB
+fewer output writes. Higher-selectivity workloads see bigger
+codec-layer wins; the larger Q14 wins live at the engine layer
+(Arrow construction skipped on filtered rows).
+
+**Remaining for v0.3.0 tag.**
+- ematix-flow bridge integration (in the **ematix-flow** repo,
+  not this one). Bridge orders the decode behind a `with_late_mat`
+  builder flag on `FastParquetTableProvider` for A/B testing.
+- Full TPC-H sweep in ematix-flow for 0 regressions.
+- Tag v0.3.0 from `main` after the codec-side PRs (#4, #5, #6)
+  merge and the ematix-flow integration confirms end-to-end Q14
+  ≤ 13.0 ms.
+
+**Acceptance status.**
+1. ✓ Bit-identical equivalence vs full-decode-then-filter across
+   types × encodings × selectivities (20 oracle tests, all green).
+2. ⏳ End-to-end Q14 ≤ 13.0 ms — measured in ematix-flow once the
+   bridge integration lands.
+3. ⏳ 0 regressions on TPC-H sweep — same.
 
 ---
 

@@ -93,3 +93,11 @@ path = "examples/probe_bitwidths.rs"
 [[example]]
 name = "bench_snappy"
 path = "examples/bench_snappy.rs"
+
+# Π.10c Q14 façade-level late-materialization bench.
+# Times baseline (4× full decode + filter) vs late-mat (mask-then-
+# decode via read_column_*_masked_into) on TPC-H lineitem Q14.
+# Run: TPCH_DATA_DIR=/path cargo run --release --example bench_q14_late_mat
+[[example]]
+name = "bench_q14_late_mat"
+path = "examples/bench_q14_late_mat.rs"

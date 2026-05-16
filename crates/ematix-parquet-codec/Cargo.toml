@@ -17,6 +17,10 @@ name = "ematix_parquet_codec"
 # end-to-end on the same binary. Default: NEON enabled where the host
 # target supports it.
 no-neon = []
+# Parquet Modular Encryption (Π.13). Pulls `ematix-parquet-crypto`
+# into the dep graph; surfaces the `encrypted` module + encrypted
+# read/write entry points. Default builds stay crypto-free.
+encryption = ["dep:ematix-parquet-crypto"]
 
 [dependencies]
 ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.5" }
@@ -25,6 +29,10 @@ ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.5" }
 # not require io — consumers that want pure byte-slice access can
 # bypass the facade.
 ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.5" }
+# AES-GCM + AAD construction for PME. Optional — only present when
+# `--features encryption` is set. The crypto crate itself stays
+# unconditionally compiled (it's small) but its surface is gated.
+ematix-parquet-crypto = { path = "../ematix-parquet-crypto", version = "0.5", optional = true }
 # Snappy is the default codec for almost every parquet writer in the
 # wild (and the one TPC-H data uses). Pinning to a known-stable cut
 # of `snap` until benchmarks tell us we want a hand-rolled one.
@@ -44,7 +52,12 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "saf
 
 [dev-dependencies]
 ematix-parquet-io = { path = "../ematix-parquet-io" }
-parquet = { version = "58", default-features = false, features = ["snap", "zstd", "flate2", "flate2-rust_backened", "brotli", "lz4", "experimental"] }
+parquet = { version = "58", default-features = false, features = ["snap", "zstd", "flate2", "flate2-rust_backened", "brotli", "lz4", "experimental", "encryption", "arrow"] }
+# Arrow types for the PME oracle tests (the only ergonomic path to
+# write an encrypted Parquet file via parquet-rs is through the
+# arrow writer).
+arrow-array = { version = "58", default-features = false }
+arrow-schema = { version = "58", default-features = false }
 # Third-party comparator in the three-way bench. Polars's
 # `LazyFrame::scan_parquet` is what real polars users pay, so we
 # time it directly. Pulls in a heavy dep tree (only for bench

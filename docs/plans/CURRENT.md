@@ -1,6 +1,6 @@
 # ematix-parquet — current plan
 
-Tracks the work between v0.1.1 and v1.0. Phases use the existing `Π.N` convention
+Tracks the work between v0.1.1 and v2.0. Phases use the existing `Π.N` convention
 (Π.1 read façade, Π.2 write path, Π.3 codec/type completeness — all shipped).
 
 ## Phase map
@@ -13,11 +13,19 @@ Tracks the work between v0.1.1 and v1.0. Phases use the existing `Π.N` conventi
 | Π.7   | BYTE_STREAM_SPLIT + first NEON wave (bw=14, gather opt, bw=17 lookup) | ✓ Done   |
 | Π.8   | Performance polish: byte_array zero-copy, more NEON widths, RLE coalesce | ✓ Done |
 | Π.9   | Photon-inspired: decode-into-buffer, predicate fusion, batched API   | ✓ Done   |
+| Π.10  | Async / object-store integration (S3 / GCS / Azure)                  | Planned  |
+| Π.11  | x86 SIMD parity (AVX2 / AVX-512 kernels mirroring NEON)              | Planned  |
+| Π.12  | Parquet Modular Encryption (read + write)                            | Planned  |
+| Π.13  | Adaptive runtime dispatch on observed selectivity                    | Planned  |
+| Π.14  | NUMA awareness and work-stealing for multi-RG parallel decode        | Planned  |
+| Π.15  | Custom LLVM codegen for hot decode paths (Photon-style)              | Speculative |
 
 v1.0 cut criteria are already met (correctness, interop, beats
-parquet-rs end-to-end on TPC-H lineitem). Π.8 is concrete performance
-work to widen the lead — measured by `bench_decode` against parquet-rs
-and polars on TPC-H lineitem at SF=1 and SF=10.
+parquet-rs end-to-end on TPC-H lineitem). v0.1–v0.2 shipped the
+Apple-Silicon-first, sync-IO codec; v1.0–v2.0 broadens the platform
+footprint (Π.10 async, Π.11 x86, Π.12 encryption) and pushes the
+performance ceiling further on workloads where const-generic
+monomorphization stops being enough (Π.13–Π.15).
 
 ---
 
@@ -484,20 +492,278 @@ batch with everything, iterator stays `None` after exhaustion,
 dict-encoded i64 streams correctly, multi-row-group: each RG
 streams independently.
 
-### Out of scope for Π.9
+### Out of scope for Π.9 (deferred to later phases or follow-ups)
 
 - **NEON prefetching in the dict gather** — `pld` instruction one
-  cache line ahead. Worthwhile when dict > L1, but a focused
-  benchmark first; defer until measured. Could be a quick Π.9d.
+  cache line ahead. Worthwhile when dict > L1; defer until measured.
+  Could be a quick Π.9d follow-up.
 - **u8 dict indices when bw ≤ 8** — saves Vec<u32> overhead in
   the index stream. Small wins on l_returnflag-class columns;
   defer until a benchmark says it matters.
 - **BYTE_ARRAY batched API** — needs `T: Clone` (not `Copy`) and
   a separate gather strategy on dict pages. Add when a consumer asks.
-- **Custom LLVM codegen** — Photon does this; we don't have the
-  infra and our const-generic monomorphisation gets ~80% of the
-  benefit at zero infra cost.
-- **NUMA awareness, work-stealing** — server concerns, not for a
-  library.
-- **Adaptive runtime dispatch on observed selectivity** — needs
-  profiling infra; hard to make pay off in a per-call library.
+
+The bigger structural items (async I/O, x86 SIMD, encryption,
+adaptive dispatch, NUMA, custom codegen) graduated from "out of
+scope" to **Π.10 through Π.15** — see below.
+
+---
+
+## Π.10 — Async / object-store integration (planned)
+
+**Goal.** Real workloads land on S3 / GCS / Azure, not local disk.
+The current `ematix-parquet-io` is sync `std::io::Read`; for cloud
+object stores we want async, range-aware fetches that can pipeline
+metadata loads, dictionary fetches, and data-page reads without
+blocking a worker thread.
+
+**Touches.**
+- New crate `ematix-parquet-io-async` (or feature flag on `io`)
+  exposing `AsyncParquetFile` over `tokio::io::AsyncRead +
+  AsyncSeek`, with an `object_store::ObjectStore` blanket impl.
+- Async page walker that issues coalesced range reads (footer +
+  dictionary + N data pages in 1-2 round trips).
+- Read façade `read_column_*_async` mirror.
+- Prefetch hint API: caller indicates batch ahead-of-time so the
+  walker pipelines.
+
+**Acceptance.**
+1. `AsyncParquetFile::open(object_store, "s3://bucket/key.parquet")`
+   reads footer + dict + first data page in ≤ 2 GET requests.
+2. `read_column_i64_async` decodes a TPC-H lineitem column from S3
+   at ≥ 70% of the local-disk throughput (network-bound, not
+   parser-bound).
+3. Sync API unchanged — async is purely additive.
+4. Oracle: cross-check async reads against sync reads on the same
+   file (LocalFileSystem `ObjectStore`), value-by-value.
+
+**Estimate.** 2-3 weeks. Async is intrusive but well-trodden — the
+`object_store` crate is the rallying point; we wrap it.
+
+**Why first.** Top consumer ask. Real analytical workloads run on
+object storage; local-disk is the development convenience. Until
+this lands, ematix-parquet can't be drop-in for cloud workloads
+even if its codec is faster.
+
+---
+
+## Π.11 — x86 SIMD parity (planned)
+
+**Goal.** Hand-tuned AVX2 (and where it pays, AVX-512) bit-unpack
++ predicate-fused kernels mirroring the NEON wave (bw=12, 14, 15,
+16, 17, 18). Lets ematix-parquet keep its ~10× scalar speedup on
+Linux x86 deployments (the majority of analytical infra).
+
+**Touches.**
+- New module `bitpack_avx2` (under `#[cfg(target_arch = "x86_64")]`).
+- Runtime `is_x86_feature_detected!("avx2")` dispatch in `bitpack.rs`
+  — current behaviour is "NEON if aarch64, scalar otherwise"; add
+  "AVX2 if x86_64 with feature, scalar otherwise."
+- Mirror the predicate-fused kernels for the same widths.
+- CI matrix adds an x86_64-linux runner.
+
+**Acceptance.**
+1. AVX2 kernels for bw=12/14/15/16/17/18 — both `unpack_indices_into`
+   and `unpack_lookup_into` paths plus the predicate-fused
+   bitmap variants.
+2. Microbench: each width within 25% of NEON's per-cycle output
+   bandwidth (allowing for the wider AVX2 register vs lane-count
+   trade-off).
+3. End-to-end TPC-H lineitem decode on x86_64-linux beats
+   parquet-rs by a margin comparable to what we see on aarch64
+   (i.e. ≥ 5% faster on the dict-encoded columns).
+4. Scalar fallback unchanged on hosts without AVX2 (older x86, ARM
+   non-aarch64).
+
+**Estimate.** 2-3 weeks. Each width is mechanical (mirror the
+NEON shape); the runtime dispatch and CI work is one-time.
+
+**Why second.** Once async lands, x86 footprint is the next gate
+to "ematix-parquet on real servers." Apple Silicon dev → x86
+prod is a common pattern; the scalar fallback works but loses
+the 10× SIMD lead exactly where it matters most (production
+throughput).
+
+---
+
+## Π.12 — Parquet Modular Encryption (planned)
+
+**Goal.** Read and write files using Parquet Modular Encryption (PME)
+— the spec-defined per-column-chunk AES-GCM encryption used in
+regulated industries (finance, healthcare, government). Without
+this, ematix-parquet can't be used in any environment that requires
+encrypted-at-rest columnar data.
+
+**Touches.**
+- New crate `ematix-parquet-crypto` for the AES-GCM primitives
+  (depends on `ring` or `aes-gcm`), kept separate so the rest of
+  the workspace stays crypto-free.
+- Footer-encryption mode (encrypted footer + encrypted columns)
+  and plaintext-footer mode (the two modes the spec defines).
+- Key-management abstraction: `trait DecryptionKeyRetriever` (KMS
+  integration is the caller's problem; we just receive bytes).
+- Column-chunk-level encrypted page reading + writing.
+- Crypto-config Thrift extensions in `ematix-parquet-format`.
+
+**Acceptance.**
+1. Round-trip oracle: parquet-rs writes a PME-encrypted file with
+   per-column keys; we read it back with the same keys and recover
+   every value.
+2. Inverse: we write a PME-encrypted file; parquet-rs reads it
+   back identically.
+3. Both encryption modes (encrypted footer, plaintext footer)
+   covered by oracle tests.
+4. Key-rotation flow documented (rewrite a file under new keys).
+5. Crypto code path is `#[cfg(feature = "encryption")]`-gated on
+   `ematix-parquet-codec` so the default build has zero crypto
+   deps.
+
+**Estimate.** 4-6 weeks. PME is a substantial spec extension and
+requires careful AES-GCM key management; round-trip parity with
+parquet-rs is non-trivial because the key-derivation rules are
+intricate.
+
+**Why third.** Required for enterprise / compliance customers, but
+not on the critical path for analytical-workload performance. Lands
+after async (broader reach) and x86 (broader hardware) so the
+encryption work benefits the maximum number of deployments.
+
+---
+
+## Π.13 — Adaptive runtime dispatch on observed selectivity (planned)
+
+**Goal.** The fused-predicate path (Π.9b) is 3.7-6.3× faster than
+materialise-then-filter at ≤ 5% selectivity, but at high selectivity
+(say > 50%) the materialise path is competitive or faster (no
+bitmap-pack overhead, downstream consumers want values anyway).
+Today the caller picks. Π.13 lets the codec pick, based on observed
+selectivity from the first N pages of a chunk.
+
+**Touches.**
+- New struct `AdaptiveDictPredicate` wrapping the chosen kernel.
+- After decoding the first 2-3 pages with the fused path, count
+  matches; if selectivity > threshold, switch the rest of the
+  chunk to materialise-then-filter (cheaper downstream).
+- Telemetry hook: optional `Fn(SelectivityProbe)` callback so
+  consumers can log dispatch decisions.
+- Threshold is tunable per call but ships with a benchmark-derived
+  default.
+
+**Acceptance.**
+1. End-to-end bench: across a sweep of selectivities (0.1%, 1%,
+   10%, 50%, 90%) the adaptive path is within 10% of the better
+   of the two static paths at every point.
+2. No regression on the Q14-shape (~1%) selective scan.
+3. Telemetry callback (optional) reports the chosen kernel and the
+   probe selectivity per chunk.
+4. Oracle: adaptive output matches static-fused output bit-for-bit
+   when selectivity is uniform across the chunk.
+
+**Estimate.** 1-2 weeks. The dispatch logic is small; the bench
+sweep + threshold tuning is most of the work.
+
+**Why fourth.** Π.13 is pure performance polish on an existing
+shipped capability (Π.9b). Lands once the breadth-of-platform work
+(async, x86, encryption) is in — then the wins compound across more
+deployments.
+
+---
+
+## Π.14 — NUMA awareness and work-stealing parallel decode (planned)
+
+**Goal.** A multi-row-group file is naturally embarrassingly
+parallel (each RG is independent). Today consumers can decode RGs
+in parallel themselves with `rayon::join` or similar, but on NUMA
+machines this leaves performance on the table when threads land on
+the wrong socket relative to the chunk-bytes buffer. Π.14 lifts
+the thread/NUMA awareness into the codec.
+
+**Touches.**
+- New entry point `read_columns_parallel(file, &cols, options)` —
+  decodes multiple (RG, column) pairs concurrently using a
+  work-stealing pool with NUMA-pinned workers.
+- `numa_alloc` for chunk-bytes buffers: allocate on the same NUMA
+  node as the worker that will decode it.
+- Thread-pool config: caller passes a `rayon::ThreadPool` or we
+  default-construct one matching the host topology.
+- Cancellation token so a stalled batch can abort the pool cleanly.
+
+**Acceptance.**
+1. On a 2-socket Linux machine, `read_columns_parallel` on a
+   100-RG file scales linearly to socket count, then sub-linearly
+   beyond — the inflection should match measured per-socket
+   memory bandwidth.
+2. Single-socket / single-NUMA-node hosts see no regression vs
+   `rayon::join` on the same workload.
+3. Cancellation token cleanly stops in-flight workers without
+   leaking allocations.
+
+**Estimate.** 2-3 weeks. NUMA primitives on Linux are
+well-supported (`hwloc`, `libnuma`); macOS has no NUMA so the
+implementation is a no-op there; Windows handled separately.
+
+**Why fifth.** Server-only concern. Not on the critical path for
+single-machine analytical workloads or for any deployment that
+already has an outer parallel-RG scheduler. Defer until a real
+consumer hits the NUMA wall.
+
+---
+
+## Π.15 — Custom LLVM codegen for hot decode paths (speculative)
+
+**Goal.** Photon (Databricks) generates per-query LLVM IR for hot
+decode loops, fusing predicate, dictionary lookup, projection, and
+output materialization into one tight kernel. Our const-generic
+monomorphization gets ~80% of this for free at compile time, but
+the remaining 20% requires runtime codegen for shapes we can't
+know at crate-build time (predicate trees, complex dict shapes).
+
+**Touches.**
+- New crate `ematix-parquet-codegen` depending on `inkwell` (LLVM
+  bindings) or `cranelift` (faster JIT, simpler IR).
+- Runtime IR generation for fused (predicate × bit_width × dict
+  type × downstream operation) shapes that aren't in the const-
+  generic table.
+- Codegen cache keyed on shape; warm cache on second call to the
+  same shape is free.
+- Fallback to the existing const-generic path when codegen is
+  disabled.
+
+**Acceptance.**
+1. Codegen path is feature-gated; default build doesn't pull LLVM.
+2. End-to-end: a complex predicate (e.g. `(a > 5 AND b < 10) OR c LIKE 'x%'`)
+   decoded via codegen runs ≥ 2× faster than the equivalent
+   composed from the const-generic kernels.
+3. Cold-cache codegen latency ≤ 100 ms for a typical Q14-shape
+   predicate; warm-cache calls are zero-overhead vs the codegen'd
+   kernel running directly.
+
+**Estimate.** 6-12 weeks. LLVM/cranelift integration is non-trivial
+and demands serious bench discipline to confirm wins are real.
+
+**Why last (and speculative).** This is the most ambitious item and
+the least likely to pay off vs. its engineering cost. The const-
+generic table covers every shape we've seen in TPC-H lineitem and
+in real consumers' workloads. Codegen is justified only if a
+specific workload demonstrates the const-generic table is the
+bottleneck. Marked **speculative**: may never ship.
+
+---
+
+## What's still open below the phase line
+
+These are smaller items that don't merit a full phase but will be
+picked up opportunistically:
+
+- **NEON prefetching in dict gather** (Π.9d) — `pld` instruction.
+- **u8 dict indices when bw ≤ 8** — saves Vec<u32> overhead.
+- **BYTE_ARRAY batched API** — needs `T: Clone`-based gather.
+- **Per-column encoding choice on `write_table_*`** — requires a
+  `WriteOptions { encoding_per_column }` shape; land when a real
+  consumer asks for mixed-encoding tables.
+- **Bloom-filter writer** — symmetric to the decoder; defer until
+  a downstream reader will actually consult it.
+- **NEON kernels for small widths (1, 4, 5, 8, 20, 21)** — scalar
+  is at ~7-9 GB/s output; gather dominates on these columns.
+  Revisit only if a workload demands.
+- **DELTA_BINARY_PACKED u64-output unpacker** (TODO in `delta.rs`).

@@ -1,0 +1,82 @@
+name: ci
+
+# Runs on every PR and on pushes to main. Branch protection on main
+# gates merges on the `build-test` job (the required check). Format
+# and clippy run as separate jobs that surface findings but are not
+# (yet) required — flip them to required once the codebase is clean
+# and the team agrees on style enforcement.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel in-progress runs for the same PR / branch when a new commit
+# lands — saves CI minutes on quick-fire pushes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test:
+    name: build-test
+    # macOS 14 for aarch64 NEON coverage — every NEON kernel runs on
+    # CI rather than only on a developer's laptop. Once Π.11 ships
+    # x86 SIMD parity we add a parallel ubuntu-latest matrix entry.
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace --all-targets
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Format check is informational while the codebase has any pre-
+    # existing diffs against `cargo fmt`. Promote to required (add to
+    # branch protection) once the diff is zero.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Clippy informational for now — there are stylistic findings
+    # the codebase hasn't worked through. Promote to required once
+    # the lint pass is clean. (`-D warnings` would gate hard.)
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

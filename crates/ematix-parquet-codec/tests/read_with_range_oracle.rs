@@ -110,8 +110,16 @@ fn i32_with_range_returns_superset_of_matches() {
 
     // Caller-side filter on the kept superset must recover exactly
     // the values that satisfy the predicate.
-    let recovered: Vec<i32> = kept.iter().copied().filter(|&v| v >= lo && v <= hi).collect();
-    let expected: Vec<i32> = values.iter().copied().filter(|&v| v >= lo && v <= hi).collect();
+    let recovered: Vec<i32> = kept
+        .iter()
+        .copied()
+        .filter(|&v| v >= lo && v <= hi)
+        .collect();
+    let expected: Vec<i32> = values
+        .iter()
+        .copied()
+        .filter(|&v| v >= lo && v <= hi)
+        .collect();
     assert_eq!(recovered, expected);
 }
 
@@ -184,8 +192,16 @@ fn i64_with_range_returns_superset_of_matches() {
     let full = read_column_i64(&file, 0, 0).unwrap();
 
     assert!(kept.len() < full.len(), "pruning must drop pages");
-    let recovered: Vec<i64> = kept.iter().copied().filter(|&v| v >= lo && v <= hi).collect();
-    let expected: Vec<i64> = values.iter().copied().filter(|&v| v >= lo && v <= hi).collect();
+    let recovered: Vec<i64> = kept
+        .iter()
+        .copied()
+        .filter(|&v| v >= lo && v <= hi)
+        .collect();
+    let expected: Vec<i64> = values
+        .iter()
+        .copied()
+        .filter(|&v| v >= lo && v <= hi)
+        .collect();
     assert_eq!(recovered, expected);
 }
 

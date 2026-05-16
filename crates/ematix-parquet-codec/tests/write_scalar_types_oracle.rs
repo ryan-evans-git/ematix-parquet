@@ -6,9 +6,7 @@
 //!   3. Read back via our own façade (the symmetric check).
 //!   4. Assert equality on both.
 
-use ematix_parquet_codec::read::{
-    read_column_byte_array, read_column_f64, read_column_i32,
-};
+use ematix_parquet_codec::read::{read_column_byte_array, read_column_f64, read_column_i32};
 use ematix_parquet_codec::write::{
     write_bool_column_to_path, write_byte_array_column_to_path, write_f64_column_to_path,
     write_i32_column_to_path,
@@ -144,9 +142,7 @@ fn bool_writes_and_reads_back_via_parquet_rs() {
     let path = dir.path().join("bool.parquet");
     // Mix of alternating + runs + length-not-multiple-of-8 to exercise
     // the bit-packing + tail-padding path.
-    let values: Vec<bool> = (0..73)
-        .map(|i| matches!(i % 5, 0 | 2 | 3))
-        .collect();
+    let values: Vec<bool> = (0..73).map(|i| matches!(i % 5, 0 | 2 | 3)).collect();
     write_bool_column_to_path(&path, "v", &values).unwrap();
     assert_eq!(pq_read_bool(&path), values);
 }
@@ -166,15 +162,14 @@ fn bool_writes_and_reads_back_via_ours() {
 
     let file = ParquetFile::open(&path).unwrap();
     let md = file.metadata().unwrap();
-    let cm = md.row_groups[0].columns[0]
-        .meta_data
-        .as_ref()
-        .unwrap();
+    let cm = md.row_groups[0].columns[0].meta_data.as_ref().unwrap();
     let start = cm
         .dictionary_page_offset
         .filter(|&d| d < cm.data_page_offset)
         .unwrap_or(cm.data_page_offset) as u64;
-    let chunk = file.read_range(start, cm.total_compressed_size as u64).unwrap();
+    let chunk = file
+        .read_range(start, cm.total_compressed_size as u64)
+        .unwrap();
     let mut walker = PageWalker::new(&chunk);
     let (hdr, body) = walker.next_page().unwrap().unwrap();
     let n = hdr.data_page_header.unwrap().num_values as usize;

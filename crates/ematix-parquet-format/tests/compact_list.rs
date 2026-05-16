@@ -93,6 +93,8 @@ fn end_to_end_decode_list_of_3_i32() {
     let (count, et) = read_list_header(&mut cur).unwrap();
     assert_eq!((count, et), (3, FieldType::I32));
     use ematix_parquet_format::compact::read_zigzag_i32;
-    let values: Vec<i32> = (0..count).map(|_| read_zigzag_i32(&mut cur).unwrap()).collect();
+    let values: Vec<i32> = (0..count)
+        .map(|_| read_zigzag_i32(&mut cur).unwrap())
+        .collect();
     assert_eq!(values, vec![1, 2, 3]);
 }

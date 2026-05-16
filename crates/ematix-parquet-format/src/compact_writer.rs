@@ -100,12 +100,7 @@ impl Writer {
     /// `prev_id` is the most recently written field id within the
     /// current struct (0 for the first field). The caller is
     /// responsible for threading it.
-    pub fn write_field_header(
-        &mut self,
-        id: i16,
-        field_type: FieldType,
-        prev_id: i16,
-    ) {
+    pub fn write_field_header(&mut self, id: i16, field_type: FieldType, prev_id: i16) {
         let type_code = field_type as u8;
         let diff = id as i32 - prev_id as i32;
         if diff > 0 && diff <= 15 {
@@ -156,8 +151,11 @@ impl Writer {
     pub fn write_list_bool(&mut self, values: &[bool]) {
         self.write_list_header(values.len(), FieldType::BoolTrue);
         for &v in values {
-            self.buf
-                .push(if v { FieldType::BoolTrue as u8 } else { FieldType::BoolFalse as u8 });
+            self.buf.push(if v {
+                FieldType::BoolTrue as u8
+            } else {
+                FieldType::BoolFalse as u8
+            });
         }
     }
 
@@ -194,7 +192,18 @@ mod tests {
 
     #[test]
     fn uvarint_roundtrip_corner_values() {
-        for v in [0u64, 1, 127, 128, 255, 256, 16_383, 16_384, u32::MAX as u64, u64::MAX] {
+        for v in [
+            0u64,
+            1,
+            127,
+            128,
+            255,
+            256,
+            16_383,
+            16_384,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
             rt_uvarint(v);
         }
     }

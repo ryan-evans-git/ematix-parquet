@@ -180,7 +180,11 @@ fn page_skip_via_column_index_skips_non_overlapping_pages() {
     // max — but if the *predicate* range itself is the lo/hi we
     // selected on, then by construction every value that satisfies
     // the predicate must be in `decoded_kept`. Verify it:
-    let expected: Vec<i32> = values.iter().copied().filter(|v| *v >= lo && *v <= hi).collect();
+    let expected: Vec<i32> = values
+        .iter()
+        .copied()
+        .filter(|v| *v >= lo && *v <= hi)
+        .collect();
     let recovered: Vec<i32> = decoded_kept
         .iter()
         .copied()

@@ -125,7 +125,15 @@ mod tests {
 
     #[test]
     fn f32_roundtrip_simple() {
-        roundtrip_f32(&[1.0, -2.0, 3.14, 0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
+        roundtrip_f32(&[
+            1.0,
+            -2.0,
+            3.14,
+            0.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ]);
     }
 
     #[test]

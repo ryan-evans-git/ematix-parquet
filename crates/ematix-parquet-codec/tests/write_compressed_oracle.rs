@@ -128,8 +128,7 @@ fn zstd_byte_array_reads_back_via_parquet_rs() {
         .map(|i| format!("Lorem ipsum dolor sit amet {}", i % 16).into_bytes())
         .collect();
     let refs: Vec<&[u8]> = values.iter().map(|v| v.as_slice()).collect();
-    write_byte_array_column_to_path_with_codec(&path, "v", &refs, CompressionCodec::Zstd)
-        .unwrap();
+    write_byte_array_column_to_path_with_codec(&path, "v", &refs, CompressionCodec::Zstd).unwrap();
     assert_eq!(pq_read_byte_array(&path), values);
 }
 

@@ -5,9 +5,7 @@
 //! new row group every `row_group_size` rows. Stats are per-RG so
 //! readers can prune individual row groups, not just the whole file.
 
-use ematix_parquet_codec::write::{
-    write_table_to_path_with_row_group_size, ColumnData,
-};
+use ematix_parquet_codec::write::{write_table_to_path_with_row_group_size, ColumnData};
 use ematix_parquet_format::types::CompressionCodec;
 
 use parquet::column::reader::ColumnReader;
@@ -113,12 +111,7 @@ fn per_row_group_stats_are_tight() {
     assert_eq!(r.metadata().num_row_groups(), 5);
 
     for rg_ix in 0..5 {
-        let cc = r
-            .get_row_group(rg_ix)
-            .unwrap()
-            .metadata()
-            .column(0)
-            .clone();
+        let cc = r.get_row_group(rg_ix).unwrap().metadata().column(0).clone();
         let PqStats::Int64(ts) = cc.statistics().expect("stats") else {
             panic!("expected Int64 stats");
         };

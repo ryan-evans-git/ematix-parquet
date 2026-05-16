@@ -147,7 +147,10 @@ fn file_metadata_full_payload() {
 
     let mut cur = Cursor::new(&bytes);
     let md = read_file_metadata(&mut cur).unwrap();
-    assert_eq!(md.created_by, Some(&b"ematix-parquet vX.Y.Z (build abcdef)"[..]));
+    assert_eq!(
+        md.created_by,
+        Some(&b"ematix-parquet vX.Y.Z (build abcdef)"[..])
+    );
     let kv = md.key_value_metadata.unwrap();
     assert_eq!(kv.len(), 1);
     assert_eq!(kv[0].key, b"writer.version");

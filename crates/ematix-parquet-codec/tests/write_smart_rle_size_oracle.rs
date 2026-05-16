@@ -44,8 +44,8 @@ fn long_runs_compress_dramatically() {
     let path = dir.path().join("repetitive.parquet");
 
     let palette: [&[u8]; 10] = [
-        b"alpha", b"bravo", b"charlie", b"delta", b"echo",
-        b"foxtrot", b"golf", b"hotel", b"india", b"juliett",
+        b"alpha", b"bravo", b"charlie", b"delta", b"echo", b"foxtrot", b"golf", b"hotel", b"india",
+        b"juliett",
     ];
     let mut values: Vec<&[u8]> = Vec::with_capacity(100_000);
     for &p in &palette {
@@ -116,7 +116,9 @@ fn mixed_runs_and_singletons_compress_better() {
     // Repeat 100 times → 100 × (500 hot + 4 cold) = 50400 rows.
     let mut values: Vec<&[u8]> = Vec::new();
     for cycle in 0..100 {
-        for _ in 0..500 { values.push(hot); }
+        for _ in 0..500 {
+            values.push(hot);
+        }
         for &c in &cold {
             values.push(c);
             // Use the cycle index to vary the cold values a bit.

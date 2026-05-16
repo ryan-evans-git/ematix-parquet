@@ -172,4 +172,3 @@ thrift_enum! {
         Interval = 21,
     }
 }
-

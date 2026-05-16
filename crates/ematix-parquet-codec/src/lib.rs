@@ -17,10 +17,10 @@
 //!   5. `byte_stream_split` — Parquet v2 numeric encoding. (Not yet.)
 
 pub mod bitpack;
-#[cfg(target_arch = "aarch64")]
-pub mod bitpack_neon;
 #[cfg(target_arch = "x86_64")]
 pub mod bitpack_avx2;
+#[cfg(target_arch = "aarch64")]
+pub mod bitpack_neon;
 pub mod bloom;
 pub mod byte_stream_split;
 pub mod column;

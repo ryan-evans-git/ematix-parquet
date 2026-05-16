@@ -111,14 +111,18 @@ async fn main() {
     // Async timings.
     for _ in 0..WARMUPS {
         buf.clear();
-        read_column_i64_async_into(&aps, 0, COL_SUPPKEY, &mut buf).await.unwrap();
+        read_column_i64_async_into(&aps, 0, COL_SUPPKEY, &mut buf)
+            .await
+            .unwrap();
         black_box(&buf);
     }
     let mut async_times: Vec<Duration> = Vec::with_capacity(ITERS);
     for _ in 0..ITERS {
         buf.clear();
         let t0 = Instant::now();
-        read_column_i64_async_into(&aps, 0, COL_SUPPKEY, &mut buf).await.unwrap();
+        read_column_i64_async_into(&aps, 0, COL_SUPPKEY, &mut buf)
+            .await
+            .unwrap();
         async_times.push(t0.elapsed());
         black_box(&buf);
     }
@@ -129,8 +133,14 @@ async fn main() {
     let pct = (ratio - 1.0) * 100.0;
     let arrow = if ratio <= 1.05 { "✓" } else { "✗" };
 
-    println!("  sync  read_column_i64_into       : median {}", fmt(sync_med));
-    println!("  async read_column_i64_async_into : median {}", fmt(async_med));
+    println!(
+        "  sync  read_column_i64_into       : median {}",
+        fmt(sync_med)
+    );
+    println!(
+        "  async read_column_i64_async_into : median {}",
+        fmt(async_med)
+    );
     println!(
         "  async/sync ratio: {:.2}× ({:+.1}%)  {arrow} within 5% acceptance bar",
         ratio, pct

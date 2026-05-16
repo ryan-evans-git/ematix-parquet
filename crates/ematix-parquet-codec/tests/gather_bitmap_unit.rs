@@ -16,7 +16,11 @@ use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, gather_dict_at_b
 fn pack(values: &[u32], bit_width: u8) -> Vec<u8> {
     let total_bits = values.len() * bit_width as usize;
     let mut out = vec![0u8; total_bits.div_ceil(8)];
-    let bw_mask: u64 = if bit_width == 0 { 0 } else { (1u64 << bit_width) - 1 };
+    let bw_mask: u64 = if bit_width == 0 {
+        0
+    } else {
+        (1u64 << bit_width) - 1
+    };
     for (i, &v) in values.iter().enumerate() {
         let v = (v as u64) & bw_mask;
         let start_bit = i * bit_width as usize;
@@ -276,7 +280,8 @@ fn bw_bitpacked_with_misaligned_bitmap_offset() {
     gather_dict_at_bitmap_into(&body, n, &bitmap, bitmap_offset, &dict, &mut out).unwrap();
     let expected = reference_gather(&body, n, &bitmap, bitmap_offset, &dict);
     assert_eq!(
-        out, expected,
+        out,
+        expected,
         "gather produced {} values, reference produced {} (bitmap_offset={bitmap_offset})",
         out.len(),
         expected.len()

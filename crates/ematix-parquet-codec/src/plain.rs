@@ -38,11 +38,7 @@ fn plain_memcpy<T: Copy>(bytes: &[u8], width: usize) -> Vec<T> {
     let n = bytes.len() / width;
     let mut out: Vec<T> = Vec::with_capacity(n);
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            out.as_mut_ptr() as *mut u8,
-            bytes.len(),
-        );
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
         out.set_len(n);
     }
     out
@@ -501,11 +497,11 @@ pub fn plain_sparse_decode_byte_array_offsets_into(
         let bit = (mask[bit_pos / 8] >> (bit_pos % 8)) & 1;
         if bit == 1 {
             out_bytes.extend_from_slice(value);
-            running = running
-                .checked_add(len as u32)
-                .ok_or_else(|| CodecError::InvalidInput(
+            running = running.checked_add(len as u32).ok_or_else(|| {
+                CodecError::InvalidInput(
                     "byte_array sparse-decode: offset overflow > u32::MAX".into(),
-                ))?;
+                )
+            })?;
             out_offsets.push(running);
         }
     }

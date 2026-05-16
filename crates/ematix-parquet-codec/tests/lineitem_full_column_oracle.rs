@@ -77,7 +77,7 @@ fn full_rg0_orderkey_column_matches_parquet_rs() {
     let dict = decode_plain_i64(&dict_decompressed).expect("dict PLAIN i64");
     eprintln!("dict: {} entries", dict.len());
 
-let mut ours: Vec<i64> = Vec::with_capacity(total_values);
+    let mut ours: Vec<i64> = Vec::with_capacity(total_values);
     let mut dict_data_pages = 0;
     let mut plain_data_pages = 0;
     while let Some((hdr, body)) = walker.next_page().unwrap() {
@@ -142,14 +142,8 @@ let mut ours: Vec<i64> = Vec::with_capacity(total_values);
             "PASS: {} l_orderkey i64 values match parquet-rs byte-for-byte",
             ours.len()
         );
-        eprintln!(
-            "      first 5: {:?}",
-            &ours[..5.min(ours.len())]
-        );
-        eprintln!(
-            "      last 5:  {:?}",
-            &ours[ours.len().saturating_sub(5)..]
-        );
+        eprintln!("      first 5: {:?}", &ours[..5.min(ours.len())]);
+        eprintln!("      last 5:  {:?}", &ours[ours.len().saturating_sub(5)..]);
         return;
     }
     // Slow path: find first divergence and report.

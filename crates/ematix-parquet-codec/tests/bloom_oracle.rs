@@ -115,10 +115,7 @@ fn bloom_i64_known_present_and_absent() {
     // True positives: every inserted value must report present.
     for &v in &present {
         let h = parquet_xxh64(&v.to_le_bytes());
-        assert!(
-            bf.contains_hash(h),
-            "false negative for present value {v}"
-        );
+        assert!(bf.contains_hash(h), "false negative for present value {v}");
     }
 
     // False-positive rate check: probe 10 000 absent values, expect

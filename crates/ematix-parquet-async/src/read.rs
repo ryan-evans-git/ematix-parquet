@@ -9,8 +9,8 @@
 
 use bytes::Bytes;
 use ematix_parquet_codec::compression::{
-    decompress_brotli_into, decompress_gzip_into, decompress_lz4_raw_into,
-    decompress_snappy_into, decompress_zstd_into,
+    decompress_brotli_into, decompress_gzip_into, decompress_lz4_raw_into, decompress_snappy_into,
+    decompress_zstd_into,
 };
 use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_into};
 use ematix_parquet_codec::plain::{
@@ -42,8 +42,7 @@ pub async fn read_column_i64_async_into(
     column: usize,
     out: &mut Vec<i64>,
 ) -> Result<()> {
-    let (chunk_bytes, total_values, codec) =
-        read_chunk_raw_async(file, row_group, column).await?;
+    let (chunk_bytes, total_values, codec) = read_chunk_raw_async(file, row_group, column).await?;
     decode_chunk_into(&chunk_bytes, total_values, codec, out, decode_plain_i64)
 }
 
@@ -64,8 +63,7 @@ pub async fn read_column_i32_async_into(
     column: usize,
     out: &mut Vec<i32>,
 ) -> Result<()> {
-    let (chunk_bytes, total_values, codec) =
-        read_chunk_raw_async(file, row_group, column).await?;
+    let (chunk_bytes, total_values, codec) = read_chunk_raw_async(file, row_group, column).await?;
     decode_chunk_into(&chunk_bytes, total_values, codec, out, decode_plain_i32)
 }
 
@@ -86,8 +84,7 @@ pub async fn read_column_f64_async_into(
     column: usize,
     out: &mut Vec<f64>,
 ) -> Result<()> {
-    let (chunk_bytes, total_values, codec) =
-        read_chunk_raw_async(file, row_group, column).await?;
+    let (chunk_bytes, total_values, codec) = read_chunk_raw_async(file, row_group, column).await?;
     decode_chunk_into(&chunk_bytes, total_values, codec, out, decode_plain_f64)
 }
 
@@ -117,8 +114,7 @@ pub async fn read_column_byte_array_async_into(
     out: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
     out.clear();
-    let (chunk_bytes, total_values, codec) =
-        read_chunk_raw_async(file, row_group, column).await?;
+    let (chunk_bytes, total_values, codec) = read_chunk_raw_async(file, row_group, column).await?;
 
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
@@ -136,8 +132,8 @@ pub async fn read_column_byte_array_async_into(
                 let info = data_page_view(&hdr, body, codec, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
-                        let slices = decode_plain_byte_array(info.values)
-                            .map_err(codec_to_async)?;
+                        let slices =
+                            decode_plain_byte_array(info.values).map_err(codec_to_async)?;
                         out.extend(slices.into_iter().map(|s| s.to_vec()));
                     }
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
@@ -146,15 +142,12 @@ pub async fn read_column_byte_array_async_into(
                                 "dict-encoded data page before dictionary".into(),
                             ));
                         }
-                        let indices = decode_rle_dictionary_indices(
-                            info.values, info.num_values,
-                        ).map_err(codec_to_async)?;
+                        let indices = decode_rle_dictionary_indices(info.values, info.num_values)
+                            .map_err(codec_to_async)?;
                         out.reserve(info.num_values);
                         for idx in indices {
                             let v = dict.get(idx as usize).ok_or_else(|| {
-                                AsyncError::Format(
-                                    "dictionary index out of range".into(),
-                                )
+                                AsyncError::Format("dictionary index out of range".into())
                             })?;
                             out.push(v.clone());
                         }
@@ -205,8 +198,7 @@ pub async fn read_column_byte_array_offsets_async_into(
     out_bytes.clear();
     out_offsets.clear();
 
-    let (chunk_bytes, total_values, codec) =
-        read_chunk_raw_async(file, row_group, column).await?;
+    let (chunk_bytes, total_values, codec) = read_chunk_raw_async(file, row_group, column).await?;
 
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
@@ -254,9 +246,8 @@ pub async fn read_column_byte_array_offsets_async_into(
                                     "PLAIN byte_array: truncated length prefix".into(),
                                 ));
                             }
-                            let len = u32::from_le_bytes(
-                                body[i..i + 4].try_into().unwrap(),
-                            ) as usize;
+                            let len =
+                                u32::from_le_bytes(body[i..i + 4].try_into().unwrap()) as usize;
                             i += 4;
                             if i + len > body.len() {
                                 return Err(AsyncError::Format(
@@ -276,9 +267,8 @@ pub async fn read_column_byte_array_offsets_async_into(
                                 "dict-encoded data page before dictionary".into(),
                             ));
                         }
-                        let indices = decode_rle_dictionary_indices(
-                            info.values, info.num_values,
-                        ).map_err(codec_to_async)?;
+                        let indices = decode_rle_dictionary_indices(info.values, info.num_values)
+                            .map_err(codec_to_async)?;
                         let dict_n = dict_offsets.len() - 1;
                         out_offsets.reserve(indices.len());
                         let mut acc: u32 = *out_offsets.last().unwrap();
@@ -325,12 +315,14 @@ async fn read_chunk_raw_async(
     column: usize,
 ) -> Result<(Bytes, usize, CompressionCodec)> {
     let md = file.metadata()?;
-    let rg = md.row_groups.get(row_group).ok_or_else(|| {
-        AsyncError::Format(format!("row group {row_group} out of range"))
-    })?;
-    let col = rg.columns.get(column).ok_or_else(|| {
-        AsyncError::Format(format!("column {column} out of range"))
-    })?;
+    let rg = md
+        .row_groups
+        .get(row_group)
+        .ok_or_else(|| AsyncError::Format(format!("row group {row_group} out of range")))?;
+    let col = rg
+        .columns
+        .get(column)
+        .ok_or_else(|| AsyncError::Format(format!("column {column} out of range")))?;
     let cm = col
         .meta_data
         .as_ref()

@@ -13,9 +13,7 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use ematix_parquet_codec::read::{
-    read_column_byte_array, read_column_i32, read_column_i64,
-};
+use ematix_parquet_codec::read::{read_column_byte_array, read_column_i32, read_column_i64};
 use ematix_parquet_io::ParquetFile;
 
 use parquet::basic::{Compression, Repetition, Type as PhysicalType};
@@ -59,7 +57,8 @@ fn data_page_v2_i32_uncompressed() {
     let values: Vec<i32> = (0..5_000).collect();
 
     let f = File::create(&path).unwrap();
-    let mut w = SerializedFileWriter::new(f, schema, writer_props_v2(Compression::UNCOMPRESSED)).unwrap();
+    let mut w =
+        SerializedFileWriter::new(f, schema, writer_props_v2(Compression::UNCOMPRESSED)).unwrap();
     let mut rg = w.next_row_group().unwrap();
     let mut col = rg.next_column().unwrap().unwrap();
     if let ColumnWriter::Int32ColumnWriter(ref mut typed) = col.untyped() {
@@ -129,7 +128,8 @@ fn data_page_v2_byte_array_uncompressed() {
         .collect();
 
     let f = File::create(&path).unwrap();
-    let mut w = SerializedFileWriter::new(f, schema, writer_props_v2(Compression::UNCOMPRESSED)).unwrap();
+    let mut w =
+        SerializedFileWriter::new(f, schema, writer_props_v2(Compression::UNCOMPRESSED)).unwrap();
     let mut rg = w.next_row_group().unwrap();
     let mut col = rg.next_column().unwrap().unwrap();
     if let ColumnWriter::ByteArrayColumnWriter(ref mut typed) = col.untyped() {

@@ -14,7 +14,10 @@ use ematix_parquet_io::ParquetFile;
 
 /// Reconstruct per-row Vec<Vec<u8>> from (bytes, offsets).
 fn reconstruct(bytes: &[u8], offsets: &[u32]) -> Vec<Vec<u8>> {
-    assert!(!offsets.is_empty(), "offsets must include the trailing total");
+    assert!(
+        !offsets.is_empty(),
+        "offsets must include the trailing total"
+    );
     let mut out = Vec::with_capacity(offsets.len() - 1);
     for w in offsets.windows(2) {
         let s = w[0] as usize;
@@ -30,9 +33,7 @@ fn plain_byte_array_offsets_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.parquet");
 
-    let values: Vec<&[u8]> = vec![
-        b"alpha", b"", b"bravo", b"charlie-delta", b"x", b"yz",
-    ];
+    let values: Vec<&[u8]> = vec![b"alpha", b"", b"bravo", b"charlie-delta", b"x", b"yz"];
     write_byte_array_column_to_path(&path, "v", &values).unwrap();
 
     let file = ParquetFile::open(&path).unwrap();
@@ -131,7 +132,9 @@ fn variable_length_values() {
     let values: Vec<Vec<u8>> = (0..100)
         .map(|i| {
             let len = (i * 17) % 200; // 0..199 byte values
-            (0..len).map(|j| ((i + j) & 0xFF) as u8).collect::<Vec<u8>>()
+            (0..len)
+                .map(|j| ((i + j) & 0xFF) as u8)
+                .collect::<Vec<u8>>()
         })
         .collect();
     let value_refs: Vec<&[u8]> = values.iter().map(|v| v.as_slice()).collect();
@@ -151,13 +154,13 @@ fn variable_length_values() {
 fn round_trip_via_parquet_rs_written_file() {
     // parquet-rs writes a dict-encoded byte_array file; we read it
     // via the offsets API and verify the values reconstruct.
-    use std::sync::Arc;
     use parquet::basic::{Compression, Repetition, Type as PhysicalType};
     use parquet::column::writer::ColumnWriter;
     use parquet::data_type::ByteArray as PqByteArray;
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
     use parquet::schema::types::Type as SchemaType;
+    use std::sync::Arc;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pq_dict.parquet");
@@ -180,8 +183,9 @@ fn round_trip_via_parquet_rs_written_file() {
     );
 
     let palette: [&[u8]; 4] = [b"foo", b"bar", b"baz", b"qux"];
-    let pq_values: Vec<PqByteArray> =
-        (0..2_000).map(|i| PqByteArray::from(palette[i % 4].to_vec())).collect();
+    let pq_values: Vec<PqByteArray> = (0..2_000)
+        .map(|i| PqByteArray::from(palette[i % 4].to_vec()))
+        .collect();
 
     {
         let f = std::fs::File::create(&path).unwrap();

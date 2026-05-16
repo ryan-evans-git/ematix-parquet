@@ -56,9 +56,7 @@ fn byte_array_plain_selectivity_sweep() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ba_plain.parquet");
     // Variable-length: row i = b"v" * (i % 5 + 1).
-    let owned: Vec<Vec<u8>> = (0..2_000)
-        .map(|i| vec![b'v'; i % 5 + 1])
-        .collect();
+    let owned: Vec<Vec<u8>> = (0..2_000).map(|i| vec![b'v'; i % 5 + 1]).collect();
     let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
     write_byte_array_column_to_path(&path, "v", &refs).unwrap();
 
@@ -90,9 +88,7 @@ fn byte_array_dict_selectivity_sweep() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ba_dict.parquet");
     let palette: [&[u8]; 4] = [b"alpha", b"bravo", b"charlie", b"delta"];
-    let owned: Vec<Vec<u8>> = (0..2_000)
-        .map(|i| palette[i % 4].to_vec())
-        .collect();
+    let owned: Vec<Vec<u8>> = (0..2_000).map(|i| palette[i % 4].to_vec()).collect();
     let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
     write_byte_array_column_dict_to_path(&path, "v", &refs, CompressionCodec::Snappy).unwrap();
 
@@ -119,10 +115,7 @@ fn byte_array_dict_selectivity_sweep() {
 // Offsets shape — PLAIN + DICT
 // ============================================================
 
-fn reference_offsets(
-    path: &std::path::Path,
-    mask: &[u8],
-) -> (Vec<u8>, Vec<u32>) {
+fn reference_offsets(path: &std::path::Path, mask: &[u8]) -> (Vec<u8>, Vec<u32>) {
     let f = ParquetFile::open(path).unwrap();
     let (full_bytes, full_offsets) = read_column_byte_array_offsets(&f, 0, 0).unwrap();
     let mut out_bytes = Vec::new();
@@ -159,8 +152,14 @@ fn byte_array_offsets_plain_matches_reference() {
     let mut got_bytes = Vec::new();
     let mut got_offsets = Vec::new();
     read_column_byte_array_offsets_masked_into(
-        &file, 0, 0, &mask, &mut got_bytes, &mut got_offsets,
-    ).unwrap();
+        &file,
+        0,
+        0,
+        &mask,
+        &mut got_bytes,
+        &mut got_offsets,
+    )
+    .unwrap();
 
     assert_eq!(got_bytes, want_bytes);
     assert_eq!(got_offsets, want_offsets);
@@ -171,13 +170,10 @@ fn byte_array_offsets_dict_matches_reference() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ba_off_dict.parquet");
     let palette: [&[u8]; 3] = [b"A", b"BB", b"CCC"];
-    let owned: Vec<Vec<u8>> = (0..1_500)
-        .map(|i| palette[i % 3].to_vec())
-        .collect();
+    let owned: Vec<Vec<u8>> = (0..1_500).map(|i| palette[i % 3].to_vec()).collect();
     let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
-    write_byte_array_column_dict_to_path(
-        &path, "v", &refs, CompressionCodec::Uncompressed,
-    ).unwrap();
+    write_byte_array_column_dict_to_path(&path, "v", &refs, CompressionCodec::Uncompressed)
+        .unwrap();
 
     let mask = stride_mask(owned.len(), 7);
     let (want_bytes, want_offsets) = reference_offsets(&path, &mask);
@@ -186,8 +182,14 @@ fn byte_array_offsets_dict_matches_reference() {
     let mut got_bytes = Vec::new();
     let mut got_offsets = Vec::new();
     read_column_byte_array_offsets_masked_into(
-        &file, 0, 0, &mask, &mut got_bytes, &mut got_offsets,
-    ).unwrap();
+        &file,
+        0,
+        0,
+        &mask,
+        &mut got_bytes,
+        &mut got_offsets,
+    )
+    .unwrap();
 
     assert_eq!(got_bytes, want_bytes);
     assert_eq!(got_offsets, want_offsets);
@@ -231,21 +233,27 @@ fn byte_array_offsets_masked_concatenates_chunks() {
     let mut bytes = Vec::new();
     let mut offsets = Vec::new();
     // Call twice with the same buffers.
-    read_column_byte_array_offsets_masked_into(
-        &file, 0, 0, &mask, &mut bytes, &mut offsets,
-    ).unwrap();
+    read_column_byte_array_offsets_masked_into(&file, 0, 0, &mask, &mut bytes, &mut offsets)
+        .unwrap();
     let after_first_n = offsets.len();
-    read_column_byte_array_offsets_masked_into(
-        &file, 0, 0, &mask, &mut bytes, &mut offsets,
-    ).unwrap();
+    read_column_byte_array_offsets_masked_into(&file, 0, 0, &mask, &mut bytes, &mut offsets)
+        .unwrap();
 
-    assert_eq!(offsets.len(), 2 * after_first_n - 1, "second call appends N-1 new offsets onto existing N (no re-push of leading 0)");
+    assert_eq!(
+        offsets.len(),
+        2 * after_first_n - 1,
+        "second call appends N-1 new offsets onto existing N (no re-push of leading 0)"
+    );
     // Offsets must be monotonically non-decreasing.
     for w in offsets.windows(2) {
         assert!(w[1] >= w[0], "offsets must be monotonically non-decreasing");
     }
     let final_off = *offsets.last().unwrap() as usize;
-    assert_eq!(bytes.len(), final_off, "bytes.len() must equal final offset");
+    assert_eq!(
+        bytes.len(),
+        final_off,
+        "bytes.len() must equal final offset"
+    );
 }
 
 // ============================================================
@@ -284,9 +292,8 @@ fn byte_array_offsets_empty_mask_initial_zero_only() {
     let mask = empty_mask(500);
     let mut bytes = Vec::new();
     let mut offsets = Vec::new();
-    read_column_byte_array_offsets_masked_into(
-        &file, 0, 0, &mask, &mut bytes, &mut offsets,
-    ).unwrap();
+    read_column_byte_array_offsets_masked_into(&file, 0, 0, &mask, &mut bytes, &mut offsets)
+        .unwrap();
     assert!(bytes.is_empty());
     assert_eq!(offsets, vec![0u32], "empty mask: only the initial 0 offset");
 }

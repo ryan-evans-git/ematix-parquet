@@ -21,10 +21,7 @@ fn bit_width_zero_yields_all_zeros() {
     // bit_width=0 → the byte stream is irrelevant; spec says every
     // value is 0.
     let bytes = [];
-    assert_eq!(
-        decode_rle_bit_packed(&bytes, 0, 5).unwrap(),
-        vec![0u64; 5]
-    );
+    assert_eq!(decode_rle_bit_packed(&bytes, 0, 5).unwrap(), vec![0u64; 5]);
 }
 
 #[test]
@@ -33,10 +30,7 @@ fn rle_run_bit_width_8() {
     //   header: uvarint(5 << 1) = uvarint(10) = 0x0A
     //   value:  42 = 0x2A, single byte LE
     let bytes = [0x0A, 0x2A];
-    assert_eq!(
-        decode_rle_bit_packed(&bytes, 8, 5).unwrap(),
-        vec![42u64; 5]
-    );
+    assert_eq!(decode_rle_bit_packed(&bytes, 8, 5).unwrap(), vec![42u64; 5]);
 }
 
 #[test]

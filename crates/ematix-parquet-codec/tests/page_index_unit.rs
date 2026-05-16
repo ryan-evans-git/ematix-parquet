@@ -5,7 +5,9 @@
 //! (i32 → 4 LE bytes, i64 → 8 LE bytes). For each page, the predicate
 //! is "page [min,max] overlaps user [lo,hi]".
 
-use ematix_parquet_codec::page_index::{select_pages_overlapping_i32, select_pages_overlapping_i64};
+use ematix_parquet_codec::page_index::{
+    select_pages_overlapping_i32, select_pages_overlapping_i64,
+};
 use ematix_parquet_format::metadata::ColumnIndex;
 use ematix_parquet_format::types::BoundaryOrder;
 
@@ -23,8 +25,14 @@ fn i32_selects_only_overlapping_pages() {
     //   page 1: [100, 199]
     //   page 2: [200, 299]
     //   page 3: [300, 399]
-    let mins: Vec<Vec<u8>> = [0i32, 100, 200, 300].iter().map(|v| i32_bytes(*v)).collect();
-    let maxs: Vec<Vec<u8>> = [99i32, 199, 299, 399].iter().map(|v| i32_bytes(*v)).collect();
+    let mins: Vec<Vec<u8>> = [0i32, 100, 200, 300]
+        .iter()
+        .map(|v| i32_bytes(*v))
+        .collect();
+    let maxs: Vec<Vec<u8>> = [99i32, 199, 299, 399]
+        .iter()
+        .map(|v| i32_bytes(*v))
+        .collect();
     let idx = ColumnIndex {
         null_pages: vec![false; 4],
         min_values: mins.iter().map(|v| v.as_slice()).collect(),
@@ -79,13 +87,25 @@ fn i32_boundary_edges_are_inclusive() {
         null_counts: None,
     };
     // lo touches max
-    assert_eq!(select_pages_overlapping_i32(&idx, 200, 999).unwrap(), vec![true]);
+    assert_eq!(
+        select_pages_overlapping_i32(&idx, 200, 999).unwrap(),
+        vec![true]
+    );
     // hi touches min
-    assert_eq!(select_pages_overlapping_i32(&idx, -10, 100).unwrap(), vec![true]);
+    assert_eq!(
+        select_pages_overlapping_i32(&idx, -10, 100).unwrap(),
+        vec![true]
+    );
     // strictly above
-    assert_eq!(select_pages_overlapping_i32(&idx, 201, 999).unwrap(), vec![false]);
+    assert_eq!(
+        select_pages_overlapping_i32(&idx, 201, 999).unwrap(),
+        vec![false]
+    );
     // strictly below
-    assert_eq!(select_pages_overlapping_i32(&idx, -10, 99).unwrap(), vec![false]);
+    assert_eq!(
+        select_pages_overlapping_i32(&idx, -10, 99).unwrap(),
+        vec![false]
+    );
 }
 
 #[test]

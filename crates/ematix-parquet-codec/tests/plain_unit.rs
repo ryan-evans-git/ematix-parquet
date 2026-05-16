@@ -29,10 +29,7 @@ fn decode_plain_i64_three_values_known_le_bytes() {
     bytes.extend_from_slice(&1i64.to_le_bytes());
     bytes.extend_from_slice(&(-1i64).to_le_bytes());
     bytes.extend_from_slice(&i64::MAX.to_le_bytes());
-    assert_eq!(
-        decode_plain_i64(&bytes).unwrap(),
-        vec![1i64, -1, i64::MAX]
-    );
+    assert_eq!(decode_plain_i64(&bytes).unwrap(), vec![1i64, -1, i64::MAX]);
 }
 
 #[test]
@@ -135,7 +132,10 @@ fn decode_plain_f64_known_values() {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
     let got = decode_plain_f64(&bytes).unwrap();
-    assert_eq!(got, vec![0.0, 0.10000000000000001, -1.234e-10, f64::INFINITY]);
+    assert_eq!(
+        got,
+        vec![0.0, 0.10000000000000001, -1.234e-10, f64::INFINITY]
+    );
 }
 
 #[test]

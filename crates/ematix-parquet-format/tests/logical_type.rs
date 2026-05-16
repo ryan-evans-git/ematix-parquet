@@ -66,7 +66,10 @@ fn edge_interpolation_algorithm_variants() {
     ] {
         let bytes = zz(v);
         let mut cur = Cursor::new(&bytes);
-        assert_eq!(EdgeInterpolationAlgorithm::read(&mut cur).unwrap(), expected);
+        assert_eq!(
+            EdgeInterpolationAlgorithm::read(&mut cur).unwrap(),
+            expected
+        );
     }
 }
 
@@ -74,7 +77,9 @@ fn edge_interpolation_algorithm_variants() {
 
 fn make_union(variant_id: i16) -> Vec<u8> {
     let inner = CompactBuilder::empty_struct();
-    CompactBuilder::new().struct_field(variant_id, &inner).stop()
+    CompactBuilder::new()
+        .struct_field(variant_id, &inner)
+        .stop()
 }
 
 #[test]

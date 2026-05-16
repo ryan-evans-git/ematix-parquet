@@ -167,8 +167,7 @@ fn multi_row_group_each_rg_streams_independently() {
     let path = dir.path().join("multi_rg.parquet");
     let values: Vec<i64> = (0..3_000i64).collect();
     let cols = vec![("v", ColumnData::I64(&values))];
-    write_table_to_path_with_row_group_size(&path, &cols, CompressionCodec::Snappy, 1_000)
-        .unwrap();
+    write_table_to_path_with_row_group_size(&path, &cols, CompressionCodec::Snappy, 1_000).unwrap();
 
     let file = ParquetFile::open(&path).unwrap();
     let md = file.metadata().unwrap();

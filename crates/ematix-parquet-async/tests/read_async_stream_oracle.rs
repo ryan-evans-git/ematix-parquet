@@ -66,8 +66,13 @@ async fn i64_stream_dict_concat_matches_async() {
     let full = read_column_i64_async(&aps, 0, 0).await.unwrap();
 
     let stream = read_column_i64_async_stream(&aps, 0, 0, 256);
-    let flat: Vec<i64> = stream.try_collect::<Vec<Vec<i64>>>().await.unwrap()
-        .into_iter().flatten().collect();
+    let flat: Vec<i64> = stream
+        .try_collect::<Vec<Vec<i64>>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect();
     assert_eq!(flat, full);
 }
 
@@ -83,8 +88,13 @@ async fn i32_stream_works() {
         .unwrap();
     let full = read_column_i32_async(&aps, 0, 0).await.unwrap();
     let stream = read_column_i32_async_stream(&aps, 0, 0, 333);
-    let flat: Vec<i32> = stream.try_collect::<Vec<Vec<i32>>>().await.unwrap()
-        .into_iter().flatten().collect();
+    let flat: Vec<i32> = stream
+        .try_collect::<Vec<Vec<i32>>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect();
     assert_eq!(flat, full);
 }
 
@@ -100,8 +110,13 @@ async fn f64_stream_works() {
         .unwrap();
     let full = read_column_f64_async(&aps, 0, 0).await.unwrap();
     let stream = read_column_f64_async_stream(&aps, 0, 0, 500);
-    let flat: Vec<f64> = stream.try_collect::<Vec<Vec<f64>>>().await.unwrap()
-        .into_iter().flatten().collect();
+    let flat: Vec<f64> = stream
+        .try_collect::<Vec<Vec<f64>>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect();
     assert_eq!(flat, full);
 }
 

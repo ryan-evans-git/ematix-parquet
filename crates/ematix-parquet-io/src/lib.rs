@@ -8,9 +8,9 @@
 //!   - A `PageWalker` that turns column-chunk bytes into an iterator
 //!     of `(PageHeader, body_slice)` pairs
 
+pub mod error;
 pub mod file;
 pub mod pages;
-pub mod error;
 
 pub use error::{IoError, Result};
 pub use file::ParquetFile;

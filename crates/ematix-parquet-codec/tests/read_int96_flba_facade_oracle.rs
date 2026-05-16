@@ -109,7 +109,13 @@ fn flba_facade_round_trip_decimal_width() {
 
     let values: Vec<FixedLenByteArray> = (0u8..40)
         .map(|i| {
-            let buf = [i, i.wrapping_add(1), i.wrapping_add(2), i.wrapping_add(3), i.wrapping_add(4)];
+            let buf = [
+                i,
+                i.wrapping_add(1),
+                i.wrapping_add(2),
+                i.wrapping_add(3),
+                i.wrapping_add(4),
+            ];
             FixedLenByteArray::from(ByteArray::from(buf.to_vec()))
         })
         .collect();

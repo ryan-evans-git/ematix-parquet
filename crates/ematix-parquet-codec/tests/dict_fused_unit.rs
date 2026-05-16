@@ -41,7 +41,16 @@ fn bit_packed_run_bit_width_3() {
 fn mixed_rle_and_bit_packed() {
     // bit_width=3, [3-zero RLE run][bit-packed [0..7]] = 11 values total
     let body = [0x03u8, 0x06, 0x00, 0x03, 0x88, 0xC6, 0xFA];
-    let dict = [1_000_000i32, 2_000_000, 3_000_000, 4_000_000, 5_000_000, 6_000_000, 7_000_000, 8_000_000];
+    let dict = [
+        1_000_000i32,
+        2_000_000,
+        3_000_000,
+        4_000_000,
+        5_000_000,
+        6_000_000,
+        7_000_000,
+        8_000_000,
+    ];
     check(&body, &dict, 11);
 }
 

@@ -21,13 +21,12 @@ use std::time::{Duration, Instant};
 
 use ematix_parquet_codec::compression::decompress_snappy_into;
 use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_into};
-use ematix_parquet_codec::read::{
-    read_column_byte_array_offsets, read_column_byte_array_offsets_into,
-    read_column_i64_into,
-};
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_byte_array_n, decode_plain_f64, decode_plain_i32,
     decode_plain_i64,
+};
+use ematix_parquet_codec::read::{
+    read_column_byte_array_offsets, read_column_byte_array_offsets_into, read_column_i64_into,
 };
 use ematix_parquet_format::types::Encoding;
 use ematix_parquet_io::{PageWalker, ParquetFile};
@@ -361,9 +360,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!(
-        "== ematix-parquet vs parquet-rs vs polars ({WARMUPS} warmups + {ITERS} iters) =="
-    );
+    println!("== ematix-parquet vs parquet-rs vs polars ({WARMUPS} warmups + {ITERS} iters) ==");
     println!("data: {}\n", path.display());
 
     println!("l_orderkey  INT64  (dict + plain mix, 1,048,576 values)");
@@ -400,7 +397,9 @@ fn main() {
 
     println!("l_returnflag  BYTE_ARRAY  (3 distinct, all dict, 1,048,576 values)");
     let (o_med, _, _) = bench("ours", || ours_decode_byte_array(&path, 8));
-    let (off_med, _, _) = bench("ours (offsets API)", || ours_decode_byte_array_offsets(&path, 8));
+    let (off_med, _, _) = bench("ours (offsets API)", || {
+        ours_decode_byte_array_offsets(&path, 8)
+    });
     // _into variant: reuse bytes + offsets buffers across iterations.
     let rf_file = ParquetFile::open(&path).unwrap();
     let mut rf_bytes: Vec<u8> = Vec::new();
@@ -410,7 +409,9 @@ fn main() {
             .unwrap();
     });
     let (pr_med, _, _) = bench("parquet-rs", || pr_decode_byte_array(&path, 8));
-    let (po_med, _, _) = bench("polars (eager)", || polars_decode_byte_array(&path, "l_returnflag"));
+    let (po_med, _, _) = bench("polars (eager)", || {
+        polars_decode_byte_array(&path, "l_returnflag")
+    });
     compare("ours          vs parquet-rs", o_med, pr_med);
     compare("ours offsets  vs parquet-rs", off_med, pr_med);
     compare("ours off _into vs parquet-rs", offi_med, pr_med);

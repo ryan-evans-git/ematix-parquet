@@ -627,6 +627,208 @@ pub fn read_column_byte_array_dict_preserved_into(
     Ok(())
 }
 
+// ============================================================
+// Π.14e — adaptive-dispatch read façade
+// ============================================================
+//
+// `read_column_*_predicate_adaptive(file, rg, col, predicate, opts,
+//  telemetry)` opens the chunk, decompresses every page, hands the
+// page bodies + the dict + a mask built from `predicate` to the
+// `adaptive::run_adaptive_dict_chunk` runner. The runner probes the
+// first `opts.probe_pages` pages with the fused kernel; if observed
+// selectivity > `opts.threshold` it commits to materialised values
+// for the whole chunk, otherwise it stays on the fused bitmap.
+//
+// `predicate` is applied to dict entries (not row values), so it
+// runs at most `dict.len()` times per chunk — typically 1-3K
+// for analytic columns.
+//
+// **Dict-only.** These entry points require the column to be
+// dict-encoded across every data page. Chunks with PLAIN-encoded
+// data pages return `InvalidInput` — callers should fall back to
+// `read_column_*_masked_into` for those.
+
+use crate::adaptive::{
+    run_adaptive_dict_chunk, AdaptiveChunkOutput, AdaptiveDictPredicate, AdaptiveDispatchOptions,
+    AdaptivePageInput, SelectivityProbe,
+};
+use crate::dict::build_dict_predicate_mask;
+
+/// Pull the chunk's dict + every decompressed data-page body into
+/// owned buffers, in order. Returns `(dict, pages, bit_width)`.
+///
+/// All pages must be dict-encoded — `PLAIN` data pages return
+/// `InvalidInput`. The runner needs every body live at once so it
+/// can re-decode the probed pages on a `Materialized` dispatch.
+fn pull_dict_chunk<T, F>(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    decode_dict_plain: F,
+) -> Result<(Vec<T>, Vec<(usize, Vec<u8>)>, u8)>
+where
+    F: Fn(&[u8]) -> Result<Vec<T>>,
+{
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut dict_decoded: Option<Vec<T>> = None;
+    let mut pages: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut rows_collected: usize = 0;
+    let mut bit_width: u8 = 0;
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                let mut decomp = Vec::new();
+                decompress_into(codec, body, &mut decomp)?;
+                dict_decoded = Some(decode_dict_plain(&decomp)?);
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                if dict_decoded.is_none() {
+                    return Err(CodecError::InvalidInput(
+                        "adaptive read: data page before dictionary (column has no DictionaryPage)"
+                            .into(),
+                    ));
+                }
+                let mut owned = Vec::new();
+                let info = data_page_view(&hdr, body, codec, &mut owned)?;
+                match info.encoding {
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {}
+                    Encoding::Plain => {
+                        return Err(CodecError::InvalidInput(
+                            "adaptive read: data page is PLAIN-encoded (writer fell back from dict — use read_column_*_masked_into instead)".into(),
+                        ));
+                    }
+                    other => {
+                        return Err(CodecError::Unsupported(format!(
+                            "adaptive read: data page encoding not supported: {other:?}"
+                        )));
+                    }
+                }
+                debug_assert!(!info.values.is_empty(), "dict-encoded page body empty");
+                if bit_width == 0 {
+                    bit_width = info.values[0];
+                }
+                // info.values borrows from `owned` (V1) or `body` (V2).
+                // Promote to a standalone owned Vec so the runner can
+                // hold every page body live simultaneously.
+                pages.push((info.num_values, info.values.to_vec()));
+                rows_collected += info.num_values;
+            }
+            PageType::IndexPage => {}
+        }
+        if rows_collected >= total_values {
+            break;
+        }
+    }
+
+    let dict = dict_decoded.ok_or_else(|| {
+        CodecError::InvalidInput("adaptive read: column chunk has no DictionaryPage".into())
+    })?;
+    Ok((dict, pages, bit_width))
+}
+
+fn run_facade<T: Copy, F, P>(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    predicate: P,
+    opts: AdaptiveDispatchOptions,
+    telemetry: Option<&mut dyn FnMut(SelectivityProbe)>,
+    decode_dict_plain: F,
+) -> Result<AdaptiveChunkOutput<T>>
+where
+    F: Fn(&[u8]) -> Result<Vec<T>>,
+    P: Fn(&T) -> bool,
+{
+    let (dict, pages, bit_width) = pull_dict_chunk(file, row_group, column, decode_dict_plain)?;
+    let dict_mask = build_dict_predicate_mask(&dict, bit_width, predicate)?;
+    let cfg = AdaptiveDictPredicate {
+        dict_mask,
+        threshold: opts.threshold,
+        probe_pages: opts.probe_pages,
+    };
+    let inputs: Vec<AdaptivePageInput<'_>> = pages
+        .iter()
+        .map(|(n, b)| AdaptivePageInput {
+            body: b.as_slice(),
+            num_values: *n,
+        })
+        .collect();
+    run_adaptive_dict_chunk::<T>(&inputs, &dict, &cfg, telemetry)
+}
+
+/// Adaptive predicate dispatch for an INT32 column.
+///
+/// Probes the first `opts.probe_pages` pages with the fused
+/// `decode_rle_dictionary_predicate_bitmap` kernel; if observed
+/// selectivity > `opts.threshold` returns
+/// `AdaptiveOutputKind::Values(Vec<i32>)`, else returns
+/// `AdaptiveOutputKind::Bitmap { bitmap, set_bits }`.
+///
+/// `telemetry`, if `Some`, is called once with the per-chunk
+/// `SelectivityProbe` summarising the dispatch decision.
+pub fn read_column_i32_predicate_adaptive<P: Fn(&i32) -> bool>(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    predicate: P,
+    opts: AdaptiveDispatchOptions,
+    telemetry: Option<&mut dyn FnMut(SelectivityProbe)>,
+) -> Result<AdaptiveChunkOutput<i32>> {
+    run_facade::<i32, _, _>(
+        file,
+        row_group,
+        column,
+        predicate,
+        opts,
+        telemetry,
+        decode_plain_i32,
+    )
+}
+
+/// Adaptive predicate dispatch for an INT64 column. See
+/// `read_column_i32_predicate_adaptive` for the full contract.
+pub fn read_column_i64_predicate_adaptive<P: Fn(&i64) -> bool>(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    predicate: P,
+    opts: AdaptiveDispatchOptions,
+    telemetry: Option<&mut dyn FnMut(SelectivityProbe)>,
+) -> Result<AdaptiveChunkOutput<i64>> {
+    run_facade::<i64, _, _>(
+        file,
+        row_group,
+        column,
+        predicate,
+        opts,
+        telemetry,
+        decode_plain_i64,
+    )
+}
+
+/// Adaptive predicate dispatch for a DOUBLE column. See
+/// `read_column_i32_predicate_adaptive` for the full contract.
+pub fn read_column_f64_predicate_adaptive<P: Fn(&f64) -> bool>(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    predicate: P,
+    opts: AdaptiveDispatchOptions,
+    telemetry: Option<&mut dyn FnMut(SelectivityProbe)>,
+) -> Result<AdaptiveChunkOutput<f64>> {
+    run_facade::<f64, _, _>(
+        file,
+        row_group,
+        column,
+        predicate,
+        opts,
+        telemetry,
+        decode_plain_f64,
+    )
+}
+
 /// Read a BYTE_ARRAY column into Arrow-style flat bytes + offsets.
 ///
 /// Returns `(values, offsets)` where row `i` is the byte slice

@@ -155,6 +155,25 @@ impl AdaptiveDictPredicate {
     }
 }
 
+/// Caller-facing config for the per-type adaptive façade entry
+/// points (`read_column_*_predicate_adaptive`). Mirrors the
+/// runtime knobs on `AdaptiveDictPredicate` minus the `dict_mask`
+/// (which the façade builds from the caller's predicate).
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveDispatchOptions {
+    pub threshold: f32,
+    pub probe_pages: usize,
+}
+
+impl Default for AdaptiveDispatchOptions {
+    fn default() -> Self {
+        Self {
+            threshold: AdaptiveDictPredicate::DEFAULT_THRESHOLD,
+            probe_pages: AdaptiveDictPredicate::DEFAULT_PROBE_PAGES,
+        }
+    }
+}
+
 /// Count the set bits in the first `num_bits` of a packed bitmap.
 /// Bits at indices `≥ num_bits` within the final byte are ignored
 /// even if non-zero (the fused kernel doesn't guarantee they're

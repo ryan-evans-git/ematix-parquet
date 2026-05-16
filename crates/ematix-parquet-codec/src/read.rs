@@ -878,3 +878,220 @@ fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> R
 fn io_to_codec(e: ematix_parquet_io::IoError) -> CodecError {
     CodecError::InvalidInput(format!("io: {e}"))
 }
+
+// ============================================================
+// Π.9c — Streaming / batched decode API
+// ============================================================
+//
+// `ColumnBatchIter<T, F>` walks a column chunk page-by-page and
+// yields `Vec<T>` batches of (mostly) `batch_size` rows. Lets ematix-
+// flow pipeline (decode batch N+1 while the engine consumes batch N)
+// and bounds working-set memory for huge row groups.
+//
+// Memory shape: the chunk's compressed bytes live for the lifetime of
+// the iterator (single allocation). Decoded values land in `carry`,
+// which holds at most `max(batch_size, page_values)` between emits —
+// the upper bound is one page's worth + the batch, since we decode a
+// page at a time and emit `batch_size` slices from it. For typical
+// parquet pages (~20K values) and batch_size in the 1K–64K range,
+// this is near-optimal.
+//
+// Dispatch matches `decode_chunk_into`: PLAIN data pages decode via
+// the per-type `decode_plain` callback; dict pages build the chunk's
+// dictionary; RLE_DICTIONARY data pages call `decode_rle_dictionary_into`.
+
+/// Iterator yielding `Vec<T>` batches from a single column chunk.
+/// Constructed via `read_column_*_batches` helpers below.
+pub struct ColumnBatchIter<T: Copy, F: Fn(&[u8]) -> Result<Vec<T>>> {
+    chunk_bytes: Vec<u8>,
+    walker_pos: usize,
+    codec: CompressionCodec,
+    total_values: usize,
+    emitted_to_carry: usize,
+    batch_size: usize,
+    dict: Vec<T>,
+    decomp: Vec<u8>,
+    carry: Vec<T>,
+    carry_pos: usize,
+    decode_plain: F,
+    finished: bool,
+}
+
+impl<T: Copy, F: Fn(&[u8]) -> Result<Vec<T>>> ColumnBatchIter<T, F> {
+    /// Pull and decode exactly one page from the chunk, appending
+    /// the decoded values to `carry`. Returns `Ok(true)` if a page
+    /// was consumed, `Ok(false)` if the chunk is exhausted.
+    fn fill_one_page(&mut self) -> Result<bool> {
+        if self.emitted_to_carry >= self.total_values {
+            return Ok(false);
+        }
+        let mut walker = PageWalker::new(&self.chunk_bytes[self.walker_pos..]);
+        loop {
+            let pair = walker.next_page().map_err(io_to_codec)?;
+            let (hdr, body) = match pair {
+                Some(p) => p,
+                None => {
+                    self.walker_pos = self.chunk_bytes.len();
+                    return Ok(false);
+                }
+            };
+            let consumed = walker.position();
+            self.walker_pos += consumed;
+
+            match hdr.page_type {
+                PageType::DictionaryPage => {
+                    decompress_into(self.codec, body, &mut self.decomp)?;
+                    self.dict = (self.decode_plain)(&self.decomp)?;
+                    // Loop to find a data page.
+                    walker = PageWalker::new(&self.chunk_bytes[self.walker_pos..]);
+                    continue;
+                }
+                PageType::DataPage | PageType::DataPageV2 => {
+                    let info = data_page_view(&hdr, body, self.codec, &mut self.decomp)?;
+                    let before = self.carry.len();
+                    match info.encoding {
+                        Encoding::Plain => {
+                            self.carry.extend((self.decode_plain)(info.values)?);
+                        }
+                        Encoding::RleDictionary | Encoding::PlainDictionary => {
+                            if self.dict.is_empty() {
+                                return Err(CodecError::InvalidInput(
+                                    "dict-encoded data page before dictionary".into(),
+                                ));
+                            }
+                            decode_rle_dictionary_into(
+                                info.values,
+                                &self.dict,
+                                info.num_values,
+                                &mut self.carry,
+                            )?;
+                        }
+                        other => {
+                            return Err(CodecError::Unsupported(format!(
+                                "encoding not yet dispatched by façade: {other:?}"
+                            )));
+                        }
+                    }
+                    let added = self.carry.len() - before;
+                    self.emitted_to_carry += added;
+                    return Ok(true);
+                }
+                PageType::IndexPage => {
+                    walker = PageWalker::new(&self.chunk_bytes[self.walker_pos..]);
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn drain_one_batch(&mut self) -> Option<Result<Vec<T>>> {
+        if self.finished {
+            return None;
+        }
+        // Pull pages until we have enough for a batch, or the chunk is
+        // exhausted.
+        while self.carry.len() - self.carry_pos < self.batch_size
+            && self.emitted_to_carry < self.total_values
+        {
+            match self.fill_one_page() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    self.finished = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+        let available = self.carry.len() - self.carry_pos;
+        if available == 0 {
+            self.finished = true;
+            return None;
+        }
+        let n = available.min(self.batch_size);
+        let batch = self.carry[self.carry_pos..self.carry_pos + n].to_vec();
+        self.carry_pos += n;
+        // Compact when fully drained to keep memory bounded.
+        if self.carry_pos == self.carry.len() {
+            self.carry.clear();
+            self.carry_pos = 0;
+        }
+        Some(Ok(batch))
+    }
+}
+
+impl<T: Copy, F: Fn(&[u8]) -> Result<Vec<T>>> Iterator for ColumnBatchIter<T, F> {
+    type Item = Result<Vec<T>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.drain_one_batch()
+    }
+}
+
+fn batch_iter_new<T: Copy, F: Fn(&[u8]) -> Result<Vec<T>>>(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    batch_size: usize,
+    decode_plain: F,
+) -> Result<ColumnBatchIter<T, F>> {
+    if batch_size == 0 {
+        return Err(CodecError::InvalidInput("batch_size must be > 0".into()));
+    }
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    Ok(ColumnBatchIter {
+        chunk_bytes,
+        walker_pos: 0,
+        codec,
+        total_values,
+        emitted_to_carry: 0,
+        batch_size,
+        dict: Vec::new(),
+        decomp: Vec::new(),
+        carry: Vec::with_capacity(batch_size),
+        carry_pos: 0,
+        decode_plain,
+        finished: false,
+    })
+}
+
+/// Stream INT64 batches of (mostly) `batch_size` rows from a column
+/// chunk. The final batch may be shorter.
+pub fn read_column_i64_batches(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    batch_size: usize,
+) -> Result<ColumnBatchIter<i64, impl Fn(&[u8]) -> Result<Vec<i64>>>> {
+    batch_iter_new(file, row_group, column, batch_size, |bytes| {
+        decode_plain_i64(bytes)
+    })
+}
+
+/// Stream INT32 batches.
+pub fn read_column_i32_batches(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    batch_size: usize,
+) -> Result<ColumnBatchIter<i32, impl Fn(&[u8]) -> Result<Vec<i32>>>> {
+    batch_iter_new(file, row_group, column, batch_size, |bytes| {
+        decode_plain_i32(bytes)
+    })
+}
+
+/// Stream DOUBLE batches.
+pub fn read_column_f64_batches(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    batch_size: usize,
+) -> Result<ColumnBatchIter<f64, impl Fn(&[u8]) -> Result<Vec<f64>>>> {
+    batch_iter_new(file, row_group, column, batch_size, |bytes| {
+        decode_plain_f64(bytes)
+    })
+}
+
+// Note: BYTE_ARRAY batched API is not provided in this iteration.
+// `Vec<u8>` is not `Copy`, and the dict-encoded path needs a separate
+// index-then-gather-then-clone strategy. Callers needing chunked
+// byte_array can use `read_column_byte_array_offsets_into` with their
+// own slicing for now.

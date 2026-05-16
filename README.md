@@ -160,6 +160,31 @@ caller's preference (typically Arrow's RecordBatch size). Lets
 the engine pipeline (process batch N while we decode batch N+1)
 and bounds working-set memory for huge row groups.
 
+**Async / object-store integration** (v0.4) — the `ematix-parquet-
+async` crate exposes `AsyncParquetFile` over any
+`object_store::ObjectStore` (S3, GCS, Azure, HTTP, local FS,
+in-memory). Cold-open issues ≤ 2 round trips via the
+`Range: bytes=-8192` footer trick. Per-column reads issue one GET
+per chunk. Mirror of every sync read façade entry point with an
+`_async` suffix plus `_async_stream` returning
+`Stream<Item = Result<Vec<T>>>`.
+
+```rust
+use std::sync::Arc;
+use object_store::local::LocalFileSystem;
+use ematix_parquet_async::{AsyncParquetFile, read_column_i64_async};
+
+let store = Arc::new(LocalFileSystem::new());
+let file = AsyncParquetFile::open(store, "data.parquet".into()).await?;
+let values: Vec<i64> = read_column_i64_async(&file, 0, 0).await?;
+```
+
+Codec-layer overhead vs sync (local FS): ~9% on a 1M-row
+dict-encoded i64 column. The cost is `object_store` abstraction
++ `tokio::spawn_blocking`; for cloud workloads (where network
+latency dwarfs this) it's noise. For raw-throughput local-file
+reads, the sync crate stays the faster path.
+
 **Late-materialization read façade** (v0.3) — after a filter pass
 produces a packed mask, decode only the matching rows instead of
 full-decode-then-filter. Available for scalar types and byte_array
@@ -231,17 +256,20 @@ just Q14 — but Q14 is what we've benchmarked end-to-end so far.
 
 ## Crate layout
 
-Three crates with sharp boundaries:
+Four crates with sharp boundaries:
 
 | Crate                    | Purpose                                                |
 | ------------------------ | ------------------------------------------------------ |
 | `ematix-parquet-format`  | Thrift compact-protocol reader + writer + Parquet metadata types |
 | `ematix-parquet-io`      | File / page-header reading on top of `std::io::Read`   |
 | `ematix-parquet-codec`   | Column decoders + encoders, bit-unpackers, compression, NEON kernels, high-level read/write façades |
+| `ematix-parquet-async`   | Async read façade over any `object_store::ObjectStore` — S3, GCS, Azure, local FS, in-memory |
 
 `format` has no deps beyond `std`. `io` depends on `format`. `codec`
 depends on both — its low-level decoders are byte-slice based and
 don't pull in `io`, but the high-level read/write façades do.
+`async` depends on all three plus `tokio` + `object_store`; the
+sync stack stays dep-free for callers who don't need cloud storage.
 
 ## Using it
 

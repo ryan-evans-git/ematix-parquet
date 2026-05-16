@@ -37,12 +37,12 @@ Every release is reproducible from `main` at the tagged commit.
    ```
 
    The `release.yml` workflow fires on the tag push and publishes
-   the three crates to crates.io in dependency order
-   (`format → io → codec`), with a 45 s sleep between publishes
-   so crates.io's index propagates.
+   the four crates to crates.io in dependency order
+   (`format → io → codec → async`), with a 45 s sleep between
+   publishes so crates.io's index propagates.
 
 6. **Verify.** After ~5 min check the workflow run and confirm
-   all three crates show the new version on crates.io. If a
+   all four crates show the new version on crates.io. If a
    publish fails midway, the workflow's order means the failed
    crate and everything downstream of it didn't ship — fix the
    issue, bump the patch version, and re-cut.

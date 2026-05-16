@@ -13,8 +13,8 @@ Tracks the work between v0.1.1 and v2.0. Phases use the existing `Π.N` conventi
 | Π.7   | BYTE_STREAM_SPLIT + first NEON wave (bw=14, gather opt, bw=17 lookup) | ✓ Done   |
 | Π.8   | Performance polish: byte_array zero-copy, more NEON widths, RLE coalesce | ✓ Done |
 | Π.9   | Photon-inspired: decode-into-buffer, predicate fusion, batched API   | ✓ Done   |
-| Π.10  | Late-materialization read façade (`read_column_*_masked_into`)       | Active (a, b, c shipped — codec side)  |
-| Π.11  | Async / object-store integration (S3 / GCS / Azure)                  | Planned  |
+| Π.10  | Late-materialization read façade (`read_column_*_masked_into`)       | ✓ Done (codec; engine in ematix-flow)  |
+| Π.11  | Async / object-store integration (S3 / GCS / Azure)                  | ✓ Done (a–d, f; e deferred to v0.4.1) |
 | Π.12  | x86 SIMD parity (AVX2 / AVX-512 kernels mirroring NEON)              | Planned  |
 | Π.13  | Parquet Modular Encryption (read + write)                            | Planned  |
 | Π.14  | Adaptive runtime dispatch on observed selectivity                    | Planned  |
@@ -599,41 +599,77 @@ codec-layer wins; the larger Q14 wins live at the engine layer
 
 ---
 
-## Π.11 — Async / object-store integration (planned)
+## Π.11 — Async / object-store integration ✓ DONE
 
-**Goal.** Real workloads land on S3 / GCS / Azure, not local disk.
-The current `ematix-parquet-io` is sync `std::io::Read`; for cloud
-object stores we want async, range-aware fetches that can pipeline
-metadata loads, dictionary fetches, and data-page reads without
-blocking a worker thread.
+Ships as **v0.4.0**. New crate `ematix-parquet-async` exposes
+`AsyncParquetFile` over any `object_store::ObjectStore` plus
+async siblings for every scalar + byte_array read façade entry
+point, including streaming `Stream<Item = Result<Vec<T>>>`.
 
-**Touches.**
-- New crate `ematix-parquet-io-async` (or feature flag on `io`)
-  exposing `AsyncParquetFile` over `tokio::io::AsyncRead +
-  AsyncSeek`, with an `object_store::ObjectStore` blanket impl.
-- Async page walker that issues coalesced range reads (footer +
-  dictionary + N data pages in 1-2 round trips).
-- Read façade `read_column_*_async` mirror.
-- Prefetch hint API: caller indicates batch ahead-of-time so the
-  walker pipelines.
+Sync `ematix-parquet-io` is unchanged and dep-free. The async
+crate isolates tokio + object_store.
 
-**Acceptance.**
-1. `AsyncParquetFile::open(object_store, "s3://bucket/key.parquet")`
-   reads footer + dict + first data page in ≤ 2 GET requests.
-2. `read_column_i64_async` decodes a TPC-H lineitem column from S3
-   at ≥ 70% of the local-disk throughput (network-bound, not
-   parser-bound).
-3. Sync API unchanged — async is purely additive.
-4. Oracle: cross-check async reads against sync reads on the same
-   file (LocalFileSystem `ObjectStore`), value-by-value.
+Full design in `docs/plans/PI-11-async-design.md`.
 
-**Estimate.** 2-3 weeks. Async is intrusive but well-trodden — the
-`object_store` crate is the rallying point; we wrap it.
+### Π.11a — AsyncParquetFile primitive ✓ DONE
 
-**Why first.** Top consumer ask. Real analytical workloads run on
-object storage; local-disk is the development convenience. Until
-this lands, ematix-parquet can't be drop-in for cloud workloads
-even if its codec is faster.
+- `crates/ematix-parquet-async/src/file.rs`: `AsyncParquetFile`
+  with `open`, `metadata()`, `read_range()`. Cold-open via the
+  suffix-range trick (≤ 2 round trips); per-call `read_range`
+  issues one GET, returns `bytes::Bytes` zero-copy where the
+  store supports it.
+- Pinned to `object_store 0.11`; bump-and-fix chore every 6-12
+  months. Re-exports the `ObjectStore` trait so consumers don't
+  double-import.
+- 7 oracle tests + 1 doc-test against the `LocalFileSystem`
+  ObjectStore for parity with sync `ParquetFile`.
+
+### Π.11b — Async façade for scalar types ✓ DONE
+
+- `crates/ematix-parquet-async/src/read.rs`:
+  `read_column_{i32,i64,f64}_async{,_into}` — six entries.
+- Internal `decode_chunk_into` mirrors the codec's sync chunk-
+  walker. Async surface is one `.await` per chunk; after that
+  the page walk + decode is sync over in-memory bytes.
+- 8 oracle tests vs sync `read_column_*`.
+
+### Π.11c — Async façade for byte_array ✓ DONE
+
+- `read_column_byte_array_async{,_into}` →  `Vec<Vec<u8>>`.
+- `read_column_byte_array_offsets_async{,_into}` →
+  Arrow-style flat `(bytes, offsets)`. Multi-call concatenation
+  continues offsets from the previous trailing value.
+- 5 oracle tests.
+
+### Π.11d — Async streaming ✓ DONE
+
+- `read_column_{i32,i64,f64}_async_stream(file, rg, col, batch_size)`
+  → `impl Stream<Item = Result<Vec<T>>>`.
+- Built on `async_stream::try_stream!` + `futures-core`.
+  Internally: one async GET for the chunk, then yields owned
+  `Vec<T>` in `batch_size`-sized slices until exhausted.
+- 6 oracle tests (concat parity, batch-size sweep, edge cases).
+
+### Π.11f — Bench + docs + release wiring ✓ DONE
+
+- `examples/bench_decode_async.rs`: timed sync vs async i64
+  decode on TPC-H lineitem (LocalFileSystem ObjectStore).
+  Measured on SF=1 `l_suppkey` (1M rows, dict bw=14):
+  sync 0.696 ms vs async 0.762 ms = **1.09× (+9.4%)**.
+  The 9% gap is honest `object_store` + `tokio::spawn_blocking`
+  overhead on local FS. For cloud workloads, network latency
+  dwarfs this; for raw local-file throughput, sync stays
+  faster.
+- README — 4-crate layout, Async section in Performance.
+- `release.yml` + `docs/RELEASING.md` — 4-crate publish order
+  (`format → io → codec → async`).
+
+### Π.11e — S3 integration tests (deferred to v0.4.1)
+
+Needs `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars
+and a public-read TPC-H S3 bucket. Doesn't gate v0.4.0; ship
+as a follow-up once a nightly CI workflow with AWS secrets is
+wired up.
 
 ---
 

@@ -11,17 +11,19 @@ a write path that produces files the rest of the ecosystem can read.
 
 ## Status
 
-`v0.3.x` — v1.0 cut criteria are met (every Parquet shape we read
+`v0.4.x` — v1.0 cut criteria are met (every Parquet shape we read
 or write is covered, predicate pushdown lights up end-to-end,
 TPC-H lineitem decode beats `parquet-rs` and `polars-parquet`).
 The v0.2 cycle landed Photon-inspired analytical hot paths
 (decode-into-caller-buffer, width-generic predicate fusion across
 every NEON kernel, streaming batched-decode iterator). The v0.3
-cycle adds **late-materialization** —
-`read_column_*_masked_into(file, rg, col, &mask, &mut out)` for
-scalar types + byte_array, composing the Π.9 primitives with
-per-page popcount-skip — so consumers can decode only matching
-rows after a filter pass instead of full-decode-then-filter.
+cycle added **late-materialization** (`read_column_*_masked_into`).
+The v0.4 cycle adds **async / object-store integration** — a new
+`ematix-parquet-async` crate exposes `AsyncParquetFile` over any
+`object_store::ObjectStore` (S3, GCS, Azure, local FS, in-memory)
+plus async siblings for every scalar + byte_array read façade
+entry point, including streaming `Stream<Item = Result<Vec<T>>>`.
+The sync stack stays dep-free.
 API is settling but the write side still has a few rough edges
 (per-column encoding choice on multi-column writes); pin by SHA
 or version range until we tag v1.0.

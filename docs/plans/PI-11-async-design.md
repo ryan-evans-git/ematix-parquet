@@ -1,4 +1,4 @@
-# Π.10 — Async / object-store integration: design
+# Π.11 — Async / object-store integration: design
 
 **Status:** design draft, pre-commitment. Once approved, the
 sub-phases land as their own PRs and a v0.3.0 tag closes the phase.
@@ -19,12 +19,12 @@ three bad shapes:
 3. **Don't use ematix-parquet** and fall back to parquet-rs's async
    path. The status quo for any cloud workload today.
 
-Π.10 closes this gap by adding an async read path that issues
+Π.11 closes this gap by adding an async read path that issues
 range-aware fetches against any `object_store::ObjectStore`,
 streams pages as they arrive, and preserves the parser-side
 performance work from Π.1–Π.9.
 
-**Out of scope** for Π.10: async writes (still sync `Write`),
+**Out of scope** for Π.11: async writes (still sync `Write`),
 async metadata parsing as a stream (footer + per-row-group
 metadata still parse from a fully-materialised byte buffer —
 the parse is microseconds, not the bottleneck).
@@ -160,7 +160,7 @@ API conventions, copied from the sync side:
 - Error type is the same `CodecError`; `object_store::Error` is
   mapped via a new `CodecError::ObjectStore(String)` variant.
 
-### D7 — Prefetch / pipelining: deferred to Π.10.1
+### D7 — Prefetch / pipelining: deferred to Π.11.1
 
 A `prefetch_columns(&[(rg, col)])` API that issues parallel GETs
 into a per-file cache is appealing — caller pipelines decode and
@@ -173,7 +173,7 @@ fetch. But:
   thread-safety) that's only justified once a workload measurably
   benefits.
 
-**Decision: ship Π.10 without prefetch.** Add as Π.10.1 if a
+**Decision: ship Π.11 without prefetch.** Add as Π.11.1 if a
 real bench shows pipelining is the bottleneck.
 
 ### D8 — Cancellation
@@ -220,23 +220,25 @@ expect, not a gating bar.
 
 | # | Sub-phase | Scope | Estimate |
 | --- | --- | --- | --- |
-| Π.10a | `AsyncParquetFile` primitive | `open`, `metadata()`, `read_range`. ObjectStore wiring, footer parse (≤2 RT). `InMemory` + `LocalFileSystem` oracle tests. | 3-4 days |
-| Π.10b | Async read façade — scalar types | `read_column_{i32,i64,f64,int96,flba}_async{,_into}` + the `_with_range_*` variants. Replay every sync oracle against async. | 3-4 days |
-| Π.10c | Async read façade — byte_array | `read_column_byte_array_async{,_into,_offsets,_offsets_into}_async{,_into}`. Mirror the sync byte_array contract. | 2-3 days |
-| Π.10d | Async streaming batch iterator | `read_column_*_async_stream(batch_size)` returning `impl Stream<Item = Result<Vec<T>>>`. Mirror `ColumnBatchIter`'s shape. | 3-4 days |
-| Π.10e | S3 integration tests | New CI workflow `nightly.yml` running the `s3-it` test set against a public-read TPC-H bucket. Skipped on PRs. | 1-2 days |
-| Π.10f | Bench + docs | `bench_decode_async` example. README "Reading from S3" section. Update `docs/RELEASING.md` for the new crate. | 2 days |
+| Π.11a | `AsyncParquetFile` primitive | `open`, `metadata()`, `read_range`. ObjectStore wiring, footer parse (≤2 RT). `InMemory` + `LocalFileSystem` oracle tests. | 3-4 days |
+| Π.11b | Async read façade — scalar types | `read_column_{i32,i64,f64,int96,flba}_async{,_into}` + the `_with_range_*` variants. Replay every sync oracle against async. | 3-4 days |
+| Π.11c | Async read façade — byte_array | `read_column_byte_array_async{,_into,_offsets,_offsets_into}_async{,_into}`. Mirror the sync byte_array contract. | 2-3 days |
+| Π.11d | Async streaming batch iterator | `read_column_*_async_stream(batch_size)` returning `impl Stream<Item = Result<Vec<T>>>`. Mirror `ColumnBatchIter`'s shape. | 3-4 days |
+| Π.11e | S3 integration tests | New CI workflow `nightly.yml` running the `s3-it` test set against a public-read TPC-H bucket. Skipped on PRs. | 1-2 days |
+| Π.11f | Bench + docs | `bench_decode_async` example. README "Reading from S3" section. Update `docs/RELEASING.md` for the new crate. | 2 days |
 | **Total** | | | **14-19 days** |
 
 Realistically 3-4 calendar weeks including review + churn on
 the object_store API.
 
-## What lands as v0.3.0
+## What lands as v0.4.0
 
-Tagging v0.3.0 once Π.10a–Π.10f are merged on `main`. The four
-existing crates bump in sync to 0.3.0. The new crate ships at
-0.3.0 too (matches the workspace version; the version-pin
-discipline holds — inter-crate deps are `version = "0.3"`).
+Tagging v0.4.0 once Π.11a–Π.11f are merged on `main` (v0.3.0
+ships Π.10 — late-materialization — first; see
+`PI-10-late-mat-design.md`). The three existing crates bump in
+sync to 0.4.0. The new crate ships at 0.4.0 too (matches the
+workspace version; the version-pin discipline holds —
+inter-crate deps are `version = "0.4"`).
 
 ## Risks + open questions
 
@@ -273,7 +275,7 @@ discipline holds — inter-crate deps are `version = "0.3"`).
 
 ## Confirmed decisions
 
-Before sub-phase Π.10a starts, two questions were raised in the
+Before sub-phase Π.11a starts, two questions were raised in the
 draft and confirmed by the maintainer:
 
 - **Q1 → confirmed.** New crate `ematix-parquet-async` (D1.C).

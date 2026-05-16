@@ -96,6 +96,7 @@ fn fmt(d: Duration) -> String {
 /// then walk rows, evaluate predicate, and materialise the matching
 /// (partkey, extprice, discount) triple per row. The Vecs are
 /// caller-owned so allocation cost amortises across iterations.
+#[allow(clippy::too_many_arguments)]
 fn baseline_full_decode(
     file: &ParquetFile,
     rg: usize,
@@ -116,7 +117,7 @@ fn baseline_full_decode(
     out_extprice.clear();
     out_discount.clear();
     for (i, &d) in shipdate_buf.iter().enumerate() {
-        if d >= LO && d < HI {
+        if (LO..HI).contains(&d) {
             out_partkey.push(partkey_buf[i]);
             out_extprice.push(extprice_buf[i]);
             out_discount.push(discount_buf[i]);
@@ -147,7 +148,7 @@ fn late_mat_facade(
 
     let mask = build_packed_mask(shipdate_buf.len(), |i| {
         let d = shipdate_buf[i];
-        d >= LO && d < HI
+        (LO..HI).contains(&d)
     });
 
     out_partkey.clear();

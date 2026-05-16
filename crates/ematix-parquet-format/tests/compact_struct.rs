@@ -5,7 +5,7 @@
 //!   - delta_id ∈ [1..15] → next field id = prev_id + delta_id
 //!   - delta_id == 0      → long form, explicit zigzag i16 field id follows
 //!   - byte == 0x00       → STOP
-//!   embedded booleans: type_nibble = 1 (true) or 2 (false); no body bytes
+//!     embedded booleans: type_nibble = 1 (true) or 2 (false); no body bytes
 //!
 //! Caller threads `prev_id` through `read_field_header` and decodes the
 //! body based on `FieldType`. We test the header reader plus a thin

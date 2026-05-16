@@ -4,8 +4,8 @@
 //!   list_header = (size_or_F << 4) | element_type
 //!   - If size < 15: high nibble carries it directly, no follow-up.
 //!   - If size >= 15: high nibble = 0xF, then `uvarint(size)` follows.
-//!   element_type uses the same FieldType nibbles as struct fields
-//!   (1=BoolTrue, 5=I32, 8=Binary, 12=Struct, etc.).
+//!     element_type uses the same FieldType nibbles as struct fields
+//!     (1=BoolTrue, 5=I32, 8=Binary, 12=Struct, etc.).
 //!
 //! Elements have no per-element headers — the caller decodes `count`
 //! bodies of the matching element type from the cursor.

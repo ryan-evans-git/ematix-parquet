@@ -84,12 +84,12 @@ pub fn decode_levels(body: &[u8], bit_width: u8, num_values: usize) -> Result<(V
 /// schema (computed via `bit_width_for`).
 ///
 /// Order on the wire is `rep` then `def` (rep levels come first).
-pub fn parse_v1_data_page_body<'a>(
-    body: &'a [u8],
+pub fn parse_v1_data_page_body(
+    body: &[u8],
     max_rep_level: u16,
     max_def_level: u16,
     num_values: usize,
-) -> Result<(Vec<u16>, Vec<u16>, &'a [u8])> {
+) -> Result<(Vec<u16>, Vec<u16>, &[u8])> {
     let rep_bw = bit_width_for(max_rep_level);
     let def_bw = bit_width_for(max_def_level);
 

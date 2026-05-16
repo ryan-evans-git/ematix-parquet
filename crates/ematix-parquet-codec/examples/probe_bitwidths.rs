@@ -87,7 +87,7 @@ fn main() {
         by_col.entry(col).or_default().push((bw, n));
     }
     for (col, mut widths) in by_col {
-        widths.sort_by(|a, b| b.1.cmp(&a.1));
+        widths.sort_by_key(|w| std::cmp::Reverse(w.1));
         let total: usize = widths.iter().map(|(_, n)| *n).sum();
         let parts: Vec<String> = widths
             .iter()

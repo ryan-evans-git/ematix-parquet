@@ -19,3 +19,6 @@ ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.4" }
 # `snap` so parquet-rs can fully iterate snappy-compressed pages in
 # the lineitem oracle (lineitem uses snappy by default).
 parquet = { version = "58", default-features = false, features = ["snap"] }
+
+[lints]
+workspace = true

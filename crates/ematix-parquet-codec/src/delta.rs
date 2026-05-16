@@ -24,8 +24,7 @@
 //! Decoding:
 //!   - Emit `first_value`.
 //!   - For each delta read from the bit-packed mini-blocks,
-//!         next_value = prev_value + min_delta + delta
-//!     and emit it.
+//!     `next_value = prev_value + min_delta + delta` and emit it.
 //!   - Stop after `num_values` total emissions; any trailing
 //!     padding deltas in the last mini-block are discarded.
 //!
@@ -64,7 +63,7 @@ pub fn decode_delta_i32_from(cur: &mut Cursor<'_>) -> Result<Vec<i32>> {
     if mini_blocks_per_block == 0 {
         return Err(delta_err("mini_blocks_per_block must be > 0"));
     }
-    if !block_size.is_multiple_of(mini_blocks_per_block) {
+    if block_size % mini_blocks_per_block != 0 {
         return Err(delta_err(
             "block_size must be a multiple of mini_blocks_per_block",
         ));
@@ -145,7 +144,7 @@ pub fn decode_delta_i64_from(cur: &mut Cursor<'_>) -> Result<Vec<i64>> {
     if mini_blocks_per_block == 0 {
         return Err(delta_err("mini_blocks_per_block must be > 0"));
     }
-    if !block_size.is_multiple_of(mini_blocks_per_block) {
+    if block_size % mini_blocks_per_block != 0 {
         return Err(delta_err(
             "block_size must be a multiple of mini_blocks_per_block",
         ));
@@ -253,7 +252,7 @@ pub fn decode_delta_byte_array(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
 
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(prefix_lengths.len());
     let mut prev: Vec<u8> = Vec::new();
-    for (pfx, sfx) in prefix_lengths.into_iter().zip(suffix_lengths.into_iter()) {
+    for (pfx, sfx) in prefix_lengths.into_iter().zip(suffix_lengths) {
         if pfx < 0 || sfx < 0 {
             return Err(delta_byte_err("negative length"));
         }

@@ -135,7 +135,7 @@ fn row_group_with_sorting_columns_and_file_offset() {
     let scs = rg.sorting_columns.unwrap();
     assert_eq!(scs.len(), 1);
     assert_eq!(scs[0].column_idx, 0);
-    assert_eq!(scs[0].nulls_first, true);
+    assert!(scs[0].nulls_first);
     assert_eq!(rg.file_offset, Some(1_000_000));
     assert_eq!(rg.total_compressed_size, Some(800_000));
 }

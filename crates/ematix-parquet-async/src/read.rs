@@ -296,7 +296,7 @@ pub async fn read_column_byte_array_offsets_async_into(
             PageType::IndexPage => {}
         }
         // Stop once we've emitted total_values values (offsets has +1).
-        if out_offsets.len() >= total_values + 1 {
+        if out_offsets.len() > total_values {
             break;
         }
     }

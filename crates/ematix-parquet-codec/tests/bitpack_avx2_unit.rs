@@ -41,7 +41,7 @@ fn indices_round_trip_aligned() {
         return;
     }
     // Exact-multiple-of-8 size: no tail.
-    let values: Vec<u32> = (0..1024u32).map(|i| i * 17 & 0xFFFF).collect();
+    let values: Vec<u32> = (0..1024u32).map(|i| (i * 17) & 0xFFFF).collect();
     let packed = pack_bw16(&values);
 
     let mut out: Vec<u32> = Vec::new();

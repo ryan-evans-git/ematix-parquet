@@ -237,7 +237,7 @@ fn main() {
     // assumption for late-mat — but matches a real query engine
     // that reads the column chunk once and runs many ops on it).
     let prebuilt = build_dict_column_chunk_i32(&path, 10);
-    let prebuilt_count_pre = prebuilt.count_matching(|d| d >= LO && d < HI);
+    let prebuilt_count_pre = prebuilt.count_matching(|d| (LO..HI).contains(&d));
     println!(
         "(sanity check: {prebuilt_count_pre} of {} rows pass filter, selectivity {:.2}%)\n",
         prebuilt.num_values,
@@ -246,19 +246,19 @@ fn main() {
 
     println!("Phase 1: count rows matching filter (no materialization)");
     let (lm_count, _, _) = bench("late-mat (count_matching on pre-built chunk)", || {
-        prebuilt.count_matching(|d| d >= LO && d < HI)
+        prebuilt.count_matching(|d| (LO..HI).contains(&d))
     });
     let (eg_count, _, _) = bench("eager (collect + filter().count() on chunk)", || {
         prebuilt
             .collect()
             .into_iter()
-            .filter(|&d| d >= LO && d < HI)
+            .filter(|&d| (LO..HI).contains(&d))
             .count()
     });
     let (pr_count, _, _) = bench("parquet-rs (typed read + filter().count())", || {
         parquet_rs_decode_i32(&path, 10)
             .into_iter()
-            .filter(|&d| d >= LO && d < HI)
+            .filter(|&d| (LO..HI).contains(&d))
             .count()
     });
     pretty_ratio("late-mat vs eager", lm_count, eg_count);
@@ -267,20 +267,20 @@ fn main() {
 
     println!("Phase 2: materialize the matching rows (filter then keep matches)");
     let (lm_gather, _, _) = bench("late-mat (filter + gather)", || {
-        let mask = prebuilt.filter(|d| d >= LO && d < HI);
+        let mask = prebuilt.filter(|d| (LO..HI).contains(&d));
         prebuilt.gather(&mask)
     });
     let (eg_gather, _, _) = bench("eager (collect + filter().collect())", || {
         prebuilt
             .collect()
             .into_iter()
-            .filter(|&d| d >= LO && d < HI)
+            .filter(|&d| (LO..HI).contains(&d))
             .collect::<Vec<i32>>()
     });
     let (pr_gather, _, _) = bench("parquet-rs (typed read + filter().collect())", || {
         parquet_rs_decode_i32(&path, 10)
             .into_iter()
-            .filter(|&d| d >= LO && d < HI)
+            .filter(|&d| (LO..HI).contains(&d))
             .collect::<Vec<i32>>()
     });
     pretty_ratio("late-mat vs eager", lm_gather, eg_gather);
@@ -290,12 +290,12 @@ fn main() {
     println!("Phase 3: end-to-end (open + build chunk + filter + count)");
     let (lm_full, _, _) = bench("late-mat (open + build + count_matching)", || {
         let c = build_dict_column_chunk_i32(&path, 10);
-        c.count_matching(|d| d >= LO && d < HI)
+        c.count_matching(|d| (LO..HI).contains(&d))
     });
     let (pr_full, _, _) = bench("parquet-rs (open + read + filter().count())", || {
         parquet_rs_decode_i32(&path, 10)
             .into_iter()
-            .filter(|&d| d >= LO && d < HI)
+            .filter(|&d| (LO..HI).contains(&d))
             .count()
     });
     pretty_ratio("end-to-end late-mat vs parquet-rs", lm_full, pr_full);
@@ -304,7 +304,7 @@ fn main() {
     println!("Phase 4: stream-fused — open + page-walk + dict-mask → bitmap");
     println!("(no DictColumnChunk, no Vec<u32> indices, direct to Vec<bool>)");
     let (sf_count, _, _) = bench("stream-fused (bitmap + count)", || {
-        let bitmap = filter_dict_chunk_i32_into_bitmap(&path, 10, |d| d >= LO && d < HI);
+        let bitmap = filter_dict_chunk_i32_into_bitmap(&path, 10, |d| (LO..HI).contains(&d));
         bitmap.iter().filter(|&&b| b).count()
     });
     pretty_ratio("end-to-end stream-fused vs parquet-rs", sf_count, pr_full);
@@ -313,7 +313,7 @@ fn main() {
     println!("Phase 5: NEON-fused — predicate-bitmap kernel for bw=12");
     println!("(unpack + dict-mask gather + bitmap pack in one NEON loop)");
     let (nf_count, _, _) = bench("neon-fused (packed bitmap + popcount)", || {
-        filter_dict_chunk_i32_neon_bitmap_count(&path, 10, |d| d >= LO && d < HI)
+        filter_dict_chunk_i32_neon_bitmap_count(&path, 10, |d| (LO..HI).contains(&d))
     });
     pretty_ratio("end-to-end neon-fused vs parquet-rs", nf_count, pr_full);
     pretty_ratio("end-to-end neon-fused vs stream-fused", nf_count, sf_count);
@@ -386,7 +386,7 @@ fn parquet_rs_q14_baseline(path: &Path) -> Vec<f64> {
 
     let mut out: Vec<f64> = Vec::new();
     for (i, &d) in shipdate.iter().enumerate() {
-        if d >= LO && d < HI {
+        if (LO..HI).contains(&d) {
             out.push(extprice[i]);
         }
     }
@@ -418,7 +418,7 @@ fn q14_lever_shipdate_then_extprice(path: &Path) -> Vec<f64> {
         let dict = decode_plain_i32(&dict_decompressed).unwrap();
         let mut m = vec![0u8; 4096];
         for (i, &v) in dict.iter().enumerate() {
-            if v >= LO && v < HI {
+            if (LO..HI).contains(&v) {
                 m[i] = 1;
             }
         }
@@ -541,7 +541,7 @@ fn filter_dict_chunk_i32_neon_bitmap_count(
             }
             Encoding::Plain => {
                 // Fall back to scalar PLAIN evaluation; should be rare.
-                let bytes = (n + 7) / 8;
+                let bytes = n.div_ceil(8);
                 let bm_start = bitmap.len();
                 bitmap.resize(bm_start + bytes, 0);
                 for chunk in decompressed.chunks_exact(4).take(n) {

@@ -36,7 +36,6 @@ use parquet::data_type::ByteArray;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 use polars::prelude::*;
-use polars_io::prelude::*;
 
 const WARMUPS: usize = 3;
 const ITERS: usize = 12;

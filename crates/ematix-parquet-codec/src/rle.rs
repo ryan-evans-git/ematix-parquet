@@ -157,7 +157,7 @@ pub fn encode_rle_bit_packed(indices: &[u32], bit_width: u8) -> Vec<u8> {
         return out;
     }
 
-    let value_bytes = (bit_width as usize + 7) / 8;
+    let value_bytes = (bit_width as usize).div_ceil(8);
     let mut pending: Vec<u32> = Vec::new();
 
     let mut i = 0usize;
@@ -219,6 +219,67 @@ pub fn encode_rle_bit_packed(indices: &[u32], bit_width: u8) -> Vec<u8> {
     }
 
     out
+}
+
+/// Decode `num_values` values from a RLE/bit-packed hybrid stream.
+/// Values come out as `u64` regardless of declared bit_width — the
+/// caller narrows to u32/u16/u8 as needed.
+pub fn decode_rle_bit_packed(bytes: &[u8], bit_width: u8, num_values: usize) -> Result<Vec<u64>> {
+    if bit_width > 64 {
+        return Err(CodecError::BitWidthOutOfRange(bit_width));
+    }
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    if bit_width == 0 {
+        return Ok(vec![0u64; num_values]);
+    }
+
+    let mut out = Vec::with_capacity(num_values);
+    let value_bytes = (bit_width as usize).div_ceil(8);
+    let mask: u64 = if bit_width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bit_width) - 1
+    };
+    let mut cur = Cursor::new(bytes);
+
+    while out.len() < num_values {
+        let header = read_uvarint(&mut cur)?;
+        let is_bit_packed = (header & 1) == 1;
+        let count = (header >> 1) as usize;
+
+        if is_bit_packed {
+            let total = count * 8;
+            let needed = (total * bit_width as usize).div_ceil(8);
+            let chunk = cur.take(needed)?;
+            let to_emit = (num_values - out.len()).min(total);
+            for i in 0..to_emit {
+                let bit_offset = i * bit_width as usize;
+                let byte_offset = bit_offset / 8;
+                let bit_in_byte = bit_offset % 8;
+                let bits_needed = bit_in_byte + bit_width as usize;
+                let bytes_needed = bits_needed.div_ceil(8);
+                let mut acc: u64 = 0;
+                for j in 0..bytes_needed {
+                    acc |= (chunk[byte_offset + j] as u64) << (j * 8);
+                }
+                out.push((acc >> bit_in_byte) & mask);
+            }
+        } else {
+            // RLE run.
+            let value_chunk = cur.take(value_bytes)?;
+            let mut val: u64 = 0;
+            for j in 0..value_bytes {
+                val |= (value_chunk[j] as u64) << (j * 8);
+            }
+            let to_emit = (num_values - out.len()).min(count);
+            for _ in 0..to_emit {
+                out.push(val);
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -389,8 +450,8 @@ mod tests {
         for bw in 1u8..=32 {
             let mask: u32 = if bw == 32 { u32::MAX } else { (1u32 << bw) - 1 };
             let v1 = 0u32;
-            let v2 = mask / 3 & mask;
-            let v3 = mask / 2 & mask;
+            let v2 = (mask / 3) & mask;
+            let v3 = (mask / 2) & mask;
 
             let mut indices: Vec<u32> = Vec::new();
             indices.extend(std::iter::repeat(v1).take(64));
@@ -461,65 +522,4 @@ mod tests {
         assert_eq!(min_bit_width_for_dict(4096), 12);
         assert_eq!(min_bit_width_for_dict(4097), 13);
     }
-}
-
-/// Decode `num_values` values from a RLE/bit-packed hybrid stream.
-/// Values come out as `u64` regardless of declared bit_width — the
-/// caller narrows to u32/u16/u8 as needed.
-pub fn decode_rle_bit_packed(bytes: &[u8], bit_width: u8, num_values: usize) -> Result<Vec<u64>> {
-    if bit_width > 64 {
-        return Err(CodecError::BitWidthOutOfRange(bit_width));
-    }
-    if num_values == 0 {
-        return Ok(Vec::new());
-    }
-    if bit_width == 0 {
-        return Ok(vec![0u64; num_values]);
-    }
-
-    let mut out = Vec::with_capacity(num_values);
-    let value_bytes = (bit_width as usize + 7) / 8;
-    let mask: u64 = if bit_width == 64 {
-        u64::MAX
-    } else {
-        (1u64 << bit_width) - 1
-    };
-    let mut cur = Cursor::new(bytes);
-
-    while out.len() < num_values {
-        let header = read_uvarint(&mut cur)?;
-        let is_bit_packed = (header & 1) == 1;
-        let count = (header >> 1) as usize;
-
-        if is_bit_packed {
-            let total = count * 8;
-            let needed = (total * bit_width as usize + 7) / 8;
-            let chunk = cur.take(needed)?;
-            let to_emit = (num_values - out.len()).min(total);
-            for i in 0..to_emit {
-                let bit_offset = i * bit_width as usize;
-                let byte_offset = bit_offset / 8;
-                let bit_in_byte = bit_offset % 8;
-                let bits_needed = bit_in_byte + bit_width as usize;
-                let bytes_needed = (bits_needed + 7) / 8;
-                let mut acc: u64 = 0;
-                for j in 0..bytes_needed {
-                    acc |= (chunk[byte_offset + j] as u64) << (j * 8);
-                }
-                out.push((acc >> bit_in_byte) & mask);
-            }
-        } else {
-            // RLE run.
-            let value_chunk = cur.take(value_bytes)?;
-            let mut val: u64 = 0;
-            for j in 0..value_bytes {
-                val |= (value_chunk[j] as u64) << (j * 8);
-            }
-            let to_emit = (num_values - out.len()).min(count);
-            for _ in 0..to_emit {
-                out.push(val);
-            }
-        }
-    }
-    Ok(out)
 }

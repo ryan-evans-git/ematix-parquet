@@ -128,14 +128,11 @@ fn decode_plain_f32_known_values() {
 #[test]
 fn decode_plain_f64_known_values() {
     let mut bytes = Vec::new();
-    for v in [0.0f64, 0.10000000000000001, -1.234e-10, f64::INFINITY] {
+    for v in [0.0f64, 0.1, -1.234e-10, f64::INFINITY] {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
     let got = decode_plain_f64(&bytes).unwrap();
-    assert_eq!(
-        got,
-        vec![0.0, 0.10000000000000001, -1.234e-10, f64::INFINITY]
-    );
+    assert_eq!(got, vec![0.0, 0.1, -1.234e-10, f64::INFINITY]);
 }
 
 #[test]

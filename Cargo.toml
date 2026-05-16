@@ -15,4 +15,24 @@ license = "Apache-2.0"
 repository = "https://github.com/ryan-evans-git/ematix-parquet"
 authors = ["Ryan Evans <ryanevans23@gmail.com>"]
 
+# Workspace-wide clippy policy. The denied set is the default
+# (-D warnings via CI); the explicit allows below are lints whose
+# default policy doesn't fit this codebase:
+#
+# - needless_range_loop: explicit `for i in 0..n` indexing is the
+#   idiomatic shape for our bit-packed / SIMD-adjacent inner loops;
+#   `.iter().enumerate()` obscures bounds elimination.
+# - uninit_vec: a handful of hot paths (Snappy decode, NEON/AVX2
+#   staging) deliberately `reserve` + `set_len` and write all bytes
+#   before any read, with a SAFETY comment at the site.
+# - type_complexity: const-generic batch iterators have inherently
+#   long types; alias'd they're harder to grep.
+# - approx_constant: test fixtures use 3.14 as a sentinel float, not
+#   as an approximation of π.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+uninit_vec = "allow"
+type_complexity = "allow"
+approx_constant = "allow"
+
 [workspace.dependencies]

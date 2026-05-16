@@ -497,24 +497,101 @@ pub fn gather_dict_at_bitmap_into<T: Clone>(
             let needed = (total * bit_width as usize + 7) / 8;
             let chunk = cur.take(needed)?;
 
-            // Iterate 8 rows at a time. Each 8-row block consumes a
-            // whole byte count of input (8 × bit_width bits = N bytes),
-            // so we can skip a block by advancing the bit cursor by
-            // `bit_width` bytes without unpacking, *iff* the bitmap
-            // byte for that block is 0. At Q14-shape selectivity
-            // (~1%) almost all bitmap bytes are 0, so most blocks
-            // skip entirely.
             let bytes_per_8 = bit_width as usize;
             debug_assert_eq!(8 * bit_width as usize, bytes_per_8 * 8);
             let mut byte_cursor = 0usize;
             let mut block_row = 0usize;
             let mut scratch: [u32; 8] = [0; 8];
+
+            // Head peel: the byte-wise fast path below assumes
+            // `bitmap_offset + row + block_row` is a multiple of 8 so a
+            // single `bitmap[..]` byte covers exactly the next 8 rows.
+            // When `bitmap_offset` is not 8-aligned (which happens for
+            // any data page whose predecessor pages didn't sum to a
+            // multiple of 8 — every byte-array Utf8 column in TPC-H
+            // l_returnflag-shaped data), we peel rows until aligned,
+            // per-row scalar.
+            let head_unaligned = (bitmap_offset + row) % 8;
+            if head_unaligned != 0 {
+                let head_rows = (8 - head_unaligned).min(to_consume);
+                let head_bytes = (head_rows * bit_width as usize + 7) / 8;
+                let mut head_idxs: Vec<u32> = Vec::with_capacity(head_rows);
+                unpack_indices_into(
+                    &chunk[byte_cursor..byte_cursor + head_bytes],
+                    head_rows,
+                    bit_width,
+                    &mut head_idxs,
+                )?;
+                for (i, idx) in head_idxs.into_iter().enumerate() {
+                    let bit_pos = bitmap_offset + row + i;
+                    let bit = (bitmap[bit_pos / 8] >> (bit_pos % 8)) & 1;
+                    if bit == 1 {
+                        let idx_u = idx as usize;
+                        if idx_u >= dict_size {
+                            return Err(CodecError::DictIndexOutOfRange {
+                                index: idx,
+                                dict_size,
+                            });
+                        }
+                        out.push(dict[idx_u].clone());
+                    }
+                }
+                // The bit-packed input is positional — each row
+                // consumes exactly `bit_width` bits, regardless of
+                // whether it's part of an 8-row block. So advancing
+                // the byte cursor by `head_rows * bit_width / 8` is
+                // only safe when that product is a whole number of
+                // bytes. `head_rows` is at most 7; pick the smallest
+                // multiple of 8 we can re-enter the fast path at by
+                // peeling rows up to the next 8-row boundary in the
+                // *page* (block_row % 8 == 0), which happens when
+                // `head_rows + block_row` is a multiple of 8. Since
+                // block_row starts at 0 and head_rows ∈ [1, 7], that
+                // means we peel `head_rows` and then add (8 -
+                // head_rows) more to reach the next 8-row block.
+                // Simpler approach: don't try to re-enter the fast
+                // path mid-page when misaligned — just scalar-process
+                // the whole run. Performance regression is bounded:
+                // misalignment only happens on Utf8 / byte-array
+                // columns where the page layout doesn't pre-align.
+                let total_bytes = (to_consume * bit_width as usize + 7) / 8;
+                let mut all_idxs: Vec<u32> = Vec::with_capacity(to_consume);
+                unpack_indices_into(
+                    &chunk[byte_cursor..byte_cursor + total_bytes],
+                    to_consume,
+                    bit_width,
+                    &mut all_idxs,
+                )?;
+                for (i, idx) in all_idxs.into_iter().enumerate().skip(head_rows) {
+                    let bit_pos = bitmap_offset + row + i;
+                    let bit = (bitmap[bit_pos / 8] >> (bit_pos % 8)) & 1;
+                    if bit == 1 {
+                        let idx_u = idx as usize;
+                        if idx_u >= dict_size {
+                            return Err(CodecError::DictIndexOutOfRange {
+                                index: idx,
+                                dict_size,
+                            });
+                        }
+                        out.push(dict[idx_u].clone());
+                    }
+                }
+                row += to_consume;
+                continue;
+            }
+
+            // Aligned fast path: 8 rows at a time. Each 8-row block
+            // consumes `bit_width` bytes (= 8 × bit_width bits), so
+            // we can skip a block by advancing the byte cursor by
+            // `bit_width` without unpacking, *iff* the bitmap byte
+            // for that block is 0. At Q14-shape selectivity (~1%)
+            // almost all bitmap bytes are 0, so most blocks skip
+            // entirely.
             while block_row + 8 <= to_consume {
                 let bit_pos_base = bitmap_offset + row + block_row;
-                debug_assert_eq!(bit_pos_base % 8, 0, "bitmap_offset must be byte-aligned for sparse-gather");
+                debug_assert_eq!(bit_pos_base % 8, 0, "fast path requires byte-aligned offset");
                 let mask_byte = bitmap[bit_pos_base / 8];
                 if mask_byte != 0 {
-                    // Unpack only the 8 indices for this block.
                     unpack_8_indices(&chunk[byte_cursor..byte_cursor + bytes_per_8], bit_width, &mut scratch);
                     for lane in 0..8 {
                         if (mask_byte >> lane) & 1 == 1 {

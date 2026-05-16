@@ -321,9 +321,7 @@ fn bw15_indices_round_trip_with_tail() {
         return;
     }
     for n in [1usize, 7, 13, 17, 35, 100, 1003] {
-        let values: Vec<u32> = (0..n as u32)
-            .map(|i| i.wrapping_mul(13) & 0x7FFF)
-            .collect();
+        let values: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(13) & 0x7FFF).collect();
         let packed = pack_bwn(&values, 15);
 
         let mut out: Vec<u32> = Vec::new();

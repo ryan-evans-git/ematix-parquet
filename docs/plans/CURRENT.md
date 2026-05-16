@@ -12,7 +12,7 @@ Tracks the work between v0.1.1 and v1.0. Phases use the existing `Π.N` conventi
 | Π.6   | DataPageV2 (read + write) + Bloom-filter decoder                     | ✓ Done   |
 | Π.7   | BYTE_STREAM_SPLIT + first NEON wave (bw=14, gather opt, bw=17 lookup) | ✓ Done   |
 | Π.8   | Performance polish: byte_array zero-copy, more NEON widths, RLE coalesce | ✓ Done |
-| Π.9   | Photon-inspired: decode-into-buffer, predicate fusion, batched API   | Active   |
+| Π.9   | Photon-inspired: decode-into-buffer, predicate fusion, batched API   | ✓ Done   |
 
 v1.0 cut criteria are already met (correctness, interop, beats
 parquet-rs end-to-end on TPC-H lineitem). Π.8 is concrete performance
@@ -411,43 +411,78 @@ treatment for `read_column_byte_array_offsets`.
 
 **Estimate.** 1 day. Pure refactor + thin wrappers + tests.
 
-### Π.9b — Predicate fusion for more widths and types (planned)
+### Π.9b — Predicate fusion for more widths and types ✓ DONE
 
-**Goal.** Extend the existing `decode_rle_dictionary_predicate_bitmap_bw12`
-pattern to bw=14/15/16/17/18 and to i64/byte_array/f64 dict
-columns. Photon's "evaluate predicate against the dict, build a
-match bitmap, walk indices comparing to the bitmap" is the win on
-selective scans — never materialise values that won't match.
+**Shipped:** width-generic predicate-fused decoder that mirrors the
+bw=12 path across every NEON-specialized width (14, 15, 16, 17, 18)
+plus a scalar fallback for non-specialized widths.
 
-**Acceptance.**
-1. Per-width fused decoders for the bw=14/15/16/17/18 NEON kernels
-   (matching the bw=12 fused signature).
-2. Generic `decode_rle_dictionary_predicate_bitmap<T>` that takes
-   a `Fn(&T) -> bool` predicate and a precomputed dict-id mask.
-3. Q14-style benchmark on a non-bw=12 column shows ≥ 2× speedup
-   over the materialise-then-filter baseline for ≤ 5% selectivity.
+**Touches:**
+- `bitpack_neon::decode_predicate_bitmap_neon_bw{14,15,16,17,18}` —
+  per-width fused kernels. Each reuses the existing
+  `unpack_neon_bw{N}_into_staging` helper and packs 8 dict-mask
+  lookups into one bitmap byte per block via the shared
+  `pack_predicate_byte` helper.
+- `dict::decode_rle_dictionary_predicate_bitmap` — width-generic
+  entry point. Reads bit_width from `body[0]`, validates
+  `dict_mask.len() ≥ 1 << bit_width`, dispatches per-width.
+- `dict::build_dict_predicate_mask` — helper that builds a
+  `dict_mask` of the right size from a decoded dictionary and a
+  predicate closure.
+- `decode_rle_dictionary_predicate_bitmap_bw12` becomes a thin
+  back-compat wrapper.
 
-**Estimate.** 3-5 days. Each width is mechanical (shape mirrors
-bw=12); the generic predicate-vs-dict-mask path is a one-time
-design.
+**Bench (microbench, 1M values, ~1% selectivity, M-series):**
+| bw | baseline (unpack→Vec<u32>→bitmap) | fused | speedup |
+| -- | --------------------------------- | ----- | ------- |
+| 14 | 1.098 ms | 0.189 ms | **5.81×** |
+| 15 | 1.103 ms | 0.190 ms | **5.82×** |
+| 16 | 1.112 ms | 0.177 ms | **6.29×** |
+| 17 | 1.210 ms | 0.207 ms | **5.84×** |
+| 18 | 1.231 ms | 0.329 ms | **3.74×** |
 
-### Π.9c — Streaming / batched decode API (planned)
+All well above the ≥ 2× acceptance bar. 15 new oracle tests in
+`tests/dict_predicate_bitmap_widths_oracle.rs` cover every width,
+the scalar fallback (bw=13), unaligned tails, all-zero/all-one
+masks, bw=0 degenerate, and `build_dict_predicate_mask` error
+cases.
 
-**Goal.** Yield batches of N rows instead of materialising the
-whole chunk. Lets ematix-flow pipeline (decode batch N+1 while
-processing batch N), bounds memory footprint for huge row groups,
-and matches Arrow's natural RecordBatch sizing.
+### Π.9c — Streaming / batched decode API ✓ DONE
 
-**Acceptance.**
-1. `read_column_*_batches(file, rg, col, batch_size) -> impl Iterator<Item = Result<Vec<T>>>`.
-2. Bounded memory: peak allocation ≤ `batch_size * sizeof::<T>()` +
-   the chunk-bytes buffer (already allocated for any read).
-3. Oracle test: collecting all batches concatenates to the same
-   `Vec<T>` as `read_column_*`.
+**Shipped:** `read_column_*_batches(file, rg, col, batch_size)`
+returning `ColumnBatchIter<T>` which implements
+`Iterator<Item = Result<Vec<T>>>`. Walks a column chunk page-by-
+page and emits batches of (mostly) `batch_size` rows; final batch
+may be shorter.
 
-**Estimate.** 2-3 days. Care needed around dict-page handling
-(must build the dict before the first batch; persist across
-batches within a chunk).
+**Implementation (`read::ColumnBatchIter<T, F>`):**
+- Chunk bytes (compressed) live in the iterator (single allocation
+  per chunk, matches non-streaming reads).
+- Page walker is reconstructed per `fill_one_page` call against
+  `&chunk_bytes[walker_pos..]` (avoids self-referential struct).
+- Dict pages decode into a persistent `dict` field; subsequent
+  RLE_DICTIONARY data pages decode against it.
+- Decoded values land in `carry`; emitting a batch slices off
+  `batch_size` and advances `carry_pos`. Compacts when fully drained.
+
+**Memory bound.** `carry` peaks at `max(batch_size, page_values)`
+plus the chunk_bytes buffer. The strict-batch-size bound isn't
+achievable because parquet pages can be larger than batch_size
+(typical: 20K values per page); we decode one full page at a time
+and emit batches from it.
+
+**Public entry points:** `read_column_{i64,i32,f64}_batches`.
+BYTE_ARRAY batched API deferred — `Vec<u8>: !Copy` clashes with
+the `decode_rle_dictionary_into<T: Copy>` bound, and the dict-
+encoded path needs a separate index-then-gather-then-clone
+strategy. Land when a real consumer asks.
+
+**8 oracle tests in `tests/read_batches_oracle.rs`:** concat parity
+across batch sizes 1..50_000, non-final batches always exactly
+`batch_size`, `batch_size = 0` rejected, oversized batch → one
+batch with everything, iterator stays `None` after exhaustion,
+dict-encoded i64 streams correctly, multi-row-group: each RG
+streams independently.
 
 ### Out of scope for Π.9
 
@@ -457,6 +492,8 @@ batches within a chunk).
 - **u8 dict indices when bw ≤ 8** — saves Vec<u32> overhead in
   the index stream. Small wins on l_returnflag-class columns;
   defer until a benchmark says it matters.
+- **BYTE_ARRAY batched API** — needs `T: Clone` (not `Copy`) and
+  a separate gather strategy on dict pages. Add when a consumer asks.
 - **Custom LLVM codegen** — Photon does this; we don't have the
   infra and our const-generic monomorphisation gets ~80% of the
   benefit at zero infra cost.

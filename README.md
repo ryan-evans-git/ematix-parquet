@@ -11,12 +11,15 @@ a write path that produces files the rest of the ecosystem can read.
 
 ## Status
 
-`v0.1.x` — v1.0 cut criteria are met (every Parquet shape we read
+`v0.2.x` — v1.0 cut criteria are met (every Parquet shape we read
 or write is covered, predicate pushdown lights up end-to-end,
 TPC-H lineitem decode beats `parquet-rs` and `polars-parquet`).
+The v0.2 cycle landed Photon-inspired analytical hot paths:
+decode-into-caller-buffer, width-generic predicate fusion across
+every NEON kernel, and a streaming batched-decode iterator.
 API is settling but the write side still has a few rough edges
-(per-column encoding choice on multi-column writes, smarter RLE
-encoder); pin by SHA until we tag v1.0.
+(per-column encoding choice on multi-column writes); pin by SHA
+or version range until we tag v1.0.
 
 ## What's implemented
 
@@ -115,11 +118,16 @@ so the scalar path is also free of `Vec::push`'s capacity check on
 every value. Benefits from LLVM auto-vectorisation on widths that
 align well.
 
-**Predicate-fused decode** —
-`decode_rle_dictionary_predicate_bitmap_bw12` performs the RLE
-walk + dict-index gather + dictionary-value comparison + bitmap
-pack in a single NEON loop. The point is to never materialise the
-~98% of values a selective predicate is going to throw away.
+**Predicate-fused decode** (width-generic since v0.2) —
+`decode_rle_dictionary_predicate_bitmap(body, n, dict_mask, out)`
+performs the RLE walk + dict-index gather + bitmap pack in a
+single pass. NEON-fused for bw ∈ {12, 14, 15, 16, 17, 18}; scalar
+fallback for the rest. Build the mask with
+`build_dict_predicate_mask(&dict, bw, predicate)` and feed it to
+the decoder — the matching bitmap drops out the other end without
+ever materialising the values that fail the predicate. At Q14-
+shape selectivity (~1%) this is 3.7–6.3× faster than the
+materialise-then-filter baseline across every width.
 
 **Sparse gather** — `gather_dict_at_bitmap_into<T>` reads only the
 dictionary entries selected by an upstream bitmap, with an 8-row
@@ -133,10 +141,24 @@ on multiples of 8 without leaking padding into the value stream.
 For long-run-dominated input (e.g., a sorted dimension key
 repeated thousands of times), the index stream shrinks 10-100×.
 
+**Decode into caller buffer** (v0.2) — every `read_column_*` entry
+point has a `_into(&mut Vec<T>)` sibling that reuses caller-owned
+memory across calls. Steady-state savings on hot read paths: on
+TPC-H lineitem `l_suppkey` the per-call cost drops from 1.51 ms
+(allocating) to 0.82 ms (`_into`) = **46% faster**; on
+`l_returnflag` byte_array-offsets from 3.26 ms → 2.70 ms.
+
+**Streaming batched decode** (v0.2) —
+`read_column_{i64,i32,f64}_batches(file, rg, col, batch_size)`
+returns an iterator that emits `Vec<T>` in batches sized to the
+caller's preference (typically Arrow's RecordBatch size). Lets
+the engine pipeline (process batch N while we decode batch N+1)
+and bounds working-set memory for huge row groups.
+
 ### Test coverage
 
 Oracle tests against `parquet-rs` cover both directions on every
-codec and every type. ~445 tests across 40+ test binaries. The
+codec and every type. ~475 tests across 40+ test binaries. The
 matrix:
 
 **Read side** — `parquet-rs` writes files we then decode and

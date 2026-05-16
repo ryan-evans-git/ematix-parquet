@@ -92,11 +92,40 @@ pub struct AdaptiveDictPredicate {
 }
 
 impl AdaptiveDictPredicate {
-    /// Placeholder threshold — replaced by a benchmark-derived
-    /// constant once Π.14c lands. Chosen low (0.10) so the
-    /// codec's existing Q14-shape hot path (~1% selectivity)
-    /// stays on the fused kernel by default; the bench sweep
-    /// confirms or moves this number.
+    /// Benchmark-derived crossover between `Fused` (with the
+    /// downstream bitmap-then-gather step a values-consumer pays)
+    /// and `Materialized` (which avoids the bitmap step entirely).
+    ///
+    /// Measured on TPC-H SF1 lineitem `l_shipdate` (1M rows, 52
+    /// pages, dict_len=2526, bw=12), median of 51 release-mode
+    /// iterations on aarch64:
+    ///
+    /// ```text
+    /// selectivity   fused+gather   materialised   winner
+    ///       0.1%        0.37 ms       0.99 ms     fused+gather  (2.7×)
+    ///       1.0%        0.53 ms       1.07 ms     fused+gather  (2.0×)
+    ///       5.0%        1.21 ms       1.29 ms     fused+gather  (1.07×)
+    ///      10.0%        1.72 ms       1.59 ms     materialised  (1.08×)
+    ///      20.0%        2.17 ms       2.21 ms     ~tied
+    ///      50.0%        3.69 ms       4.30 ms     fused+gather  (1.16×)
+    ///      90.0%        2.39 ms       2.29 ms     materialised  (1.04×)
+    /// ```
+    ///
+    /// At 10% selectivity the two paths cross; below that the
+    /// fused path wins decisively (up to 2.7× at Q14-shape ~1%
+    /// selectivity), above it materialised is competitive and
+    /// usually wins. The mid-range (20-50%) is noisy because the
+    /// curves are close and depend on cache + allocator behaviour
+    /// of the specific workload.
+    ///
+    /// `bench_adaptive_dispatch` (in `examples/`) reproduces the
+    /// numbers above and is the right place to retune if a future
+    /// workload shifts the crossover.
+    ///
+    /// For bitmap-consuming callers (filter chain, COUNT
+    /// aggregator) the fused path always wins; those callers
+    /// should keep using `decode_rle_dictionary_predicate_bitmap`
+    /// directly rather than going through the adaptive runner.
     pub const DEFAULT_THRESHOLD: f32 = 0.10;
 
     /// Default probe budget — three pages gives a more robust

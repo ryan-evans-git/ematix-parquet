@@ -124,5 +124,15 @@ name = "key_rotation"
 path = "examples/key_rotation.rs"
 required-features = ["encryption"]
 
+# Π.14c adaptive-dispatch threshold-tuning bench. Sweeps target
+# selectivities across the same lineitem `l_shipdate` chunk and
+# times static-fused vs static-materialised vs adaptive. The
+# observed crossover where matr_ms < fused_ms is the threshold to
+# commit as `AdaptiveDictPredicate::DEFAULT_THRESHOLD`.
+# Run: TPCH_DATA_DIR=/path cargo run --release --example bench_adaptive_dispatch
+[[example]]
+name = "bench_adaptive_dispatch"
+path = "examples/bench_adaptive_dispatch.rs"
+
 [lints]
 workspace = true

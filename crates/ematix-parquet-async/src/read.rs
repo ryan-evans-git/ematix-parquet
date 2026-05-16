@@ -1,0 +1,261 @@
+//! Async read façade — mirror of `ematix_parquet_codec::read` with
+//! async I/O at the chunk-fetch boundary.
+//!
+//! The page walk + per-encoding decode is the same byte-slice work
+//! the sync crate does; once the chunk's compressed bytes are in
+//! memory, no more `await` points. This keeps the async surface
+//! narrow (one GET per chunk) and lets us reuse every existing
+//! decoder.
+
+use bytes::Bytes;
+use ematix_parquet_codec::compression::{
+    decompress_brotli_into, decompress_gzip_into, decompress_lz4_raw_into,
+    decompress_snappy_into, decompress_zstd_into,
+};
+use ematix_parquet_codec::dict::decode_rle_dictionary_into;
+use ematix_parquet_codec::plain::{
+    decode_plain_f64, decode_plain_i32, decode_plain_i64,
+};
+use ematix_parquet_format::metadata::PageHeader;
+use ematix_parquet_format::types::{CompressionCodec, Encoding, PageType};
+use ematix_parquet_io::PageWalker;
+
+use crate::error::{AsyncError, Result};
+use crate::file::AsyncParquetFile;
+
+/// Read INT64 column chunk asynchronously. Issues one GET for the
+/// chunk bytes, then walks pages + decodes in memory.
+pub async fn read_column_i64_async(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    read_column_i64_async_into(file, row_group, column, &mut out).await?;
+    Ok(out)
+}
+
+/// `read_column_i64_async` writing into a caller-provided buffer.
+pub async fn read_column_i64_async_into(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+    out: &mut Vec<i64>,
+) -> Result<()> {
+    let (chunk_bytes, total_values, codec) =
+        read_chunk_raw_async(file, row_group, column).await?;
+    decode_chunk_into(&chunk_bytes, total_values, codec, out, decode_plain_i64)
+}
+
+/// Read INT32 column chunk asynchronously.
+pub async fn read_column_i32_async(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<Vec<i32>> {
+    let mut out = Vec::new();
+    read_column_i32_async_into(file, row_group, column, &mut out).await?;
+    Ok(out)
+}
+
+pub async fn read_column_i32_async_into(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+    out: &mut Vec<i32>,
+) -> Result<()> {
+    let (chunk_bytes, total_values, codec) =
+        read_chunk_raw_async(file, row_group, column).await?;
+    decode_chunk_into(&chunk_bytes, total_values, codec, out, decode_plain_i32)
+}
+
+/// Read DOUBLE column chunk asynchronously.
+pub async fn read_column_f64_async(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<Vec<f64>> {
+    let mut out = Vec::new();
+    read_column_f64_async_into(file, row_group, column, &mut out).await?;
+    Ok(out)
+}
+
+pub async fn read_column_f64_async_into(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+    out: &mut Vec<f64>,
+) -> Result<()> {
+    let (chunk_bytes, total_values, codec) =
+        read_chunk_raw_async(file, row_group, column).await?;
+    decode_chunk_into(&chunk_bytes, total_values, codec, out, decode_plain_f64)
+}
+
+// ============================================================
+// internal: async chunk fetch + sync chunk decode
+// ============================================================
+
+/// Compute the chunk's `(start, length)` from metadata, issue one
+/// async GET, return the bytes + the chunk's total value count + codec.
+async fn read_chunk_raw_async(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<(Bytes, usize, CompressionCodec)> {
+    let md = file.metadata()?;
+    let rg = md.row_groups.get(row_group).ok_or_else(|| {
+        AsyncError::Format(format!("row group {row_group} out of range"))
+    })?;
+    let col = rg.columns.get(column).ok_or_else(|| {
+        AsyncError::Format(format!("column {column} out of range"))
+    })?;
+    let cm = col
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| AsyncError::Format("column missing inline meta_data".into()))?;
+    let start = cm
+        .dictionary_page_offset
+        .filter(|&d| d < cm.data_page_offset)
+        .unwrap_or(cm.data_page_offset) as u64;
+    let length = cm.total_compressed_size as u64;
+    let bytes = file.read_range(start, length).await?;
+    Ok((bytes, cm.num_values as usize, cm.codec))
+}
+
+/// Sync chunk decode that mirrors `ematix_parquet_codec::read::
+/// decode_chunk_into` exactly — walks dictionary then data pages,
+/// dispatches Plain vs RleDictionary, writes into the caller's
+/// buffer. Duplicated here (rather than re-exported from codec)
+/// because the codec version expects a sync `ParquetFile` to fetch
+/// the chunk; we already have the bytes in hand.
+fn decode_chunk_into<T: Copy>(
+    chunk_bytes: &[u8],
+    total_values: usize,
+    codec: CompressionCodec,
+    out: &mut Vec<T>,
+    decode_plain: impl Fn(&[u8]) -> ematix_parquet_codec::error::Result<Vec<T>>,
+) -> Result<()> {
+    out.clear();
+    let mut walker = PageWalker::new(chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+
+    let mut dict: Vec<T> = Vec::new();
+    out.reserve(total_values);
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_async)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
+                dict = decode_plain(&decomp).map_err(codec_to_async)?;
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                match info.encoding {
+                    Encoding::Plain => {
+                        out.extend(decode_plain(info.values).map_err(codec_to_async)?);
+                    }
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        if dict.is_empty() {
+                            return Err(AsyncError::Format(
+                                "dict-encoded data page before dictionary".into(),
+                            ));
+                        }
+                        decode_rle_dictionary_into(info.values, &dict, info.num_values, out)
+                            .map_err(codec_to_async)?;
+                    }
+                    other => {
+                        return Err(AsyncError::Format(format!(
+                            "encoding not yet dispatched by async façade: {other:?}"
+                        )));
+                    }
+                }
+            }
+            PageType::IndexPage => {}
+        }
+        if out.len() >= total_values {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Mirror of `ematix_parquet_codec::read::DataPageInfo` — local copy
+/// because that type is private. The shape and rules match exactly.
+struct DataPageInfo<'a> {
+    num_values: usize,
+    encoding: Encoding,
+    values: &'a [u8],
+}
+
+/// Mirror of codec's `data_page_view`. V1 decompresses the whole
+/// body; V2 keeps rep/def levels uncompressed and only decompresses
+/// the values portion (gated by `is_compressed`).
+fn data_page_view<'a>(
+    hdr: &'a PageHeader<'a>,
+    body: &'a [u8],
+    chunk_codec: CompressionCodec,
+    decomp: &'a mut Vec<u8>,
+) -> Result<DataPageInfo<'a>> {
+    if let Some(ref dph) = hdr.data_page_header {
+        decompress_into(chunk_codec, body, decomp)?;
+        Ok(DataPageInfo {
+            num_values: dph.num_values as usize,
+            encoding: dph.encoding,
+            values: decomp.as_slice(),
+        })
+    } else if let Some(ref dph) = hdr.data_page_header_v2 {
+        let rep_len = dph.repetition_levels_byte_length as usize;
+        let def_len = dph.definition_levels_byte_length as usize;
+        let prefix = rep_len + def_len;
+        if body.len() < prefix {
+            return Err(AsyncError::Format(format!(
+                "DataPageV2 body too short: {} bytes, need {} for rep+def",
+                body.len(),
+                prefix
+            )));
+        }
+        let value_bytes = &body[prefix..];
+        let values: &[u8] = if dph.is_compressed && chunk_codec != CompressionCodec::Uncompressed {
+            decompress_into(chunk_codec, value_bytes, decomp)?;
+            decomp.as_slice()
+        } else {
+            value_bytes
+        };
+        Ok(DataPageInfo {
+            num_values: dph.num_values as usize,
+            encoding: dph.encoding,
+            values,
+        })
+    } else {
+        Err(AsyncError::Format(
+            "data page missing both V1 and V2 header".into(),
+        ))
+    }
+}
+
+fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    match codec {
+        CompressionCodec::Uncompressed => {
+            out.clear();
+            out.extend_from_slice(body);
+            Ok(())
+        }
+        CompressionCodec::Snappy => decompress_snappy_into(body, out).map_err(codec_to_async),
+        CompressionCodec::Zstd => decompress_zstd_into(body, out).map_err(codec_to_async),
+        CompressionCodec::Gzip => decompress_gzip_into(body, out).map_err(codec_to_async),
+        CompressionCodec::Brotli => decompress_brotli_into(body, out).map_err(codec_to_async),
+        CompressionCodec::Lz4Raw => decompress_lz4_raw_into(body, out).map_err(codec_to_async),
+        other => Err(AsyncError::Format(format!(
+            "compression codec not yet wired in async façade: {other:?}"
+        ))),
+    }
+}
+
+fn io_to_async(e: ematix_parquet_io::IoError) -> AsyncError {
+    AsyncError::Format(format!("io: {e}"))
+}
+
+fn codec_to_async(e: ematix_parquet_codec::error::CodecError) -> AsyncError {
+    AsyncError::Format(format!("codec: {e}"))
+}

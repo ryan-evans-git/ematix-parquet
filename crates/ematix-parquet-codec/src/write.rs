@@ -45,6 +45,11 @@ use crate::compression::{
 use crate::error::{CodecError, Result};
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
+/// Magic used at the file trailer in **encrypted-footer** PME mode.
+/// Signals that the FileMetaData itself is encrypted and a
+/// FileCryptoMetaData trailer sits just ahead of it.
+#[cfg(feature = "encryption")]
+const PARQUET_MAGIC_ENCRYPTED: &[u8; 4] = b"PARE";
 
 // ---- Multi-column table writer -------------------------------------
 
@@ -459,9 +464,63 @@ pub fn write_i32_column_to_path_encrypted(
         stats,
         key,
         aad_prefix,
+        FooterMode::Plaintext,
     )?;
     w.flush().map_err(io_to_codec)?;
     Ok(())
+}
+
+/// PME **encrypted-footer mode**: write a single i32 column with both
+/// page data AND the FileMetaData itself encrypted under `key`.
+///
+/// File trailer layout (vs plaintext-footer's PAR1 mode):
+///
+/// ```text
+///   [ ... encrypted pages ... ]
+///   [ FileCryptoMetaData (Thrift) ]
+///   [ encrypted FileMetaData wire frame ]
+///   [ footer_len: u32 LE ]    -- covers both Thrift + encrypted frame
+///   [ PARE ]                  -- magic distinguishes from PAR1
+/// ```
+///
+/// Footer-key mode only (same as `write_i32_column_to_path_encrypted`).
+/// Caller must supply the same `key` to the reader.
+#[cfg(feature = "encryption")]
+pub fn write_i32_column_to_path_encrypted_footer(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[i32],
+    key: &ematix_parquet_crypto::key::Key,
+    aad_prefix: Option<&[u8]>,
+) -> Result<()> {
+    let body = encode_plain_i32(values);
+    let stats = stats_i32(values);
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_encrypted(
+        &mut w,
+        name,
+        ParquetType::Int32,
+        values.len(),
+        body,
+        CompressionCodec::Uncompressed,
+        stats,
+        key,
+        aad_prefix,
+        FooterMode::Encrypted,
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+/// PME footer mode for the encrypted-write helpers. Plaintext keeps
+/// the readable PAR1-magic footer + per-page encryption; Encrypted
+/// additionally seals the FileMetaData itself and emits PARE magic.
+#[cfg(feature = "encryption")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterMode {
+    Plaintext,
+    Encrypted,
 }
 
 pub fn write_f64_column_to_path(path: impl AsRef<Path>, name: &str, values: &[f64]) -> Result<()> {
@@ -826,6 +885,7 @@ fn write_single_column_encrypted<W: Write>(
     stats: ColumnStats,
     key: &ematix_parquet_crypto::key::Key,
     aad_prefix: Option<&[u8]>,
+    footer_mode: FooterMode,
 ) -> Result<()> {
     use crate::encrypted::{encrypt_module, ColumnEncryptContext};
     use ematix_parquet_crypto::aad::ModuleType;
@@ -961,6 +1021,12 @@ fn write_single_column_encrypted<W: Write>(
         total_compressed_size: None,
         ordinal: Some(0),
     };
+    // FileMetaData differs between the two footer modes:
+    //   - Plaintext footer: include encryption_algorithm so the reader
+    //     can build the AAD on decrypt of column pages.
+    //   - Encrypted footer: encryption_algorithm lives in the
+    //     FileCryptoMetaData trailer instead; the (encrypted)
+    //     FileMetaData does NOT repeat it (matches parquet-rs).
     let md = FileMetaData {
         version: 1,
         schema: vec![root, leaf],
@@ -969,51 +1035,86 @@ fn write_single_column_encrypted<W: Write>(
         key_value_metadata: None,
         created_by: Some(b"ematix-parquet 0.0.1"),
         column_orders: None,
-        encryption_algorithm: Some(EncryptionAlgorithm::AesGcmV1(AesGcmV1 {
-            aad_prefix: None,
-            aad_file_unique: Some(&file_unique),
-            // Set when the caller passes an aad_prefix that is NOT
-            // embedded in the file — readers must obtain it
-            // themselves.
-            supply_aad_prefix: aad_prefix.map(|_| true),
-        })),
+        encryption_algorithm: match footer_mode {
+            FooterMode::Plaintext => Some(EncryptionAlgorithm::AesGcmV1(AesGcmV1 {
+                aad_prefix: None,
+                aad_file_unique: Some(&file_unique),
+                supply_aad_prefix: aad_prefix.map(|_| true),
+            })),
+            FooterMode::Encrypted => None,
+        },
         footer_signing_key_metadata: None,
     };
     let footer = write_file_metadata(&md);
 
-    // Plaintext-footer-mode signature per spec:
-    //   [ FileMetaData ][ nonce: 12B ][ tag: 16B ]
-    // computed as AES-GCM over the FileMetaData bytes with the
-    // footer key and Footer-module AAD. parquet-rs verifies this on
-    // read, even though the footer itself is unencrypted.
     use ematix_parquet_crypto::aad::build_module_aad;
     use ematix_parquet_crypto::aead::seal;
     use ematix_parquet_crypto::nonce::NonceSource;
 
-    let footer_aad = build_module_aad(aad_prefix, &file_unique, ModuleType::Footer, 0, 0, None);
-    let footer_nonce = ctx
-        .nonces
-        .next()
-        .map_err(|e| CodecError::Decompress(format!("PME encrypt: footer nonce: {e}")))?;
-    let ct_and_tag = seal(key, &footer_nonce, &footer_aad, &footer)
-        .map_err(|e| CodecError::Decompress(format!("PME encrypt: footer seal: {e}")))?;
-    // We need just the trailing tag (the ciphertext we discard;
-    // the FileMetaData stays plaintext on disk). `aes-gcm` always
-    // returns ciphertext || tag, so the last 16 bytes are the tag.
-    let tag = &ct_and_tag[ct_and_tag.len() - 16..];
+    match footer_mode {
+        FooterMode::Plaintext => {
+            // Plaintext-footer-mode signature per spec:
+            //   [ FileMetaData ][ nonce: 12B ][ tag: 16B ]
+            // GCM tag over the FileMetaData bytes with the footer key
+            // and Footer-module AAD. parquet-rs verifies this on read.
+            let footer_aad =
+                build_module_aad(aad_prefix, &file_unique, ModuleType::Footer, 0, 0, None);
+            let footer_nonce = ctx
+                .nonces
+                .next()
+                .map_err(|e| CodecError::Decompress(format!("PME encrypt: footer nonce: {e}")))?;
+            let ct_and_tag = seal(key, &footer_nonce, &footer_aad, &footer)
+                .map_err(|e| CodecError::Decompress(format!("PME encrypt: footer seal: {e}")))?;
+            let tag = &ct_and_tag[ct_and_tag.len() - 16..];
 
-    let footer_len = (footer.len() + 12 + 16) as u32;
-    out.write_all(&footer).map_err(io_to_codec)?;
-    written += footer.len() as u64;
-    out.write_all(&footer_nonce).map_err(io_to_codec)?;
-    written += 12;
-    out.write_all(tag).map_err(io_to_codec)?;
-    written += 16;
+            let footer_len = (footer.len() + 12 + 16) as u32;
+            out.write_all(&footer).map_err(io_to_codec)?;
+            written += footer.len() as u64;
+            out.write_all(&footer_nonce).map_err(io_to_codec)?;
+            written += 12;
+            out.write_all(tag).map_err(io_to_codec)?;
+            written += 16;
 
-    out.write_all(&footer_len.to_le_bytes())
-        .map_err(io_to_codec)?;
-    out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
-    written += 8;
+            out.write_all(&footer_len.to_le_bytes())
+                .map_err(io_to_codec)?;
+            out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
+            written += 8;
+        }
+        FooterMode::Encrypted => {
+            // Encrypted-footer trailer layout (PARE magic):
+            //   [ FileCryptoMetaData Thrift ]
+            //   [ encrypted FileMetaData wire frame ]
+            //   [ footer_len: u32 LE ]   -- covers both above
+            //   [ PARE ]
+            use crate::encrypted::encrypt_footer;
+            use ematix_parquet_format::metadata::FileCryptoMetaData;
+            use ematix_parquet_format::metadata_writer::write_file_crypto_metadata;
+
+            let fcm = FileCryptoMetaData {
+                encryption_algorithm: Some(EncryptionAlgorithm::AesGcmV1(AesGcmV1 {
+                    aad_prefix: None,
+                    aad_file_unique: Some(&file_unique),
+                    supply_aad_prefix: aad_prefix.map(|_| true),
+                })),
+                key_metadata: None,
+            };
+            let fcm_bytes = write_file_crypto_metadata(&fcm);
+            let encrypted_md_frame =
+                encrypt_footer(&footer, key, aad_prefix, &file_unique, ctx.nonces)?;
+
+            let footer_len = (fcm_bytes.len() + encrypted_md_frame.len()) as u32;
+            out.write_all(&fcm_bytes).map_err(io_to_codec)?;
+            written += fcm_bytes.len() as u64;
+            out.write_all(&encrypted_md_frame).map_err(io_to_codec)?;
+            written += encrypted_md_frame.len() as u64;
+
+            out.write_all(&footer_len.to_le_bytes())
+                .map_err(io_to_codec)?;
+            out.write_all(PARQUET_MAGIC_ENCRYPTED)
+                .map_err(io_to_codec)?;
+            written += 8;
+        }
+    }
 
     let _ = written;
     Ok(())

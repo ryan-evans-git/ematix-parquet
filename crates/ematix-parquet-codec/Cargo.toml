@@ -115,5 +115,14 @@ path = "examples/bench_snappy.rs"
 name = "bench_q14_late_mat"
 path = "examples/bench_q14_late_mat.rs"
 
+# Π.13f end-to-end key-rotation demo. Writes an encrypted-footer
+# file, decrypts it under the old key, re-writes under a new key,
+# and confirms the old key no longer decrypts the rotated file.
+# Run: cargo run --release --example key_rotation -p ematix-parquet-codec --features encryption
+[[example]]
+name = "key_rotation"
+path = "examples/key_rotation.rs"
+required-features = ["encryption"]
+
 [lints]
 workspace = true

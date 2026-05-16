@@ -13,19 +13,23 @@ Tracks the work between v0.1.1 and v2.0. Phases use the existing `Π.N` conventi
 | Π.7   | BYTE_STREAM_SPLIT + first NEON wave (bw=14, gather opt, bw=17 lookup) | ✓ Done   |
 | Π.8   | Performance polish: byte_array zero-copy, more NEON widths, RLE coalesce | ✓ Done |
 | Π.9   | Photon-inspired: decode-into-buffer, predicate fusion, batched API   | ✓ Done   |
-| Π.10  | Async / object-store integration (S3 / GCS / Azure)                  | Planned  |
-| Π.11  | x86 SIMD parity (AVX2 / AVX-512 kernels mirroring NEON)              | Planned  |
-| Π.12  | Parquet Modular Encryption (read + write)                            | Planned  |
-| Π.13  | Adaptive runtime dispatch on observed selectivity                    | Planned  |
-| Π.14  | NUMA awareness and work-stealing for multi-RG parallel decode        | Planned  |
-| Π.15  | Custom LLVM codegen for hot decode paths (Photon-style)              | Speculative |
+| Π.10  | Late-materialization read façade (`read_column_*_masked_into`)       | Planned  |
+| Π.11  | Async / object-store integration (S3 / GCS / Azure)                  | Planned  |
+| Π.12  | x86 SIMD parity (AVX2 / AVX-512 kernels mirroring NEON)              | Planned  |
+| Π.13  | Parquet Modular Encryption (read + write)                            | Planned  |
+| Π.14  | Adaptive runtime dispatch on observed selectivity                    | Planned  |
+| Π.15  | NUMA awareness and work-stealing for multi-RG parallel decode        | Planned  |
+| Π.16  | Custom LLVM codegen for hot decode paths (Photon-style)              | Speculative |
 
 v1.0 cut criteria are already met (correctness, interop, beats
 parquet-rs end-to-end on TPC-H lineitem). v0.1–v0.2 shipped the
-Apple-Silicon-first, sync-IO codec; v1.0–v2.0 broadens the platform
-footprint (Π.10 async, Π.11 x86, Π.12 encryption) and pushes the
-performance ceiling further on workloads where const-generic
-monomorphization stops being enough (Π.13–Π.15).
+Apple-Silicon-first, sync-IO codec; Π.10 (the next ship, sized
+~1.5 weeks because every building block already exists) closes a
+measured 2 ms Q14 gap to Polars via late-materialization. v0.4 and
+beyond broaden the platform footprint (Π.11 async, Π.12 x86,
+Π.13 encryption) and push the performance ceiling further on
+workloads where const-generic monomorphization stops being enough
+(Π.14–Π.16).
 
 ---
 
@@ -505,11 +509,76 @@ streams independently.
 
 The bigger structural items (async I/O, x86 SIMD, encryption,
 adaptive dispatch, NUMA, custom codegen) graduated from "out of
-scope" to **Π.10 through Π.15** — see below.
+scope" to **Π.11 through Π.16** — see below.
 
 ---
 
-## Π.10 — Async / object-store integration (planned)
+## Π.10 — Late-materialization read façade (planned)
+
+**Goal.** Close a measured ~2 ms Q14 gap to Polars by adding
+top-level "decode a column with a row-mask" entry points. Today
+ematix-parquet decodes every column in full, then applies the
+filter — Polars decodes the filter column first, builds a mask,
+then sparse-decodes only matching rows in the other columns
+(99% of the decode work skipped at Q14's ~1.4% selectivity).
+
+**Shovel-ready.** Every building block already exists in
+`ematix-parquet-codec` from Π.9:
+- `gather_dict_at_bitmap_into<T>` — dict-encoded sparse gather
+- `decode_rle_dictionary_predicate_bitmap` — filter-col → bitmap
+- `decode_*_into(&mut Vec<T>)` — caller-buffer reuse
+
+What's missing is the top-level façade that composes them and
+the PLAIN sparse-decode primitive.
+
+**Touches.**
+- `crates/ematix-parquet-codec/src/read.rs` — add
+  `read_column_{i32,i64,f64,byte_array}_masked_into(file, rg,
+  col, mask: &[u8], out: &mut Vec<T>)` entry points. Per-page
+  popcount-skip; dict-encoded pages dispatch to
+  `gather_dict_at_bitmap_into`; PLAIN pages use new sparse-
+  decode helpers.
+- `crates/ematix-parquet-codec/src/plain.rs` — add
+  `plain_sparse_decode_{i32,i64,f64}_into` and
+  `plain_sparse_decode_byte_array_offsets_into`.
+- `crates/ematix-parquet-codec/src/dict.rs` — add a
+  `gather_dict_at_bitmap_into_clone<T: Clone>` sibling for
+  `Vec<u8>` (byte_array dict).
+- New bench example `bench_q14_late_mat` for end-to-end
+  measurement.
+
+**Sub-phases.**
+- **Π.10a** — `read_column_*_masked_into` for i32/i64/f64
+  (3-4 days). Façade entry points; dict path reuses existing
+  primitive; PLAIN path adds the three scalar sparse-decoders.
+  Per-page popcount-skip. Oracle tests across encodings ×
+  selectivities.
+- **Π.10b** — `read_column_byte_array_masked_into` + offsets
+  variant (2-3 days). Variable-length sparse-decode for the
+  PLAIN path; dict path reuses the clone-based sibling.
+- **Π.10c** — Q14 bench + ematix-flow bridge integration
+  (3-4 days). Bridge orders the decode behind a `with_late_mat`
+  builder flag for A/B; full TPC-H sweep for 0 regressions.
+
+**Acceptance.**
+1. Bit-identical equivalence vs full-decode-then-filter,
+   across types × encodings × selectivities (0–100% in a sweep).
+2. End-to-end Q14 (in ematix-flow) ≤ 13.0 ms (beats Polars's
+   12.53 ms with breathing room). Stretch: ≤ 11.0 ms.
+3. 0 regressions on the full TPC-H sweep.
+
+**Estimate.** 8-11 dev days, ~1.5 calendar weeks. See
+`docs/plans/PI-10-late-mat-design.md` for the full design.
+
+**Why first.** Π.10 ships as v0.3.0 because it's the smallest
+high-impact item on the roadmap. The building blocks all exist;
+the work is exposing them at the façade layer. Lands before
+async/x86/encryption (which are multi-week lifts) so the
+release flow gets exercised on a low-risk PR sequence.
+
+---
+
+## Π.11 — Async / object-store integration (planned)
 
 **Goal.** Real workloads land on S3 / GCS / Azure, not local disk.
 The current `ematix-parquet-io` is sync `std::io::Read`; for cloud
@@ -547,7 +616,7 @@ even if its codec is faster.
 
 ---
 
-## Π.11 — x86 SIMD parity (planned)
+## Π.12 — x86 SIMD parity (planned)
 
 **Goal.** Hand-tuned AVX2 (and where it pays, AVX-512) bit-unpack
 + predicate-fused kernels mirroring the NEON wave (bw=12, 14, 15,
@@ -586,7 +655,7 @@ throughput).
 
 ---
 
-## Π.12 — Parquet Modular Encryption (planned)
+## Π.13 — Parquet Modular Encryption (planned)
 
 **Goal.** Read and write files using Parquet Modular Encryption (PME)
 — the spec-defined per-column-chunk AES-GCM encryption used in
@@ -630,13 +699,13 @@ encryption work benefits the maximum number of deployments.
 
 ---
 
-## Π.13 — Adaptive runtime dispatch on observed selectivity (planned)
+## Π.14 — Adaptive runtime dispatch on observed selectivity (planned)
 
 **Goal.** The fused-predicate path (Π.9b) is 3.7-6.3× faster than
 materialise-then-filter at ≤ 5% selectivity, but at high selectivity
 (say > 50%) the materialise path is competitive or faster (no
 bitmap-pack overhead, downstream consumers want values anyway).
-Today the caller picks. Π.13 lets the codec pick, based on observed
+Today the caller picks. Π.14 lets the codec pick, based on observed
 selectivity from the first N pages of a chunk.
 
 **Touches.**
@@ -662,20 +731,20 @@ selectivity from the first N pages of a chunk.
 **Estimate.** 1-2 weeks. The dispatch logic is small; the bench
 sweep + threshold tuning is most of the work.
 
-**Why fourth.** Π.13 is pure performance polish on an existing
+**Why fourth.** Π.14 is pure performance polish on an existing
 shipped capability (Π.9b). Lands once the breadth-of-platform work
 (async, x86, encryption) is in — then the wins compound across more
 deployments.
 
 ---
 
-## Π.14 — NUMA awareness and work-stealing parallel decode (planned)
+## Π.15 — NUMA awareness and work-stealing parallel decode (planned)
 
 **Goal.** A multi-row-group file is naturally embarrassingly
 parallel (each RG is independent). Today consumers can decode RGs
 in parallel themselves with `rayon::join` or similar, but on NUMA
 machines this leaves performance on the table when threads land on
-the wrong socket relative to the chunk-bytes buffer. Π.14 lifts
+the wrong socket relative to the chunk-bytes buffer. Π.15 lifts
 the thread/NUMA awareness into the codec.
 
 **Touches.**
@@ -709,7 +778,7 @@ consumer hits the NUMA wall.
 
 ---
 
-## Π.15 — Custom LLVM codegen for hot decode paths (speculative)
+## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot
 decode loops, fusing predicate, dictionary lookup, projection, and

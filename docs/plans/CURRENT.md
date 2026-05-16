@@ -12,6 +12,7 @@ Tracks the work between v0.1.1 and v1.0. Phases use the existing `Π.N` conventi
 | Π.6   | DataPageV2 (read + write) + Bloom-filter decoder                     | ✓ Done   |
 | Π.7   | BYTE_STREAM_SPLIT + first NEON wave (bw=14, gather opt, bw=17 lookup) | ✓ Done   |
 | Π.8   | Performance polish: byte_array zero-copy, more NEON widths, RLE coalesce | ✓ Done |
+| Π.9   | Photon-inspired: decode-into-buffer, predicate fusion, batched API   | Active   |
 
 v1.0 cut criteria are already met (correctness, interop, beats
 parquet-rs end-to-end on TPC-H lineitem). Π.8 is concrete performance
@@ -362,3 +363,104 @@ zero where it shouldn't have.
 - **Per-column encoding choice on `write_table_*`** — would let
   callers mix PLAIN and dict per column. Useful but invasive (new
   `WriteOptions` shape). Land it when a real consumer asks.
+
+---
+
+## Π.9 — Photon-inspired performance work (active)
+
+The Databricks Photon paper (SIGMOD 2022) and engineering blog
+posts describe a vectorized C++ query engine. Most of its design
+sits at the *engine* layer (what ematix-flow plays), but a coherent
+subset — how individual column scans are organized — lives at our
+layer. Π.9 lifts that subset.
+
+**What we already have that mirrors Photon:** bytes+offsets layout
+(Π.8a), page-index pruning (Π.5a), bloom filters (Π.6c), fused
+predicate decode (existing bw=12 kernel), sparse gather, raw-pointer
+hot loops, smart RLE writes (Π.8c). Those are explicit in the
+Photon paper too.
+
+**What's worth lifting:**
+
+### Π.9a — Decode-into-caller-buffer API (active)
+
+**Goal.** Eliminate the per-call `Vec` allocation in the read façade
+by letting callers pass an `&mut Vec<T>` they reuse. Mirrors how
+Photon writes directly into Arrow buffers.
+
+**Touches.** `crates/ematix-parquet-codec/src/read.rs`. For each
+existing `read_column_*` entry point, add an `_into` variant that
+takes the output buffer; refactor the existing function to be a
+thin wrapper that allocates and calls the `_into` version. Same
+treatment for `read_column_byte_array_offsets`.
+
+**Acceptance.**
+1. `read_column_*_into(file, rg, col, &mut Vec<T>)` for every type
+   we expose today (i32, i64, f64, byte_array, int96, flba +
+   `byte_array_offsets`).
+2. `read_column_*_with_range_into` for the page-pruning variants.
+3. Calling `_into` twice with the same buffer overwrites on the
+   second call (clear-then-fill semantics).
+4. Existing `read_column_*` tests still pass (the wrappers must be
+   byte-identical to the old direct implementations).
+5. Oracle test: 10 successive reads of the same chunk into the same
+   buffer produce 10 identical results, with no growth past the
+   first allocation.
+6. `bench_decode` adds an `ours_into` row to demonstrate the
+   steady-state savings on a hot read path.
+
+**Estimate.** 1 day. Pure refactor + thin wrappers + tests.
+
+### Π.9b — Predicate fusion for more widths and types (planned)
+
+**Goal.** Extend the existing `decode_rle_dictionary_predicate_bitmap_bw12`
+pattern to bw=14/15/16/17/18 and to i64/byte_array/f64 dict
+columns. Photon's "evaluate predicate against the dict, build a
+match bitmap, walk indices comparing to the bitmap" is the win on
+selective scans — never materialise values that won't match.
+
+**Acceptance.**
+1. Per-width fused decoders for the bw=14/15/16/17/18 NEON kernels
+   (matching the bw=12 fused signature).
+2. Generic `decode_rle_dictionary_predicate_bitmap<T>` that takes
+   a `Fn(&T) -> bool` predicate and a precomputed dict-id mask.
+3. Q14-style benchmark on a non-bw=12 column shows ≥ 2× speedup
+   over the materialise-then-filter baseline for ≤ 5% selectivity.
+
+**Estimate.** 3-5 days. Each width is mechanical (shape mirrors
+bw=12); the generic predicate-vs-dict-mask path is a one-time
+design.
+
+### Π.9c — Streaming / batched decode API (planned)
+
+**Goal.** Yield batches of N rows instead of materialising the
+whole chunk. Lets ematix-flow pipeline (decode batch N+1 while
+processing batch N), bounds memory footprint for huge row groups,
+and matches Arrow's natural RecordBatch sizing.
+
+**Acceptance.**
+1. `read_column_*_batches(file, rg, col, batch_size) -> impl Iterator<Item = Result<Vec<T>>>`.
+2. Bounded memory: peak allocation ≤ `batch_size * sizeof::<T>()` +
+   the chunk-bytes buffer (already allocated for any read).
+3. Oracle test: collecting all batches concatenates to the same
+   `Vec<T>` as `read_column_*`.
+
+**Estimate.** 2-3 days. Care needed around dict-page handling
+(must build the dict before the first batch; persist across
+batches within a chunk).
+
+### Out of scope for Π.9
+
+- **NEON prefetching in the dict gather** — `pld` instruction one
+  cache line ahead. Worthwhile when dict > L1, but a focused
+  benchmark first; defer until measured. Could be a quick Π.9d.
+- **u8 dict indices when bw ≤ 8** — saves Vec<u32> overhead in
+  the index stream. Small wins on l_returnflag-class columns;
+  defer until a benchmark says it matters.
+- **Custom LLVM codegen** — Photon does this; we don't have the
+  infra and our const-generic monomorphisation gets ~80% of the
+  benefit at zero infra cost.
+- **NUMA awareness, work-stealing** — server concerns, not for a
+  library.
+- **Adaptive runtime dispatch on observed selectivity** — needs
+  profiling infra; hard to make pay off in a per-call library.

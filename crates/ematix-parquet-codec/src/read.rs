@@ -42,7 +42,22 @@ pub fn read_column_i64(
     row_group: usize,
     column: usize,
 ) -> Result<Vec<i64>> {
-    decode_chunk(file, row_group, column, |bytes| decode_plain_i64(bytes))
+    let mut out = Vec::new();
+    read_column_i64_into(file, row_group, column, &mut out)?;
+    Ok(out)
+}
+
+/// `read_column_i64` writing into a caller-provided buffer (cleared
+/// then filled). Reuse the same `Vec` across calls to avoid the
+/// per-read allocation; steady-state cost is whatever the chunk
+/// itself requires.
+pub fn read_column_i64_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    out: &mut Vec<i64>,
+) -> Result<()> {
+    decode_chunk_into(file, row_group, column, out, |bytes| decode_plain_i64(bytes))
 }
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
@@ -52,7 +67,19 @@ pub fn read_column_i32(
     row_group: usize,
     column: usize,
 ) -> Result<Vec<i32>> {
-    decode_chunk(file, row_group, column, |bytes| decode_plain_i32(bytes))
+    let mut out = Vec::new();
+    read_column_i32_into(file, row_group, column, &mut out)?;
+    Ok(out)
+}
+
+/// `read_column_i32` writing into a caller-provided buffer.
+pub fn read_column_i32_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    out: &mut Vec<i32>,
+) -> Result<()> {
+    decode_chunk_into(file, row_group, column, out, |bytes| decode_plain_i32(bytes))
 }
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
@@ -62,7 +89,19 @@ pub fn read_column_f64(
     row_group: usize,
     column: usize,
 ) -> Result<Vec<f64>> {
-    decode_chunk(file, row_group, column, |bytes| decode_plain_f64(bytes))
+    let mut out = Vec::new();
+    read_column_f64_into(file, row_group, column, &mut out)?;
+    Ok(out)
+}
+
+/// `read_column_f64` writing into a caller-provided buffer.
+pub fn read_column_f64_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    out: &mut Vec<f64>,
+) -> Result<()> {
+    decode_chunk_into(file, row_group, column, out, |bytes| decode_plain_f64(bytes))
 }
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
@@ -78,12 +117,28 @@ pub fn read_column_byte_array(
     row_group: usize,
     column: usize,
 ) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    read_column_byte_array_into(file, row_group, column, &mut out)?;
+    Ok(out)
+}
+
+/// `read_column_byte_array` writing into a caller-provided buffer
+/// (cleared then filled). Note: the per-row `Vec<u8>` allocations
+/// are still incurred — for an allocation-light path use
+/// `read_column_byte_array_offsets` or its `_into` variant.
+pub fn read_column_byte_array_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    out: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    out.clear();
     let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
 
     let mut dict: Vec<Vec<u8>> = Vec::new();
-    let mut out: Vec<Vec<u8>> = Vec::with_capacity(total_values);
+    out.reserve(total_values);
 
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
@@ -135,7 +190,7 @@ pub fn read_column_byte_array(
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Read a BYTE_ARRAY column into Arrow-style flat bytes + offsets.
@@ -160,6 +215,27 @@ pub fn read_column_byte_array_offsets(
     row_group: usize,
     column: usize,
 ) -> Result<(Vec<u8>, Vec<u32>)> {
+    let mut bytes = Vec::new();
+    let mut offsets = Vec::new();
+    read_column_byte_array_offsets_into(file, row_group, column, &mut bytes, &mut offsets)?;
+    Ok((bytes, offsets))
+}
+
+/// `read_column_byte_array_offsets` writing into caller-provided
+/// buffers (cleared then filled). The bytes buffer's capacity is
+/// reused across calls; for steady-state hot paths this is a
+/// zero-allocation read once both buffers have grown to the
+/// largest chunk size.
+pub fn read_column_byte_array_offsets_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    out_bytes: &mut Vec<u8>,
+    out_offsets: &mut Vec<u32>,
+) -> Result<()> {
+    out_bytes.clear();
+    out_offsets.clear();
+
     let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
@@ -169,8 +245,7 @@ pub fn read_column_byte_array_offsets(
     let mut dict_bytes: Vec<u8> = Vec::new();
     let mut dict_offsets: Vec<u32> = vec![0];
 
-    let mut out_bytes: Vec<u8> = Vec::new();
-    let mut out_offsets: Vec<u32> = Vec::with_capacity(total_values + 1);
+    out_offsets.reserve(total_values + 1);
     out_offsets.push(0);
 
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
@@ -295,7 +370,7 @@ pub fn read_column_byte_array_offsets(
         }
     }
 
-    Ok((out_bytes, out_offsets))
+    Ok(())
 }
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
@@ -310,7 +385,19 @@ pub fn read_column_int96(
     row_group: usize,
     column: usize,
 ) -> Result<Vec<Int96>> {
-    decode_chunk(file, row_group, column, |bytes| decode_plain_int96(bytes))
+    let mut out = Vec::new();
+    read_column_int96_into(file, row_group, column, &mut out)?;
+    Ok(out)
+}
+
+/// `read_column_int96` writing into a caller-provided buffer.
+pub fn read_column_int96_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    out: &mut Vec<Int96>,
+) -> Result<()> {
+    decode_chunk_into(file, row_group, column, out, |bytes| decode_plain_int96(bytes))
 }
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
@@ -325,6 +412,21 @@ pub fn read_column_flba(
     row_group: usize,
     column: usize,
 ) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    read_column_flba_into(file, row_group, column, &mut out)?;
+    Ok(out)
+}
+
+/// `read_column_flba` writing into a caller-provided buffer
+/// (cleared then filled). Per-row `Vec<u8>` allocations still
+/// happen — there's no offsets variant for FLBA today.
+pub fn read_column_flba_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    out: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    out.clear();
     let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
     let type_length = type_length_for(file, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
@@ -334,7 +436,7 @@ pub fn read_column_flba(
     // if present, is also owned (Vec<Vec<u8>>) so values can be
     // copied out by index without holding onto page buffers.
     let mut dict: Vec<Vec<u8>> = Vec::new();
-    let mut out: Vec<Vec<u8>> = Vec::with_capacity(total_values);
+    out.reserve(total_values);
 
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
@@ -383,7 +485,7 @@ pub fn read_column_flba(
             break;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 // ---- Page-index pruning entry points (Π.5a) -------------------------
@@ -409,8 +511,22 @@ pub fn read_column_i64_with_range(
     lo: i64,
     hi: i64,
 ) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    read_column_i64_with_range_into(file, row_group, column, lo, hi, &mut out)?;
+    Ok(out)
+}
+
+/// `read_column_i64_with_range` writing into a caller-provided buffer.
+pub fn read_column_i64_with_range_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    lo: i64,
+    hi: i64,
+    out: &mut Vec<i64>,
+) -> Result<()> {
     let mask = page_mask_i64(file, row_group, column, lo, hi)?;
-    decode_chunk_masked(file, row_group, column, mask, |bytes| decode_plain_i64(bytes))
+    decode_chunk_masked_into(file, row_group, column, mask, out, |bytes| decode_plain_i64(bytes))
 }
 
 /// `read_column_i32` with page-index pruning by `[lo, hi]` (inclusive).
@@ -421,8 +537,22 @@ pub fn read_column_i32_with_range(
     lo: i32,
     hi: i32,
 ) -> Result<Vec<i32>> {
+    let mut out = Vec::new();
+    read_column_i32_with_range_into(file, row_group, column, lo, hi, &mut out)?;
+    Ok(out)
+}
+
+/// `read_column_i32_with_range` writing into a caller-provided buffer.
+pub fn read_column_i32_with_range_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    lo: i32,
+    hi: i32,
+    out: &mut Vec<i32>,
+) -> Result<()> {
     let mask = page_mask_i32(file, row_group, column, lo, hi)?;
-    decode_chunk_masked(file, row_group, column, mask, |bytes| decode_plain_i32(bytes))
+    decode_chunk_masked_into(file, row_group, column, mask, out, |bytes| decode_plain_i32(bytes))
 }
 
 fn page_mask_i64(
@@ -479,23 +609,25 @@ fn read_column_index_bytes(
 
 // ---- internals -------------------------------------------------------------
 
-/// Same as `decode_chunk` but skips data pages whose `page_mask`
+/// Same as `decode_chunk_into` but skips data pages whose `page_mask`
 /// entry is `false`. `page_mask` is indexed by data-page ordinal
 /// (dictionary pages are not counted). `None` means "no pruning"
-/// — equivalent to `decode_chunk`.
-fn decode_chunk_masked<T: Copy>(
+/// — equivalent to `decode_chunk_into`.
+fn decode_chunk_masked_into<T: Copy>(
     file: &ParquetFile,
     row_group: usize,
     column: usize,
     page_mask: Option<Vec<bool>>,
+    out: &mut Vec<T>,
     decode_plain: impl Fn(&[u8]) -> Result<Vec<T>>,
-) -> Result<Vec<T>> {
+) -> Result<()> {
+    out.clear();
     let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
 
     let mut dict: Vec<T> = Vec::new();
-    let mut out: Vec<T> = Vec::with_capacity(total_values);
+    out.reserve(total_values);
     let mut data_page_ix: usize = 0;
     let total_kept_data_pages = page_mask
         .as_ref()
@@ -530,7 +662,7 @@ fn decode_chunk_masked<T: Copy>(
                             info.values,
                             &dict,
                             info.num_values,
-                            &mut out,
+                            out,
                         )?;
                     }
                     other => {
@@ -548,7 +680,7 @@ fn decode_chunk_masked<T: Copy>(
             break;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn format_to_codec(e: ematix_parquet_format::error::FormatError) -> CodecError {
@@ -640,18 +772,21 @@ fn type_length_for(file: &ParquetFile, column: usize) -> Result<i32> {
 
 /// Generic chunk-decode for `Copy` scalar types. `decode_plain` knows
 /// how to turn a bytes slice into a `Vec<T>` via the PLAIN encoding.
-fn decode_chunk<T: Copy>(
+/// Writes into the caller's `out` buffer (cleared then filled).
+fn decode_chunk_into<T: Copy>(
     file: &ParquetFile,
     row_group: usize,
     column: usize,
+    out: &mut Vec<T>,
     decode_plain: impl Fn(&[u8]) -> Result<Vec<T>>,
-) -> Result<Vec<T>> {
+) -> Result<()> {
+    out.clear();
     let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
 
     let mut dict: Vec<T> = Vec::new();
-    let mut out: Vec<T> = Vec::with_capacity(total_values);
+    out.reserve(total_values);
 
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
@@ -675,7 +810,7 @@ fn decode_chunk<T: Copy>(
                             info.values,
                             &dict,
                             info.num_values,
-                            &mut out,
+                            out,
                         )?;
                     }
                     other => {
@@ -692,7 +827,7 @@ fn decode_chunk<T: Copy>(
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Pull the raw column-chunk bytes (compressed pages, dictionary

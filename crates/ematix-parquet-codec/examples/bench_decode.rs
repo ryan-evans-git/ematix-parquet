@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 
 use ematix_parquet_codec::compression::decompress_snappy_into;
 use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_into};
-use ematix_parquet_codec::read::read_column_byte_array_offsets;
+use ematix_parquet_codec::read::{
+    read_column_byte_array_offsets, read_column_byte_array_offsets_into,
+    read_column_i64_into,
+};
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_byte_array_n, decode_plain_f64, decode_plain_i32,
     decode_plain_i64,
@@ -373,10 +376,18 @@ fn main() {
 
     println!("l_suppkey  INT64  (dict bw=14, 100% — l_suppkey is the bw=14 hot path)");
     let (o_med, _, _) = bench("ours", || ours_decode_i64(&path, 2));
+    // _into variant: reuse the same Vec<i64> across iterations.
+    let suppkey_file = ParquetFile::open(&path).unwrap();
+    let mut suppkey_buf: Vec<i64> = Vec::new();
+    let (oi_med, _, _) = bench("ours (façade _into)", || {
+        read_column_i64_into(&suppkey_file, 0, 2, &mut suppkey_buf).unwrap();
+    });
     let (pr_med, _, _) = bench("parquet-rs", || pr_decode_i64(&path, 2));
     let (po_med, _, _) = bench("polars (eager)", || polars_decode_i64(&path, "l_suppkey"));
-    compare("ours vs parquet-rs", o_med, pr_med);
-    compare("ours vs polars    ", o_med, po_med);
+    compare("ours        vs parquet-rs", o_med, pr_med);
+    compare("ours _into  vs parquet-rs", oi_med, pr_med);
+    compare("ours _into  vs ours       ", oi_med, o_med);
+    compare("ours        vs polars     ", o_med, po_med);
     println!();
 
     println!("l_shipdate  INT32  (dict, 1,048,576 values)");
@@ -390,10 +401,19 @@ fn main() {
     println!("l_returnflag  BYTE_ARRAY  (3 distinct, all dict, 1,048,576 values)");
     let (o_med, _, _) = bench("ours", || ours_decode_byte_array(&path, 8));
     let (off_med, _, _) = bench("ours (offsets API)", || ours_decode_byte_array_offsets(&path, 8));
+    // _into variant: reuse bytes + offsets buffers across iterations.
+    let rf_file = ParquetFile::open(&path).unwrap();
+    let mut rf_bytes: Vec<u8> = Vec::new();
+    let mut rf_offsets: Vec<u32> = Vec::new();
+    let (offi_med, _, _) = bench("ours (offsets _into)", || {
+        read_column_byte_array_offsets_into(&rf_file, 0, 8, &mut rf_bytes, &mut rf_offsets)
+            .unwrap();
+    });
     let (pr_med, _, _) = bench("parquet-rs", || pr_decode_byte_array(&path, 8));
     let (po_med, _, _) = bench("polars (eager)", || polars_decode_byte_array(&path, "l_returnflag"));
-    compare("ours        vs parquet-rs", o_med, pr_med);
-    compare("ours offsets vs parquet-rs", off_med, pr_med);
-    compare("ours offsets vs ours       ", off_med, o_med);
-    compare("ours offsets vs polars     ", off_med, po_med);
+    compare("ours          vs parquet-rs", o_med, pr_med);
+    compare("ours offsets  vs parquet-rs", off_med, pr_med);
+    compare("ours off _into vs parquet-rs", offi_med, pr_med);
+    compare("ours off _into vs offsets   ", offi_med, off_med);
+    compare("ours offsets  vs polars     ", off_med, po_med);
 }

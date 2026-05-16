@@ -19,12 +19,12 @@ name = "ematix_parquet_codec"
 no-neon = []
 
 [dependencies]
-ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.3" }
+ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.4" }
 # io provides ParquetFile + PageWalker, used by the high-level `read`
 # facade. Lower-level byte-slice decoders (plain/dict/delta/...) do
 # not require io — consumers that want pure byte-slice access can
 # bypass the facade.
-ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.3" }
+ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.4" }
 # Snappy is the default codec for almost every parquet writer in the
 # wild (and the one TPC-H data uses). Pinning to a known-stable cut
 # of `snap` until benchmarks tell us we want a hand-rolled one.

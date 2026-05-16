@@ -1,18 +1,19 @@
-//! Π.12a unit tests: AVX2 bw=16 kernel correctness.
+//! Π.12a + Π.12b unit tests: AVX2 bw=16 + bw=14 kernel correctness.
 //!
 //! Only compiled + run on x86_64 with AVX2. On aarch64 / non-AVX2
 //! x86 these tests are absent from the test binary (cfg-gated out)
 //! — the NEON + scalar paths cover those targets.
 //!
-//! Strategy: pack known u16 values via the scalar packer, decode
-//! via AVX2, assert bit-identical output. Also exercise the
-//! lookup variant against a small dict to confirm the fused gather
+//! Strategy: pack known values via the scalar packer, decode via
+//! AVX2, assert bit-identical output. Also exercise the lookup
+//! variants against a small dict to confirm the fused gather
 //! produces the right values.
 
 #![cfg(target_arch = "x86_64")]
 
 use ematix_parquet_codec::bitpack_avx2::{
-    unpack_indices_into_avx2_bw16, unpack_lookup_into_avx2_bw16,
+    unpack_indices_into_avx2_bw14, unpack_indices_into_avx2_bw16,
+    unpack_lookup_into_avx2_bw14, unpack_lookup_into_avx2_bw16,
 };
 
 /// Pack `n` u16 values into LE bytes — the on-wire bw=16 form.
@@ -170,4 +171,117 @@ fn matches_scalar_dispatcher() {
 
     assert_eq!(via_dispatcher, via_direct, "dispatcher and direct AVX2 disagree");
     assert_eq!(via_dispatcher, values, "round trip mismatch");
+}
+
+// ============================================================
+// bw=14 — Π.12b
+// ============================================================
+
+/// Pack `n` u32 values (masked to 14 bits) into the on-wire bw=14
+/// LSB-first form. Mirrors the writer's bit-packed layout.
+fn pack_bwn(values: &[u32], bw: u8) -> Vec<u8> {
+    let total_bits = values.len() * bw as usize;
+    let total_bytes = total_bits.div_ceil(8);
+    let mut out = vec![0u8; total_bytes];
+    let mask: u64 = if bw == 32 { u32::MAX as u64 } else { (1u64 << bw) - 1 };
+    for (i, &v) in values.iter().enumerate() {
+        let v = (v as u64) & mask;
+        let start_bit = i * bw as usize;
+        let mut byte_idx = start_bit / 8;
+        let mut bit_in_byte = (start_bit % 8) as u32;
+        let mut remaining = v;
+        let mut remaining_bits = bw as u32;
+        while remaining_bits > 0 {
+            let space = 8 - bit_in_byte;
+            let take = space.min(remaining_bits);
+            let chunk = (remaining & ((1u64 << take) - 1)) as u8;
+            out[byte_idx] |= chunk << bit_in_byte;
+            remaining >>= take;
+            remaining_bits -= take;
+            byte_idx += 1;
+            bit_in_byte = 0;
+        }
+    }
+    out
+}
+
+#[test]
+fn bw14_indices_round_trip_aligned() {
+    if skip_if_no_avx2() {
+        return;
+    }
+    let values: Vec<u32> = (0..1024u32).map(|i| i.wrapping_mul(17) & 0x3FFF).collect();
+    let packed = pack_bwn(&values, 14);
+
+    let mut out: Vec<u32> = Vec::new();
+    unpack_indices_into_avx2_bw14(&packed, values.len(), &mut out).unwrap();
+    assert_eq!(out, values);
+}
+
+#[test]
+fn bw14_indices_round_trip_with_tail() {
+    if skip_if_no_avx2() {
+        return;
+    }
+    for n in [1usize, 7, 13, 17, 35, 100, 1003] {
+        let values: Vec<u32> = (0..n as u32)
+            .map(|i| i.wrapping_mul(13) & 0x3FFF)
+            .collect();
+        let packed = pack_bwn(&values, 14);
+
+        let mut out: Vec<u32> = Vec::new();
+        unpack_indices_into_avx2_bw14(&packed, n, &mut out).unwrap();
+        assert_eq!(out, values, "n = {n}");
+    }
+}
+
+#[test]
+fn bw14_indices_max_values() {
+    if skip_if_no_avx2() {
+        return;
+    }
+    // Saturate every 14-bit slot at 0x3FFF to catch sign-extension
+    // or off-by-one shift bugs.
+    let values: Vec<u32> = vec![0x3FFFu32; 256];
+    let packed = pack_bwn(&values, 14);
+
+    let mut out: Vec<u32> = Vec::new();
+    unpack_indices_into_avx2_bw14(&packed, values.len(), &mut out).unwrap();
+    assert_eq!(out, values);
+}
+
+#[test]
+fn bw14_lookup_round_trips_against_dict() {
+    if skip_if_no_avx2() {
+        return;
+    }
+    let dict: Vec<i64> = (1000..1200i64).collect();
+    let indices: Vec<u32> = (0..512).map(|i| (i % dict.len()) as u32).collect();
+    let packed = pack_bwn(&indices, 14);
+
+    let mut out: Vec<i64> = Vec::new();
+    unpack_lookup_into_avx2_bw14(&packed, indices.len(), &dict, &mut out).unwrap();
+
+    let expected: Vec<i64> = indices.iter().map(|&i| dict[i as usize]).collect();
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn bw14_matches_scalar_dispatcher() {
+    if skip_if_no_avx2() {
+        return;
+    }
+    use ematix_parquet_codec::bitpack::unpack_indices_into;
+
+    let values: Vec<u32> = (0..2_048u32).map(|i| i.wrapping_mul(31337) & 0x3FFF).collect();
+    let packed = pack_bwn(&values, 14);
+
+    let mut via_dispatcher: Vec<u32> = Vec::new();
+    unpack_indices_into(&packed, values.len(), 14, &mut via_dispatcher).unwrap();
+
+    let mut via_direct: Vec<u32> = Vec::new();
+    unpack_indices_into_avx2_bw14(&packed, values.len(), &mut via_direct).unwrap();
+
+    assert_eq!(via_dispatcher, via_direct, "bw14 dispatcher and direct AVX2 disagree");
+    assert_eq!(via_dispatcher, values, "bw14 round trip mismatch");
 }

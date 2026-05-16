@@ -36,6 +36,8 @@ pub mod read;
 pub use error::{AsyncError, Result};
 pub use file::AsyncParquetFile;
 pub use read::{
+    read_column_byte_array_async, read_column_byte_array_async_into,
+    read_column_byte_array_offsets_async, read_column_byte_array_offsets_async_into,
     read_column_f64_async, read_column_f64_async_into, read_column_i32_async,
     read_column_i32_async_into, read_column_i64_async, read_column_i64_async_into,
 };

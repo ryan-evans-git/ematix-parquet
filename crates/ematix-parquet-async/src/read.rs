@@ -12,9 +12,9 @@ use ematix_parquet_codec::compression::{
     decompress_brotli_into, decompress_gzip_into, decompress_lz4_raw_into,
     decompress_snappy_into, decompress_zstd_into,
 };
-use ematix_parquet_codec::dict::decode_rle_dictionary_into;
+use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_into};
 use ematix_parquet_codec::plain::{
-    decode_plain_f64, decode_plain_i32, decode_plain_i64,
+    decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
 };
 use ematix_parquet_format::metadata::PageHeader;
 use ematix_parquet_format::types::{CompressionCodec, Encoding, PageType};
@@ -89,6 +89,228 @@ pub async fn read_column_f64_async_into(
     let (chunk_bytes, total_values, codec) =
         read_chunk_raw_async(file, row_group, column).await?;
     decode_chunk_into(&chunk_bytes, total_values, codec, out, decode_plain_f64)
+}
+
+// ============================================================
+// byte_array — Vec<Vec<u8>> shape
+// ============================================================
+
+/// Read BYTE_ARRAY column chunk asynchronously, returning owned
+/// `Vec<u8>` per row. For low-cardinality dict-encoded columns this
+/// is much slower than the offsets variant (per-row allocation);
+/// prefer `read_column_byte_array_offsets_async` when downstream
+/// can consume the Arrow-style flat layout.
+pub async fn read_column_byte_array_async(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    read_column_byte_array_async_into(file, row_group, column, &mut out).await?;
+    Ok(out)
+}
+
+pub async fn read_column_byte_array_async_into(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+    out: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    out.clear();
+    let (chunk_bytes, total_values, codec) =
+        read_chunk_raw_async(file, row_group, column).await?;
+
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+    let mut dict: Vec<Vec<u8>> = Vec::new();
+    out.reserve(total_values);
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_async)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
+                let slices = decode_plain_byte_array(&decomp).map_err(codec_to_async)?;
+                dict = slices.into_iter().map(|s| s.to_vec()).collect();
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                match info.encoding {
+                    Encoding::Plain => {
+                        let slices = decode_plain_byte_array(info.values)
+                            .map_err(codec_to_async)?;
+                        out.extend(slices.into_iter().map(|s| s.to_vec()));
+                    }
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        if dict.is_empty() {
+                            return Err(AsyncError::Format(
+                                "dict-encoded data page before dictionary".into(),
+                            ));
+                        }
+                        let indices = decode_rle_dictionary_indices(
+                            info.values, info.num_values,
+                        ).map_err(codec_to_async)?;
+                        out.reserve(info.num_values);
+                        for idx in indices {
+                            let v = dict.get(idx as usize).ok_or_else(|| {
+                                AsyncError::Format(
+                                    "dictionary index out of range".into(),
+                                )
+                            })?;
+                            out.push(v.clone());
+                        }
+                    }
+                    other => {
+                        return Err(AsyncError::Format(format!(
+                            "encoding not yet dispatched by async façade: {other:?}"
+                        )));
+                    }
+                }
+            }
+            PageType::IndexPage => {}
+        }
+        if out.len() >= total_values {
+            break;
+        }
+    }
+    Ok(())
+}
+
+// ============================================================
+// byte_array — Arrow-style flat bytes + offsets
+// ============================================================
+
+/// Async equivalent of `read_column_byte_array_offsets`. Returns
+/// `(values, offsets)` where row `i` is `values[offsets[i] as usize
+/// .. offsets[i + 1] as usize]`. The trailing offset is the total
+/// values length (Arrow BinaryArray convention).
+pub async fn read_column_byte_array_offsets_async(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<(Vec<u8>, Vec<u32>)> {
+    let mut bytes = Vec::new();
+    let mut offsets = Vec::new();
+    read_column_byte_array_offsets_async_into(file, row_group, column, &mut bytes, &mut offsets)
+        .await?;
+    Ok((bytes, offsets))
+}
+
+pub async fn read_column_byte_array_offsets_async_into(
+    file: &AsyncParquetFile,
+    row_group: usize,
+    column: usize,
+    out_bytes: &mut Vec<u8>,
+    out_offsets: &mut Vec<u32>,
+) -> Result<()> {
+    out_bytes.clear();
+    out_offsets.clear();
+
+    let (chunk_bytes, total_values, codec) =
+        read_chunk_raw_async(file, row_group, column).await?;
+
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+
+    // Dictionary as flat bytes + offsets (same shape as the output).
+    let mut dict_bytes: Vec<u8> = Vec::new();
+    let mut dict_offsets: Vec<u32> = vec![0];
+
+    out_offsets.reserve(total_values + 1);
+    out_offsets.push(0);
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_async)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
+                let slices = decode_plain_byte_array(&decomp).map_err(codec_to_async)?;
+                let total: usize = slices.iter().map(|s| s.len()).sum();
+                dict_bytes.clear();
+                dict_bytes.reserve(total);
+                dict_offsets.clear();
+                dict_offsets.reserve(slices.len() + 1);
+                dict_offsets.push(0);
+                let mut acc: u32 = 0;
+                for s in &slices {
+                    dict_bytes.extend_from_slice(s);
+                    acc += s.len() as u32;
+                    dict_offsets.push(acc);
+                }
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                match info.encoding {
+                    Encoding::Plain => {
+                        // Inline PLAIN walk: u32_le length + bytes per value.
+                        let body = info.values;
+                        let mut i = 0usize;
+                        let mut emitted = 0usize;
+                        let cap_target = info.num_values;
+                        out_bytes.reserve(body.len());
+                        out_offsets.reserve(cap_target);
+                        let mut acc: u32 = *out_offsets.last().unwrap();
+                        while i < body.len() && emitted < cap_target {
+                            if i + 4 > body.len() {
+                                return Err(AsyncError::Format(
+                                    "PLAIN byte_array: truncated length prefix".into(),
+                                ));
+                            }
+                            let len = u32::from_le_bytes(
+                                body[i..i + 4].try_into().unwrap(),
+                            ) as usize;
+                            i += 4;
+                            if i + len > body.len() {
+                                return Err(AsyncError::Format(
+                                    "PLAIN byte_array: value runs past page end".into(),
+                                ));
+                            }
+                            out_bytes.extend_from_slice(&body[i..i + len]);
+                            i += len;
+                            acc += len as u32;
+                            out_offsets.push(acc);
+                            emitted += 1;
+                        }
+                    }
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        if dict_offsets.len() < 2 {
+                            return Err(AsyncError::Format(
+                                "dict-encoded data page before dictionary".into(),
+                            ));
+                        }
+                        let indices = decode_rle_dictionary_indices(
+                            info.values, info.num_values,
+                        ).map_err(codec_to_async)?;
+                        let dict_n = dict_offsets.len() - 1;
+                        out_offsets.reserve(indices.len());
+                        let mut acc: u32 = *out_offsets.last().unwrap();
+                        for idx in indices {
+                            let i = idx as usize;
+                            if i >= dict_n {
+                                return Err(AsyncError::Format(
+                                    "dictionary index out of range".into(),
+                                ));
+                            }
+                            let lo = dict_offsets[i] as usize;
+                            let hi = dict_offsets[i + 1] as usize;
+                            out_bytes.extend_from_slice(&dict_bytes[lo..hi]);
+                            acc += (hi - lo) as u32;
+                            out_offsets.push(acc);
+                        }
+                    }
+                    other => {
+                        return Err(AsyncError::Format(format!(
+                            "encoding not yet dispatched by async façade: {other:?}"
+                        )));
+                    }
+                }
+            }
+            PageType::IndexPage => {}
+        }
+        // Stop once we've emitted total_values values (offsets has +1).
+        if out_offsets.len() >= total_values + 1 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 // ============================================================

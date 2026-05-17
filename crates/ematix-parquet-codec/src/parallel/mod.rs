@@ -18,6 +18,9 @@
 //! `cfg(target_os = "linux")` extensions to the runner. Today's
 //! Π.15a entry point is portable.
 
+#[cfg(target_os = "linux")]
+pub mod numa;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 

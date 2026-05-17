@@ -37,6 +37,11 @@ pub enum CodecError {
     /// The lower-level decoder for it may still exist; this just
     /// means the high-level entry point can't reach it yet.
     Unsupported(String),
+    /// A parallel runner saw its `CancellationToken` fire before this
+    /// target had been decoded. Cooperative — the runner only checks
+    /// at target boundaries, so in-flight decodes complete before
+    /// this surfaces.
+    Cancelled,
 }
 
 impl fmt::Display for CodecError {
@@ -67,6 +72,7 @@ impl fmt::Display for CodecError {
             }
             Self::InvalidInput(s) => write!(f, "invalid input: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
+            Self::Cancelled => write!(f, "parallel decode cancelled by token"),
         }
     }
 }

@@ -31,6 +31,8 @@ pub mod encrypted;
 pub mod error;
 pub mod levels;
 pub mod page_index;
+#[cfg(feature = "parallel")]
+pub mod parallel;
 pub mod plain;
 pub mod read;
 pub mod rle;

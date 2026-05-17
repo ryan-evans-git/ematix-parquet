@@ -942,6 +942,40 @@ no behaviour changes for existing callers.
 
 ---
 
+## v0.9.2 patch — bloom-filter writer end-to-end
+
+Closes the bloom-filter story: v0.9.1 shipped the in-memory
+builder; v0.9.2 wires it through the codec write path so emitted
+Parquet files carry consultable bloom filters that downstream
+readers — including the upstream Rust Parquet reader — discover
+via ColumnMetaData and apply automatically.
+
+- **Format crate**: `metadata_writer::encode_column_meta_data`
+  now writes `bloom_filter_offset` (field 14, i64) and
+  `bloom_filter_length` (field 15, i32) when set. Previously
+  both panicked.
+- **Codec writer**: new public entries
+  `write::write_{i32,i64,f64,byte_array}_column_dict_with_bloom_to_path(path,
+  name, values, codec, target_fpp)`. Builds an SBBF over the
+  column's distinct values (sized via `optimal_num_blocks`),
+  emits it inline with the column chunk.
+- **Interop**: 4 round-trip tests confirm parquet-rs reads our
+  bloom filters via `ReaderProperties::set_read_bloom_filter(true)`
+  + `RowGroupReader::get_column_bloom_filter`, and every distinct
+  value reports present.
+
+Hash contract follows the spec: XXHash64 seed=0 of the value's
+PLAIN-encoded bytes (LE for scalar, raw bytes for byte_array
+without length prefix).
+
+Scope notes (deferred):
+- Multi-column / multi-row-group bloom writes.
+- Bloom on plain (non-dict) write paths.
+
+**Released as v0.9.2.**
+
+---
+
 ## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot

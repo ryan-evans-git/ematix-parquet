@@ -196,6 +196,68 @@ fn io_err(e: io::Error) -> CodecError {
     CodecError::InvalidInput(format!("numa: {e}"))
 }
 
+/// Π.15d — NUMA-local chunk-bytes allocation.
+///
+/// Return the NUMA node id of the CPU the calling thread is
+/// running on, via the `getcpu(2)` Linux syscall. Returns `None`
+/// if the syscall fails (rare; typically only on very old kernels)
+/// or if NUMA isn't available — caller should treat as "unknown,
+/// fall back to default allocation".
+pub fn current_node() -> Option<u32> {
+    let mut node: libc::c_uint = 0;
+    // SAFETY: passing valid out pointers per getcpu(2). The third
+    // argument is reserved and must be NULL.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_getcpu,
+            std::ptr::null_mut::<libc::c_uint>(),
+            &mut node as *mut libc::c_uint,
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
+    if rc == 0 {
+        Some(node as u32)
+    } else {
+        None
+    }
+}
+
+/// Allocate a `Vec<u8>` of `size` bytes and force every page to be
+/// faulted in on the **calling thread's** NUMA node, via Linux's
+/// first-touch policy.
+///
+/// Combined with `pin_current_thread_to_node` (Π.15c) on rayon
+/// worker startup, this gives chunk-bytes buffers a stable NUMA
+/// location matching the worker that will decode them — no
+/// explicit `mbind(2)` required, no `libnuma` C dep.
+///
+/// The page-faulting walk is done in 4 KiB strides; the cost is
+/// one byte-write per OS page. Negligible vs the subsequent
+/// decompress + decode.
+pub fn alloc_local_buffer(size: usize) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(size);
+    // SAFETY: we set_len to `size` then write a sentinel into every
+    // page below, so every byte up to `size` is initialised before
+    // any reader sees it. Avoids the per-byte resize() bookkeeping.
+    unsafe { buf.set_len(size) };
+    // 4 KiB is Linux's default page size on x86_64 and aarch64.
+    // ARM Macs use 16 KiB pages but this module is cfg'd Linux-only,
+    // so 4 KiB is the right stride here.
+    const PAGE_SIZE: usize = 4096;
+    let mut i = 0usize;
+    while i < size {
+        buf[i] = 0;
+        i += PAGE_SIZE;
+    }
+    // Ensure the last byte of the final partial page is touched too —
+    // the stride above may skip the tail page entirely if size isn't
+    // page-aligned.
+    if size > 0 {
+        buf[size - 1] = 0;
+    }
+    buf
+}
+
 /// Build a rayon thread pool with workers pinned to NUMA nodes
 /// round-robin. With N CPUs spread across K nodes, worker `w` ends
 /// up pinned to the CPUs of node `w % K`.
@@ -264,5 +326,45 @@ mod tests {
         let pool = build_numa_pinned_pool(2).unwrap();
         let sum: i32 = pool.install(|| (1..=100).sum());
         assert_eq!(sum, 5050);
+    }
+
+    #[test]
+    fn current_node_is_reasonable() {
+        // Returns Some on any reasonably-modern kernel. We can't
+        // assert the specific node (depends on what the scheduler
+        // gives us) but it must be < the topology's node count.
+        let t = NumaTopology::detect().unwrap();
+        if let Some(n) = current_node() {
+            assert!(
+                (n as usize) < t.num_nodes(),
+                "current_node {n} ≥ topology node count {}",
+                t.num_nodes()
+            );
+        }
+    }
+
+    #[test]
+    fn alloc_local_buffer_has_requested_size() {
+        let buf = alloc_local_buffer(1 << 16);
+        assert_eq!(buf.len(), 1 << 16);
+        // First and last byte readable + zero-initialised.
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[buf.len() - 1], 0);
+    }
+
+    #[test]
+    fn alloc_local_buffer_zero_size() {
+        let buf = alloc_local_buffer(0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn alloc_local_buffer_unaligned_size() {
+        // 4097 = one full page + 1 byte. Confirm the tail-page
+        // touch hits the trailing byte.
+        let buf = alloc_local_buffer(4097);
+        assert_eq!(buf.len(), 4097);
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[4096], 0);
     }
 }

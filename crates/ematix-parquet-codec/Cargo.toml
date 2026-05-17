@@ -29,16 +29,16 @@ encryption = ["dep:ematix-parquet-crypto"]
 parallel = ["dep:rayon", "dep:libc"]
 
 [dependencies]
-ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.8" }
+ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.9" }
 # io provides ParquetFile + PageWalker, used by the high-level `read`
 # facade. Lower-level byte-slice decoders (plain/dict/delta/...) do
 # not require io — consumers that want pure byte-slice access can
 # bypass the facade.
-ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.8" }
+ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.9" }
 # AES-GCM + AAD construction for PME. Optional — only present when
 # `--features encryption` is set. The crypto crate itself stays
 # unconditionally compiled (it's small) but its surface is gated.
-ematix-parquet-crypto = { path = "../ematix-parquet-crypto", version = "0.8", optional = true }
+ematix-parquet-crypto = { path = "../ematix-parquet-crypto", version = "0.9", optional = true }
 # Work-stealing thread pool for `read_columns_parallel` (Π.15).
 # Optional — only present when `--features parallel` is set.
 rayon = { version = "1.10", optional = true }

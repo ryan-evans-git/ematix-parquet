@@ -21,11 +21,12 @@ no-neon = []
 # into the dep graph; surfaces the `encrypted` module + encrypted
 # read/write entry points. Default builds stay crypto-free.
 encryption = ["dep:ematix-parquet-crypto"]
-# Π.15 multi-RG parallel decode. Pulls `rayon` in; surfaces the
-# `parallel` module + `read_columns_parallel` entry point. Default
-# builds stay rayon-free so single-threaded consumers don't pay the
-# thread-pool startup cost or the dep-tree weight.
-parallel = ["dep:rayon"]
+# Π.15 multi-RG parallel decode. Pulls `rayon` in (and `libc` on
+# Linux for the NUMA helpers); surfaces the `parallel` module +
+# `read_columns_parallel` entry point. Default builds stay rayon-
+# free so single-threaded consumers don't pay the thread-pool
+# startup cost or the dep-tree weight.
+parallel = ["dep:rayon", "dep:libc"]
 
 [dependencies]
 ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.8" }
@@ -57,6 +58,15 @@ brotli = "8"
 # LZ4_RAW: parquet's frameless lz4 variant (the newer codec; the
 # older `Lz4` enum value is deprecated). lz4_flex is pure-Rust.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+
+# Linux-only NUMA detection + pinning helpers (Π.15c, Π.15d). Used
+# only when the `parallel` feature is set AND the host is Linux;
+# macOS / Windows builds drop the dep entirely. Pinning uses
+# `sched_setaffinity`; topology comes from sysfs (`/sys/devices/
+# system/node/node*/cpulist`). Allocator helpers in Π.15d use
+# `numa(3)` via these primitives.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 ematix-parquet-io = { path = "../ematix-parquet-io" }

@@ -911,6 +911,37 @@ awareness into the codec so consumers don't have to roll it.
 
 ---
 
+## v0.9.1 patch — opportunistic items
+
+A small additive bundle ahead of the next big phase. No API breaks,
+no behaviour changes for existing callers.
+
+- **u8 dict-indices reader** —
+  `read::DictPreservedColumnU8 { dict_bytes, dict_offsets,
+   indices: Vec<u8> }` and `read_column_byte_array_dict_preserved_u8`
+  + `..._u8_into`. Saves 3 bytes/row on dict-encoded columns with
+  ≤ 256 unique values (most TPC-H string columns). Unlocks Arrow
+  `DictionaryArray<UInt8, T>` materialisation in ematix-flow with
+  a 4× smaller indices buffer.
+- **BYTE_ARRAY adaptive façade** — closes the v0.8 gap.
+  `read::read_column_byte_array_predicate_adaptive` (+
+  `AdaptiveByteArrayChunkOutput` / `AdaptiveByteArrayOutputKind`).
+  Same `DEFAULT_THRESHOLD = 0.10` contract as i32/i64/f64; output
+  is bitmap (Fused) or Arrow-style `(bytes, offsets)`
+  (Materialized).
+- **Split-Block Bloom Filter builder** —
+  `bloom::SplitBlockBloomFilterBuilder` (+ `insert_hash`,
+  `insert_bytes`, `into_bytes`) and `bloom::optimal_num_blocks`.
+  Symmetric to the Π.6c decoder; round-trips byte-stable through
+  `SplitBlockBloomFilter::from_bytes`. Full writer-integration
+  (emitting bloom filters into a parquet file's body + setting
+  `ColumnMetaData.bloom_filter_offset`) is a deferred follow-up
+  that needs format-crate metadata-writer work too.
+
+**Released as v0.9.1.**
+
+---
+
 ## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot

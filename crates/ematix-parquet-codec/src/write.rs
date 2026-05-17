@@ -180,7 +180,58 @@ pub fn write_table_to_path_v2<P: AsRef<Path>>(
 ) -> Result<()> {
     let f = File::create(path.as_ref()).map_err(io_to_codec)?;
     let mut w = BufWriter::new(f);
-    write_table_inner(&mut w, columns, codec, row_group_size, PageVersion::V2)?;
+    write_table_inner(
+        &mut w,
+        columns,
+        codec,
+        row_group_size,
+        PageVersion::V2,
+        None,
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+/// Multi-column / multi-row-group writer with **per-column bloom
+/// filters**. `bloom_fpps[i]` is the target false-positive
+/// probability for column `i`; `None` means no bloom filter for
+/// that column. Slice length must equal `columns.len()`.
+///
+/// Each (row-group, column) pair that has bloom enabled gets its
+/// own Split-Block Bloom Filter built from the values in that RG
+/// slice. The filter bytes are emitted inline after the column's
+/// data page; `bloom_filter_offset` and `bloom_filter_length` are
+/// set on the corresponding `ColumnMetaData` so downstream readers
+/// (ours + the upstream Rust Parquet reader) discover the filter
+/// via the spec.
+///
+/// Hash input follows the Parquet spec — XXHash64 seed=0 of the
+/// value's PLAIN-encoded bytes (LE for scalar, raw bytes for
+/// byte_array without length prefix).
+pub fn write_table_with_blooms_to_path<P: AsRef<Path>>(
+    path: P,
+    columns: &[(&str, ColumnData<'_>)],
+    codec: CompressionCodec,
+    row_group_size: usize,
+    bloom_fpps: &[Option<f64>],
+) -> Result<()> {
+    if bloom_fpps.len() != columns.len() {
+        return Err(CodecError::InvalidInput(format!(
+            "write_table_with_blooms: bloom_fpps length {} != columns length {}",
+            bloom_fpps.len(),
+            columns.len()
+        )));
+    }
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_table_inner(
+        &mut w,
+        columns,
+        codec,
+        row_group_size,
+        PageVersion::V1,
+        Some(bloom_fpps),
+    )?;
     w.flush().map_err(io_to_codec)?;
     Ok(())
 }
@@ -193,7 +244,7 @@ pub fn write_table_with_row_group_size<W: Write>(
     codec: CompressionCodec,
     row_group_size: usize,
 ) -> Result<()> {
-    write_table_inner(out, columns, codec, row_group_size, PageVersion::V1)
+    write_table_inner(out, columns, codec, row_group_size, PageVersion::V1, None)
 }
 
 fn write_table_inner<W: Write>(
@@ -202,6 +253,7 @@ fn write_table_inner<W: Write>(
     codec: CompressionCodec,
     row_group_size: usize,
     page_version: PageVersion,
+    bloom_fpps: Option<&[Option<f64>]>,
 ) -> Result<()> {
     if columns.is_empty() {
         return Err(CodecError::InvalidInput(
@@ -228,12 +280,16 @@ fn write_table_inner<W: Write>(
     let mut written: u64 = 4;
 
     /// Per-column descriptor inside one row group: where its single
-    /// data page landed and its (owned) stats bytes.
+    /// data page landed and its (owned) stats bytes. Bloom offset/
+    /// length are `Some` iff this (RG, column) had a bloom filter
+    /// written immediately after its data page.
     struct PreparedColumn {
         data_page_offset: i64,
         total_uncompressed_size: i64,
         total_compressed_size: i64,
         stats: ColumnStats,
+        bloom_filter_offset: Option<i64>,
+        bloom_filter_length: Option<i32>,
     }
 
     // One `PreparedColumn` vec per row group, owned for the lifetime
@@ -254,13 +310,20 @@ fn write_table_inner<W: Write>(
         let chunk_rows = row_end - row_start;
 
         let mut prepared: Vec<PreparedColumn> = Vec::with_capacity(columns.len());
-        for (_name, col) in columns {
+        for (col_ix, (_name, col)) in columns.iter().enumerate() {
             let col_slice = col.slice(row_start..row_end);
             let stats = compute_stats(&col_slice);
             let body = col_slice.encode_plain();
             let uncompressed_size = body.len();
             let compressed_body = compress_body(&body, codec)?;
             let compressed_size = compressed_body.len();
+
+            // Build the bloom filter (if requested for this column)
+            // from the RG slice — per-(RG, column) granularity, the
+            // spec-correct shape for row-group pruning.
+            let bloom_bytes: Option<Vec<u8>> = bloom_fpps
+                .and_then(|fpps| fpps[col_ix])
+                .map(|fpp| build_bloom_for_column(&col_slice, fpp));
 
             let header = match page_version {
                 PageVersion::V1 => PageHeader {
@@ -310,11 +373,26 @@ fn write_table_inner<W: Write>(
             out.write_all(&compressed_body).map_err(io_to_codec)?;
             written += compressed_body.len() as u64;
 
+            // Write the bloom filter (if any) immediately after the
+            // data page; record the offset/length for ColumnMetaData.
+            let (bloom_filter_offset, bloom_filter_length) =
+                if let Some(blob) = bloom_bytes.as_ref() {
+                    let off = written as i64;
+                    out.write_all(blob).map_err(io_to_codec)?;
+                    let len = blob.len() as i32;
+                    written += blob.len() as u64;
+                    (Some(off), Some(len))
+                } else {
+                    (None, None)
+                };
+
             prepared.push(PreparedColumn {
                 data_page_offset,
                 total_uncompressed_size: (header_bytes.len() + uncompressed_size) as i64,
                 total_compressed_size: (header_bytes.len() + compressed_size) as i64,
                 stats,
+                bloom_filter_offset,
+                bloom_filter_length,
             });
         }
         prepared_groups.push((chunk_rows, prepared));
@@ -371,8 +449,8 @@ fn write_table_inner<W: Write>(
                 dictionary_page_offset: None,
                 statistics: Some(prep.stats.as_statistics()),
                 encoding_stats: None,
-                bloom_filter_offset: None,
-                bloom_filter_length: None,
+                bloom_filter_offset: prep.bloom_filter_offset,
+                bloom_filter_length: prep.bloom_filter_length,
                 size_statistics: None,
             };
             row_group_columns.push(ColumnChunk {
@@ -1219,6 +1297,61 @@ fn compute_stats(col: &ColumnData<'_>) -> ColumnStats {
         ColumnData::Bool(v) => stats_bool(v),
         ColumnData::ByteArray(v) => stats_byte_array(v),
     }
+}
+
+/// Build the serialised SBBF bytes (header + bitset) for one
+/// column's value slice at the requested false-positive rate.
+///
+/// Per Parquet spec, the hash input is the value's PLAIN-encoded
+/// bytes — LE for scalar types, raw bytes for byte_array without
+/// the length prefix. Bool is hashed as a single byte (0/1).
+///
+/// The filter is sized via `optimal_num_blocks` using the **value
+/// count** as the distinct-count estimate. Conservative: when many
+/// values are duplicates the actual fpp ends up better than the
+/// target. Could be tightened by deduplicating first (extra pass),
+/// but the size win is bounded and not worth the per-write cost
+/// here — high-cardinality columns are where bloom filters matter
+/// most.
+fn build_bloom_for_column(col: &ColumnData<'_>, target_fpp: f64) -> Vec<u8> {
+    use crate::bloom::{optimal_num_blocks, SplitBlockBloomFilterBuilder};
+    let n = col.row_count();
+    let num_blocks = optimal_num_blocks(n, target_fpp);
+    let mut b = SplitBlockBloomFilterBuilder::new(num_blocks);
+    match col {
+        ColumnData::I32(vs) => {
+            let mut le = [0u8; 4];
+            for &v in *vs {
+                le.copy_from_slice(&v.to_le_bytes());
+                b.insert_bytes(&le);
+            }
+        }
+        ColumnData::I64(vs) => {
+            let mut le = [0u8; 8];
+            for &v in *vs {
+                le.copy_from_slice(&v.to_le_bytes());
+                b.insert_bytes(&le);
+            }
+        }
+        ColumnData::F64(vs) => {
+            let mut le = [0u8; 8];
+            for &v in *vs {
+                le.copy_from_slice(&v.to_le_bytes());
+                b.insert_bytes(&le);
+            }
+        }
+        ColumnData::Bool(vs) => {
+            for &v in *vs {
+                b.insert_bytes(&[v as u8]);
+            }
+        }
+        ColumnData::ByteArray(vs) => {
+            for v in *vs {
+                b.insert_bytes(v);
+            }
+        }
+    }
+    b.into_bytes()
 }
 
 fn stats_i32(v: &[i32]) -> ColumnStats {

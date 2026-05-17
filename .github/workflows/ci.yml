@@ -62,6 +62,16 @@ jobs:
       - name: Run tests (encryption feature)
         run: cargo test --workspace --all-targets --features ematix-parquet-codec/encryption
 
+      # Parallel feature (Π.15) is similarly gated off by default;
+      # exercise the parallel runner + cancellation token on both
+      # runners so the rayon dep stays optional and the parallel-
+      # specific paths stay green.
+      - name: Build workspace (parallel feature)
+        run: cargo build --workspace --all-targets --features ematix-parquet-codec/parallel
+
+      - name: Run tests (parallel feature)
+        run: cargo test --workspace --all-targets --features ematix-parquet-codec/parallel
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

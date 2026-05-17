@@ -6,11 +6,24 @@
 //! (self-referential ownership). Footer decoding is microseconds —
 //! callers that need the metadata more than once can hold the
 //! returned struct for as long as they hold `&ParquetFile`.
+//!
+//! ## Concurrency model
+//!
+//! `read_range` is **lock-free**: it uses positional reads
+//! (`pread(2)` on Unix, `ReadFile` with explicit offset on Windows)
+//! via the standard library's `FileExt` traits. The file handle is
+//! shared across all callers; the OS guarantees that concurrent
+//! positional reads don't interfere with each other (no shared
+//! file-cursor state to race on).
+//!
+//! This is the v0.10 successor to the old `Mutex<File>`
+//! implementation. The mutex was the parallel-decode ceiling
+//! identified in Π.15's scaling bench (peak ~1.8× on a 14-core
+//! M-series); pread unlocks real linear scaling.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use ematix_parquet_format::compact::Cursor;
 use ematix_parquet_format::metadata::{read_file_metadata, FileMetaData};
@@ -22,7 +35,7 @@ const FOOTER_TRAILER_LEN: u64 = 8; // 4 bytes length + 4 bytes magic
 
 pub struct ParquetFile {
     path: PathBuf,
-    file: Mutex<File>,
+    file: File,
     file_size: u64,
     footer_bytes: Vec<u8>,
     /// Byte offset of the start of the footer struct (where the thrift
@@ -85,7 +98,7 @@ impl ParquetFile {
 
         Ok(Self {
             path,
-            file: Mutex::new(file),
+            file,
             file_size,
             footer_bytes,
             footer_offset,
@@ -116,6 +129,10 @@ impl ParquetFile {
     }
 
     /// Read `length` bytes starting at byte `offset` into a fresh Vec.
+    ///
+    /// Lock-free: uses positional I/O (`pread(2)` on Unix,
+    /// `ReadFile` with explicit offset on Windows). Concurrent calls
+    /// from multiple threads do not interfere.
     pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
         if offset.saturating_add(length) > self.file_size {
             return Err(IoError::OutOfRangeRead {
@@ -125,9 +142,38 @@ impl ParquetFile {
             });
         }
         let mut buf = vec![0u8; length as usize];
-        let mut file = self.file.lock().expect("file mutex poisoned");
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut buf)?;
+        read_exact_at(&self.file, &mut buf, offset)?;
         Ok(buf)
     }
+}
+
+/// Positional read helper — calls the platform-specific stdlib
+/// FileExt without touching the shared cursor. Returns
+/// `IoError::Io` on any underlying read failure.
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    // `seek_read` reads up to buf.len() bytes; loop to fill on
+    // short reads (rare for local files but spec-mandated).
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let cur_off = offset + filled as u64;
+        let n = file.seek_read(&mut buf[filled..], cur_off)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF before pread completed",
+            )
+            .into());
+        }
+        filled += n;
+    }
+    Ok(())
 }

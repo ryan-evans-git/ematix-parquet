@@ -22,6 +22,28 @@ use crate::bitpack_neon::{
 };
 use crate::error::{CodecError, Result};
 
+/// Hint the L1 data cache to load the line containing `p`. AArch64
+/// uses the `prfm pldl1keep` instruction (≈ free on Apple Silicon
+/// when the address is already cached). No-op on other targets, so
+/// callers can sprinkle hints unconditionally.
+///
+/// Used in the dict-gather hot path to overlap the dict load with
+/// the predicate-bitmap arithmetic in the same loop iteration.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn pld_l1<T>(p: *const T) {
+    use core::arch::asm;
+    asm!(
+        "prfm pldl1keep, [{0}]",
+        in(reg) p as *const u8,
+        options(nostack, preserves_flags, readonly),
+    );
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+unsafe fn pld_l1<T>(_p: *const T) {}
+
 /// Decode `num_values` u32 indices from a data-page body that uses
 /// RLE_DICTIONARY (or the legacy PLAIN_DICTIONARY) encoding.
 ///
@@ -663,6 +685,26 @@ pub fn gather_dict_at_bitmap_into<T: Clone>(
                         bit_width,
                         &mut scratch,
                     );
+                    // Π.9d: prefetch the dict slots this block will
+                    // actually gather, before the per-lane loop drives
+                    // the loads. On AArch64 this is `prfm pldl1keep`;
+                    // on other targets a no-op. The cost is a few
+                    // hint cycles per active lane; the win is
+                    // overlapping the dict-pointer chase with the
+                    // bit-twiddling in the gather loop, which matters
+                    // when the dict exceeds L1.
+                    let dict_base = dict.as_ptr();
+                    let mut prefetch_mask = mask_byte;
+                    while prefetch_mask != 0 {
+                        let lane = prefetch_mask.trailing_zeros() as usize;
+                        let idx_u = scratch[lane] as usize;
+                        if idx_u < dict_size {
+                            unsafe {
+                                pld_l1(dict_base.add(idx_u));
+                            }
+                        }
+                        prefetch_mask &= prefetch_mask - 1;
+                    }
                     for lane in 0..8 {
                         if (mask_byte >> lane) & 1 == 1 {
                             let idx_u = scratch[lane] as usize;
@@ -674,6 +716,17 @@ pub fn gather_dict_at_bitmap_into<T: Clone>(
                             }
                             out.push(dict[idx_u].clone());
                         }
+                    }
+                }
+                // Π.9d: pre-warm the next 8-row block's chunk bytes so
+                // the next `unpack_8_indices` finds them in L1 even
+                // when the bitmap byte for this block was 0 (so we
+                // skipped the unpack and didn't otherwise touch
+                // those bytes).
+                let next_cursor = byte_cursor + bytes_per_8;
+                if next_cursor < chunk.len() {
+                    unsafe {
+                        pld_l1(chunk.as_ptr().add(next_cursor));
                     }
                 }
                 byte_cursor += bytes_per_8;

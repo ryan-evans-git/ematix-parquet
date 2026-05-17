@@ -12,7 +12,7 @@ a write path that produces spec-compliant files.
 
 ## Status
 
-`v0.8.x` — v1.0 cut criteria are met (every Parquet shape we read
+`v0.9.x` — v1.0 cut criteria are met (every Parquet shape we read
 or write is covered, predicate pushdown lights up end-to-end, and
 the decode hot paths are hand-tuned for the columns that dominate
 analytical TPC-H workloads).
@@ -37,13 +37,22 @@ no crypto deps.
 The v0.7 cycle added a **dict-preserving BYTE_ARRAY column reader**
 (`read_column_byte_array_dict_preserved`) so Arrow consumers can
 assemble `DictionaryArray<UInt32, Utf8|Binary>` directly without
-per-row materialisation. The v0.8 cycle adds **adaptive
+per-row materialisation. The v0.8 cycle added **adaptive
 predicate-dispatch** (`read_column_*_predicate_adaptive`) — the
 codec probes the first N pages of a chunk with the fused kernel,
 measures selectivity, and decides per-chunk whether to emit a
 bitmap (fused, wins at low selectivity) or a values vector
 (materialised, wins at high selectivity). Optional telemetry
 callback exposes the dispatch decision.
+The v0.9 cycle adds **parallel multi-row-group decode** behind a
+default-off `parallel` feature on `ematix-parquet-codec`. A new
+`read_columns_parallel(file, &targets, opts, decode_one)` entry
+point decodes a slice of `(row_group, column)` targets concurrently
+over rayon, with cooperative cancellation via a shared
+`CancellationToken`. On Linux a `parallel::numa` submodule adds
+NUMA topology detection, per-thread worker pinning, and
+first-touch local-buffer allocation so chunk bytes land on the
+worker's node automatically — no `libnuma` C dep.
 API is settling but the write side still has a few rough edges
 (per-column encoding choice on multi-column writes); pin by SHA
 or version range until we tag v1.0.

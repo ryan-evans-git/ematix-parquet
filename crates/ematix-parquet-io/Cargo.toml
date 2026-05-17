@@ -13,7 +13,7 @@ readme = "../../README.md"
 name = "ematix_parquet_io"
 
 [dependencies]
-ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.8" }
+ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.9" }
 
 [dev-dependencies]
 # `snap` so parquet-rs can fully iterate snappy-compressed pages in

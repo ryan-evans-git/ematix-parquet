@@ -983,6 +983,273 @@ pub fn read_column_f64_predicate_adaptive<P: Fn(&f64) -> bool>(
     )
 }
 
+// ============================================================
+// BYTE_ARRAY adaptive façade (closes the v0.8 gap)
+// ============================================================
+//
+// `read_column_byte_array_predicate_adaptive(file, rg, col, predicate,
+//  opts, telemetry)` mirrors the scalar adaptive entry points for
+// the byte_array path. Output shape differs:
+//
+//   - Fused → AdaptiveByteArrayOutputKind::Bitmap { bitmap, set_bits }
+//   - Materialized → AdaptiveByteArrayOutputKind::Values { bytes, offsets }
+//                    (Arrow-style flat bytes + u32 offsets, length =
+//                    set_bits + 1)
+//
+// Predicate is evaluated against dict entries (≤ dict.len() calls
+// per chunk) and receives `&[u8]`. Dict-only (PLAIN data pages
+// rejected) and uses the same `DEFAULT_THRESHOLD = 0.10` as the
+// scalar entry points.
+
+/// Two output shapes the BYTE_ARRAY adaptive runner can produce.
+#[derive(Debug)]
+pub enum AdaptiveByteArrayOutputKind {
+    /// Fused path: packed predicate bitmap. Same semantics as
+    /// `AdaptiveOutputKind::Bitmap` for the scalar entry points.
+    Bitmap { bitmap: Vec<u8>, set_bits: usize },
+    /// Materialised path: filtered values as Arrow-style flat
+    /// bytes + offsets. `offsets.len() == set_bits + 1`; row `i`
+    /// is `bytes[offsets[i]..offsets[i+1]]`.
+    Values { bytes: Vec<u8>, offsets: Vec<u32> },
+}
+
+/// Result of running the BYTE_ARRAY adaptive runner across a
+/// chunk's pages.
+#[derive(Debug)]
+pub struct AdaptiveByteArrayChunkOutput {
+    pub dispatch: crate::adaptive::Dispatch,
+    pub total_rows: usize,
+    pub kind: AdaptiveByteArrayOutputKind,
+}
+
+/// Adaptive predicate dispatch for a BYTE_ARRAY column. See
+/// `read_column_i32_predicate_adaptive` for the runner contract.
+/// Output shape differs — see `AdaptiveByteArrayOutputKind`.
+pub fn read_column_byte_array_predicate_adaptive<P>(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    predicate: P,
+    opts: AdaptiveDispatchOptions,
+    mut telemetry: Option<&mut dyn FnMut(SelectivityProbe)>,
+) -> Result<AdaptiveByteArrayChunkOutput>
+where
+    P: Fn(&[u8]) -> bool,
+{
+    use crate::adaptive::{
+        probe_page_fused, AdaptiveDictPredicate, Dispatch, PageProbe, SelectivityProbe,
+    };
+    use crate::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_predicate_bitmap};
+
+    // ---- Pull the chunk: dict bytes/offsets + every decompressed page body ----
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let mut walker = PageWalker::new(&chunk_bytes);
+
+    let mut dict_bytes: Vec<u8> = Vec::new();
+    let mut dict_offsets: Vec<u32> = vec![0];
+    let mut have_dict = false;
+    let mut pages: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut bit_width: u8 = 0;
+    let mut rows_collected: usize = 0;
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                let mut decomp = Vec::new();
+                decompress_into(codec, body, &mut decomp)?;
+                let slices = decode_plain_byte_array(&decomp)?;
+                let total_dict_bytes: usize = slices.iter().map(|s| s.len()).sum();
+                dict_bytes.reserve(total_dict_bytes);
+                dict_offsets.reserve(slices.len());
+                let mut acc: u32 = 0;
+                for s in &slices {
+                    dict_bytes.extend_from_slice(s);
+                    acc = acc.checked_add(s.len() as u32).ok_or_else(|| {
+                        CodecError::InvalidInput("dict bytes exceed u32::MAX".into())
+                    })?;
+                    dict_offsets.push(acc);
+                }
+                have_dict = true;
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                if !have_dict {
+                    return Err(CodecError::InvalidInput(
+                        "byte_array adaptive: data page before dictionary (column has no DictionaryPage)".into(),
+                    ));
+                }
+                let mut owned = Vec::new();
+                let info = data_page_view(&hdr, body, codec, &mut owned)?;
+                match info.encoding {
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {}
+                    Encoding::Plain => {
+                        return Err(CodecError::InvalidInput(
+                            "byte_array adaptive: data page is PLAIN-encoded (writer fell back from dict — use read_column_byte_array_masked_into instead)".into(),
+                        ));
+                    }
+                    other => {
+                        return Err(CodecError::Unsupported(format!(
+                            "byte_array adaptive: data page encoding not supported: {other:?}"
+                        )));
+                    }
+                }
+                debug_assert!(!info.values.is_empty(), "dict-encoded page body empty");
+                if bit_width == 0 {
+                    bit_width = info.values[0];
+                }
+                pages.push((info.num_values, info.values.to_vec()));
+                rows_collected += info.num_values;
+            }
+            PageType::IndexPage => {}
+        }
+        if rows_collected >= total_values {
+            break;
+        }
+    }
+    if !have_dict {
+        return Err(CodecError::InvalidInput(
+            "byte_array adaptive: column chunk has no DictionaryPage".into(),
+        ));
+    }
+
+    // ---- Build dict_mask from the user predicate ----
+    let dict_len = dict_offsets.len() - 1;
+    if bit_width > 32 || bit_width == 0 {
+        return Err(CodecError::BitWidthOutOfRange(bit_width));
+    }
+    let mask_len = 1usize << bit_width;
+    if dict_len > mask_len {
+        return Err(CodecError::Decompress(format!(
+            "dict has {dict_len} entries, exceeds bit_width={bit_width} addressable space ({mask_len})"
+        )));
+    }
+    let mut dict_mask = vec![0u8; mask_len];
+    for i in 0..dict_len {
+        let lo = dict_offsets[i] as usize;
+        let hi = dict_offsets[i + 1] as usize;
+        if predicate(&dict_bytes[lo..hi]) {
+            dict_mask[i] = 1;
+        }
+    }
+
+    // ---- Probe + dispatch ----
+    let total_rows: usize = pages.iter().map(|(n, _)| *n).sum();
+    if total_rows == 0 {
+        if let Some(cb) = telemetry.as_mut() {
+            cb(SelectivityProbe {
+                pages_probed: 0,
+                rows_in: 0,
+                rows_passed: 0,
+                selectivity: 0.0,
+                dispatch: Dispatch::Fused,
+            });
+        }
+        return Ok(AdaptiveByteArrayChunkOutput {
+            dispatch: Dispatch::Fused,
+            total_rows: 0,
+            kind: AdaptiveByteArrayOutputKind::Bitmap {
+                bitmap: Vec::new(),
+                set_bits: 0,
+            },
+        });
+    }
+
+    let cfg = AdaptiveDictPredicate {
+        dict_mask,
+        threshold: opts.threshold,
+        probe_pages: opts.probe_pages,
+    };
+
+    let probe_end = cfg.probe_pages.min(pages.len());
+    let mut probe_bitmap: Vec<u8> = Vec::new();
+    let mut probe_rows_in: usize = 0;
+    let mut probe_rows_passed: usize = 0;
+    for (n, body) in &pages[..probe_end] {
+        let p = probe_page_fused(body, *n, &cfg.dict_mask, &mut probe_bitmap)?;
+        probe_rows_in += p.rows_in;
+        probe_rows_passed += p.rows_passed;
+    }
+    let aggregated = PageProbe {
+        rows_in: probe_rows_in,
+        rows_passed: probe_rows_passed,
+    };
+    let dispatch = cfg.dispatch_for(aggregated);
+
+    if let Some(cb) = telemetry.as_mut() {
+        cb(SelectivityProbe {
+            pages_probed: probe_end,
+            rows_in: probe_rows_in,
+            rows_passed: probe_rows_passed,
+            selectivity: aggregated.selectivity(),
+            dispatch,
+        });
+    }
+
+    match dispatch {
+        Dispatch::Fused => {
+            let mut bitmap = probe_bitmap;
+            let mut total_set = probe_rows_passed;
+            for (n, body) in &pages[probe_end..] {
+                let p = probe_page_fused(body, *n, &cfg.dict_mask, &mut bitmap)?;
+                total_set += p.rows_passed;
+            }
+            Ok(AdaptiveByteArrayChunkOutput {
+                dispatch,
+                total_rows,
+                kind: AdaptiveByteArrayOutputKind::Bitmap {
+                    bitmap,
+                    set_bits: total_set,
+                },
+            })
+        }
+        Dispatch::Materialized => {
+            // For each page: decode indices → for each row whose
+            // dict_mask bit is set, copy dict_bytes[offsets[idx]..]
+            // into the output and append to offsets.
+            let mut out_bytes: Vec<u8> = Vec::new();
+            let mut out_offsets: Vec<u32> = vec![0];
+            let mut byte_acc: u32 = 0;
+            let mut page_indices: Vec<u32> = Vec::new();
+            for (n, body) in &pages {
+                page_indices.clear();
+                // Reuse the existing index decoder (returns Vec<u32>).
+                // For very large pages a u8-narrow variant could
+                // reduce working set, but the gather below is the
+                // hot path and isn't sensitive to that.
+                let decoded = decode_rle_dictionary_indices(body, *n)?;
+                page_indices.extend(decoded);
+
+                // Use the bitmap kernel to know per-row pass.
+                let mut bm = Vec::with_capacity((*n).div_ceil(8));
+                decode_rle_dictionary_predicate_bitmap(body, *n, &cfg.dict_mask, &mut bm)?;
+
+                for row in 0..*n {
+                    let bit = (bm[row / 8] >> (row % 8)) & 1;
+                    if bit != 0 {
+                        let idx = page_indices[row] as usize;
+                        let lo = dict_offsets[idx] as usize;
+                        let hi = dict_offsets[idx + 1] as usize;
+                        out_bytes.extend_from_slice(&dict_bytes[lo..hi]);
+                        byte_acc = byte_acc.checked_add((hi - lo) as u32).ok_or_else(|| {
+                            CodecError::InvalidInput(
+                                "byte_array adaptive: output bytes exceed u32::MAX".into(),
+                            )
+                        })?;
+                        out_offsets.push(byte_acc);
+                    }
+                }
+            }
+            Ok(AdaptiveByteArrayChunkOutput {
+                dispatch,
+                total_rows,
+                kind: AdaptiveByteArrayOutputKind::Values {
+                    bytes: out_bytes,
+                    offsets: out_offsets,
+                },
+            })
+        }
+    }
+}
+
 /// Read a BYTE_ARRAY column into Arrow-style flat bytes + offsets.
 ///
 /// Returns `(values, offsets)` where row `i` is the byte slice

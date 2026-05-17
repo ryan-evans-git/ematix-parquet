@@ -34,7 +34,7 @@
 
 use ematix_parquet_format::compact::{read_uvarint, read_zigzag_i32, read_zigzag_i64, Cursor};
 
-use crate::bitpack::unpack_indices_into;
+use crate::bitpack::{unpack_indices64_into, unpack_indices_into};
 use crate::error::{CodecError, Result};
 
 /// Decode a DELTA_BINARY_PACKED INT32 stream.
@@ -121,11 +121,12 @@ pub fn decode_delta_i32_from(cur: &mut Cursor<'_>) -> Result<Vec<i32>> {
 /// Decode a DELTA_BINARY_PACKED INT64 stream.
 ///
 /// Uses an i128 accumulator so the partial sums can't overflow on
-/// any valid input. Caps mini-block `bit_width` at 32 because our
-/// const-generic unpacker only specializes up to 32 bits per value;
-/// real-world DELTA-i64 data almost never crosses that threshold
-/// (the writer would emit PLAIN in that case). Larger bit_widths
-/// would need a u64-output unpacker (TODO).
+/// any valid input. Mini-block `bit_width` may be anywhere in 0..=64
+/// — widths ≤ 32 go through the u32-output unpacker (path shared with
+/// dictionary indices, fully SIMD-specialised), widths > 32 use the
+/// u64-output unpacker added for this case (scalar, but DELTA-i64 with
+/// bit_width > 32 is rare since the writer typically emits PLAIN
+/// instead).
 pub fn decode_delta_i64(bytes: &[u8]) -> Result<Vec<i64>> {
     let mut cur = Cursor::new(bytes);
     decode_delta_i64_from(&mut cur)
@@ -156,7 +157,11 @@ pub fn decode_delta_i64_from(cur: &mut Cursor<'_>) -> Result<Vec<i64>> {
     let mut prev: i128 = first_value as i128;
     let mut remaining = num_values - 1;
 
-    let mut unpack_buf: Vec<u32> = Vec::with_capacity(mini_block_size);
+    // Two unpack buffers — pick which one each mini-block uses based
+    // on its bit_width. Reusing both across iterations keeps the hot
+    // path allocation-free.
+    let mut unpack_buf32: Vec<u32> = Vec::with_capacity(mini_block_size);
+    let mut unpack_buf64: Vec<u64> = Vec::with_capacity(mini_block_size);
 
     while remaining > 0 {
         let block_min_delta = read_zigzag_i64(cur)? as i128;
@@ -173,27 +178,41 @@ pub fn decode_delta_i64_from(cur: &mut Cursor<'_>) -> Result<Vec<i64>> {
             if remaining == 0 {
                 break;
             }
-            if bit_width > 32 {
-                return Err(delta_err(
-                    "i64 DELTA with bit_width > 32 not yet supported \
-                     (unusual in practice; writer would normally emit PLAIN)",
-                ));
+            if bit_width > 64 {
+                return Err(delta_err("bit_width > 64 is not representable"));
             }
+            // body_bytes = mini_block_size * bit_width / 8.
+            // mini_block_size is a multiple of 32, so this is always
+            // a whole-byte count for any bit_width in 0..=64.
             let body_bytes = mini_block_size * bit_width as usize / 8;
             let chunk = cur.take(body_bytes)?;
 
-            unpack_buf.clear();
-            unpack_indices_into(chunk, mini_block_size, bit_width, &mut unpack_buf)?;
-
-            for &delta_u in unpack_buf.iter() {
-                if remaining == 0 {
-                    break;
+            if bit_width <= 32 {
+                unpack_buf32.clear();
+                unpack_indices_into(chunk, mini_block_size, bit_width, &mut unpack_buf32)?;
+                for &delta_u in unpack_buf32.iter() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    prev = prev
+                        .wrapping_add(block_min_delta)
+                        .wrapping_add(delta_u as i128);
+                    out.push(prev as i64);
+                    remaining -= 1;
                 }
-                prev = prev
-                    .wrapping_add(block_min_delta)
-                    .wrapping_add(delta_u as i128);
-                out.push(prev as i64);
-                remaining -= 1;
+            } else {
+                unpack_buf64.clear();
+                unpack_indices64_into(chunk, mini_block_size, bit_width, &mut unpack_buf64)?;
+                for &delta_u in unpack_buf64.iter() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    prev = prev
+                        .wrapping_add(block_min_delta)
+                        .wrapping_add(delta_u as i128);
+                    out.push(prev as i64);
+                    remaining -= 1;
+                }
             }
         }
     }

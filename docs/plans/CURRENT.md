@@ -976,6 +976,61 @@ Scope notes (deferred):
 
 ---
 
+## v0.10.0 — write-side polish + opportunistic deferred items
+
+Bundles every item that was deferred under "Scope notes" through
+v0.9.2 plus the below-the-phase-line catch-all list, plus an I/O
+unblock that lets parallel decode scale honestly.
+
+**Write-side completeness:**
+- **Multi-column / multi-RG bloom writes** (PR #54). Per-(RG, col)
+  SBBFs in `write_table_with_blooms_to_path` — closes the v0.9.2
+  scope gap.
+- **Bloom on PLAIN (non-dict) write paths** (PR #56). New
+  `write_{i32,i64,f64,byte_array}_column_with_bloom_to_path`
+  family for callers that want an SBBF on a column without paying
+  for dictionary encoding (high-cardinality strings, etc.).
+- **Multi-column dict writes** (PR #57). Per-column dict opt-in
+  via `dict_per_column: &[bool]` in
+  `write_table_with_dict_to_path` and the bloom-combined sibling.
+- **Per-column codec + `WriteOptions`** (PR #59). New
+  `write_table_with_options_to_path(path, columns, &WriteOptions)`
+  bundles row_group_size, page_version, default_codec,
+  codec_per_column, dict_per_column, bloom_fpps in one struct —
+  different columns can use different codecs in the same RG.
+
+**Decode coverage:**
+- **DELTA_BINARY_PACKED u64-output unpacker** (PR #58).
+  `unpack_indices64_into` covers bit_widths 1..=64 (u128
+  accumulator on the > 57-bit path); `decode_delta_i64` no longer
+  errors on streams with bit_width > 32.
+- **BYTE_ARRAY batched/streaming decode API** (PR #60).
+  `read_column_byte_array_batches` mirrors the scalar batched API
+  but for `Vec<Vec<u8>>` (T-not-Copy via index-then-gather-then-
+  clone on the dict path).
+
+**Perf:**
+- **pread-based unlocked I/O** (PR #55). `ParquetFile.read_range`
+  uses `pread(2)` / `FileExt::read_exact_at` instead of
+  `Mutex<File>` + seek, so parallel workers no longer serialise
+  on a single file handle. Sequential decode also drops ~28% on
+  the bench fixture (no Mutex acquire/release overhead).
+- **NEON `pld` L1 prefetch hints in dict gather** (PR #61, Π.9d).
+  `prfm pldl1keep` on the dict slots a block is about to gather +
+  on the next 8-row block's chunk bytes; behaviour-identical, perf
+  insensitive to dict footprint up to 1 MB.
+- **NEON unpackers for bw=4 + bw=8** (PR #62). Byte-aligned and
+  nibble-aligned variants added to the specialisation table.
+
+Below-the-line follow-ups still outstanding:
+- NEON kernels for bw=1, 5, 20, 21 (bw=5 is awkward unaligned;
+  bw=20/21 mirror bw=17/18 structure; bw=1 uncommon in practice).
+- Π.11e — S3 integration tests (long-deferred from v0.4.1).
+
+**Released as v0.10.0.**
+
+---
+
 ## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot
@@ -1022,15 +1077,9 @@ bottleneck. Marked **speculative**: may never ship.
 These are smaller items that don't merit a full phase but will be
 picked up opportunistically:
 
-- **NEON prefetching in dict gather** (Π.9d) — `pld` instruction.
-- **u8 dict indices when bw ≤ 8** — saves Vec<u32> overhead.
-- **BYTE_ARRAY batched API** — needs `T: Clone`-based gather.
-- **Per-column encoding choice on `write_table_*`** — requires a
-  `WriteOptions { encoding_per_column }` shape; land when a real
-  consumer asks for mixed-encoding tables.
-- **Bloom-filter writer** — symmetric to the decoder; defer until
-  a downstream reader will actually consult it.
-- **NEON kernels for small widths (1, 4, 5, 8, 20, 21)** — scalar
-  is at ~7-9 GB/s output; gather dominates on these columns.
-  Revisit only if a workload demands.
-- **DELTA_BINARY_PACKED u64-output unpacker** (TODO in `delta.rs`).
+- **NEON kernels for bw=1, 5, 20, 21** — v0.10 added bw=4 + bw=8;
+  bw=5 has awkward unaligned packing, bw=20/21 mirror bw=17/18,
+  bw=1 is uncommon in practice. Revisit when a workload demands.
+- **Π.11e — S3 integration tests** (long-deferred from v0.4.1).
+  Costs real cloud spend and isn't a correctness gate — wired
+  when the next end-to-end validation pass needs it.

@@ -718,6 +718,112 @@ pub fn write_byte_array_column_to_path_with_codec(
     )
 }
 
+// ---- Public PLAIN entry points with attached SBBF -------------------
+//
+// Symmetric to the `*_dict_with_bloom_to_path` family in this module,
+// but for PLAIN-encoded columns (no dictionary page). The bloom is
+// built over **every value** in the column — there is no dict to
+// deduplicate against on this path, so each value goes through
+// `insert_bytes` directly. Hash input matches the spec: LE bytes for
+// scalar types, raw bytes (no length prefix) for BYTE_ARRAY.
+
+/// `write_i32_column_to_path_with_codec` with an attached SBBF.
+/// `target_fpp` sizes the filter via `bloom::optimal_num_blocks`.
+pub fn write_i32_column_with_bloom_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[i32],
+    codec: CompressionCodec,
+    target_fpp: f64,
+) -> Result<()> {
+    let body = encode_plain_i32(values);
+    let stats = stats_i32(values);
+    let bloom_bytes = build_bloom_for_column(&ColumnData::I32(values), target_fpp);
+    write_to_path_with_bloom(
+        path,
+        name,
+        ParquetType::Int32,
+        values.len(),
+        body,
+        codec,
+        stats,
+        &bloom_bytes,
+    )
+}
+
+/// `write_i64_column_to_path_with_codec` with an attached SBBF.
+pub fn write_i64_column_with_bloom_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[i64],
+    codec: CompressionCodec,
+    target_fpp: f64,
+) -> Result<()> {
+    let body = encode_plain_i64(values);
+    let stats = stats_i64(values);
+    let bloom_bytes = build_bloom_for_column(&ColumnData::I64(values), target_fpp);
+    write_to_path_with_bloom(
+        path,
+        name,
+        ParquetType::Int64,
+        values.len(),
+        body,
+        codec,
+        stats,
+        &bloom_bytes,
+    )
+}
+
+/// `write_f64_column_to_path_with_codec` with an attached SBBF.
+/// f64 values are hashed as their 8-byte LE bit pattern; NaN bit
+/// patterns collide with themselves but distinct NaN bit patterns
+/// hash differently — matches what parquet-rs writes.
+pub fn write_f64_column_with_bloom_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[f64],
+    codec: CompressionCodec,
+    target_fpp: f64,
+) -> Result<()> {
+    let body = encode_plain_f64(values);
+    let stats = stats_f64(values);
+    let bloom_bytes = build_bloom_for_column(&ColumnData::F64(values), target_fpp);
+    write_to_path_with_bloom(
+        path,
+        name,
+        ParquetType::Double,
+        values.len(),
+        body,
+        codec,
+        stats,
+        &bloom_bytes,
+    )
+}
+
+/// `write_byte_array_column_to_path_with_codec` with an attached SBBF.
+/// Hash input is the raw value bytes (no length prefix).
+pub fn write_byte_array_column_with_bloom_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[&[u8]],
+    codec: CompressionCodec,
+    target_fpp: f64,
+) -> Result<()> {
+    let body = encode_plain_byte_array(values);
+    let stats = stats_byte_array(values);
+    let bloom_bytes = build_bloom_for_column(&ColumnData::ByteArray(values), target_fpp);
+    write_to_path_with_bloom(
+        path,
+        name,
+        ParquetType::ByteArray,
+        values.len(),
+        body,
+        codec,
+        stats,
+        &bloom_bytes,
+    )
+}
+
 // ---- Public `Write`-sink variants (in-memory friendly) --------------
 
 pub fn write_i64_column<W: Write>(out: &mut W, name: &str, values: &[i64]) -> Result<()> {
@@ -808,6 +914,33 @@ fn write_to_path(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_to_path_with_bloom(
+    path: impl AsRef<Path>,
+    name: &str,
+    parquet_type: ParquetType,
+    num_values: usize,
+    body: Vec<u8>,
+    codec: CompressionCodec,
+    stats: ColumnStats,
+    bloom_bytes: &[u8],
+) -> Result<()> {
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_inner(
+        &mut w,
+        name,
+        parquet_type,
+        num_values,
+        body,
+        codec,
+        stats,
+        Some(bloom_bytes),
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
 // ---- Shared file-skeleton writer ------------------------------------
 
 /// Stamps PAR1 + one DataPage + footer + footer-len + PAR1 into `out`.
@@ -822,6 +955,34 @@ fn write_single_column<W: Write>(
     body: Vec<u8>,
     codec: CompressionCodec,
     stats: ColumnStats,
+) -> Result<()> {
+    write_single_column_inner(
+        out,
+        column_name,
+        parquet_type,
+        num_values,
+        body,
+        codec,
+        stats,
+        None,
+    )
+}
+
+/// `write_single_column` with an optional Split-Block Bloom Filter
+/// blob (already serialised via `SplitBlockBloomFilterBuilder::into_bytes`).
+/// When present, the blob is written immediately after the data page
+/// body and its absolute offset + length are recorded in the
+/// ColumnMetaData per the Parquet spec.
+#[allow(clippy::too_many_arguments)]
+fn write_single_column_inner<W: Write>(
+    out: &mut W,
+    column_name: &str,
+    parquet_type: ParquetType,
+    num_values: usize,
+    body: Vec<u8>,
+    codec: CompressionCodec,
+    stats: ColumnStats,
+    bloom_bytes: Option<&[u8]>,
 ) -> Result<()> {
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
     let mut written: u64 = 4;
@@ -855,6 +1016,19 @@ fn write_single_column<W: Write>(
     written += header_bytes.len() as u64;
     out.write_all(&compressed_body).map_err(io_to_codec)?;
     written += compressed_body.len() as u64;
+
+    // Optional SBBF: same placement convention as the dict path —
+    // immediately after the chunk's data, with the absolute offset
+    // recorded in `bloom_filter_offset`.
+    let (bloom_filter_offset, bloom_filter_length) = if let Some(blob) = bloom_bytes {
+        let offset = written as i64;
+        out.write_all(blob).map_err(io_to_codec)?;
+        let length = blob.len() as i32;
+        written += blob.len() as u64;
+        (Some(offset), Some(length))
+    } else {
+        (None, None)
+    };
 
     let total_uncompressed_size = (header_bytes.len() + uncompressed_size) as i64;
     let total_compressed_size = (header_bytes.len() + compressed_size) as i64;
@@ -898,8 +1072,8 @@ fn write_single_column<W: Write>(
         dictionary_page_offset: None,
         statistics: Some(stats.as_statistics()),
         encoding_stats: None,
-        bloom_filter_offset: None,
-        bloom_filter_length: None,
+        bloom_filter_offset,
+        bloom_filter_length,
         size_statistics: None,
     };
     let cc = ColumnChunk {

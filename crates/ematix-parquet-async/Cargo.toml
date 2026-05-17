@@ -13,14 +13,14 @@ readme = "../../README.md"
 name = "ematix_parquet_async"
 
 [dependencies]
-ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.9" }
+ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.10" }
 # Sync io provides PageWalker (in-memory page iteration after the
 # chunk bytes have been fetched). Page walk is pure CPU work over
 # a byte slice; we don't re-implement it.
-ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.9" }
+ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.10" }
 # Codec provides every byte-slice decoder (plain, dict, compression,
 # data_page_view) the async façade composes on top of read_range.
-ematix-parquet-codec = { path = "../ematix-parquet-codec", version = "0.9" }
+ematix-parquet-codec = { path = "../ematix-parquet-codec", version = "0.10" }
 # Wraps every async byte-range source (S3, GCS, Azure, HTTP, local
 # FS, in-memory) behind a single trait. Pinned tight per Π.11 plan;
 # bump every 6-12 months as object_store releases.

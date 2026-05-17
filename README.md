@@ -12,7 +12,7 @@ a write path that produces spec-compliant files.
 
 ## Status
 
-`v0.9.x` — v1.0 cut criteria are met (every Parquet shape we read
+`v0.10.x` — v1.0 cut criteria are met (every Parquet shape we read
 or write is covered, predicate pushdown lights up end-to-end, and
 the decode hot paths are hand-tuned for the columns that dominate
 analytical TPC-H workloads).
@@ -53,9 +53,21 @@ over rayon, with cooperative cancellation via a shared
 NUMA topology detection, per-thread worker pinning, and
 first-touch local-buffer allocation so chunk bytes land on the
 worker's node automatically — no `libnuma` C dep.
-API is settling but the write side still has a few rough edges
-(per-column encoding choice on multi-column writes); pin by SHA
-or version range until we tag v1.0.
+The v0.10 cycle rounds out the write side and closes several
+opportunistic items: **multi-column / multi-row-group bloom writes**
+(per-(RG, col) SBBFs in `write_table_with_blooms_to_path`), **bloom
+on PLAIN (non-dict) write paths**, **multi-column dict encoding**
+(per-column opt-in via `dict_per_column`), **per-column codec**
+(new `write_table_with_options_to_path` + `WriteOptions` bundle —
+each column can use its own codec / dict / bloom in the same row
+group), a **u64-output bit-pack unpacker** that lets DELTA-i64
+streams use bit_width up to 64, **pread-based unlocked I/O** so
+`ParquetFile.read_range` no longer serialises across parallel
+workers, a **BYTE_ARRAY batched/streaming decode API** sibling to
+the scalar one, plus **NEON `pld` L1 prefetch hints** in the dict
+gather and **NEON unpackers for bw=4 + bw=8** added to the
+specialisation table.
+API is settling; pin by version range until we tag v1.0.
 
 ## What's implemented
 

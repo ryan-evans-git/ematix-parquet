@@ -40,14 +40,8 @@ fn plain_i32_bloom_roundtrip() {
     // (not distinct values), so this also exercises the duplicate
     // insert path. Distinct cardinality ≈ 1024.
     let values: Vec<i32> = (0..4096).map(|i| (i % 1024) * 7 - 3).collect();
-    write_i32_column_with_bloom_to_path(
-        &path,
-        "v",
-        &values,
-        CompressionCodec::Snappy,
-        0.01,
-    )
-    .unwrap();
+    write_i32_column_with_bloom_to_path(&path, "v", &values, CompressionCodec::Snappy, 0.01)
+        .unwrap();
 
     let reader = open_with_bloom(&path);
     let rg = reader.get_row_group(0).unwrap();
@@ -84,14 +78,8 @@ fn plain_i64_bloom_roundtrip() {
     let path = dir.path().join("plain_i64_bloom.parquet");
 
     let values: Vec<i64> = (0..2048).map(|i| (i as i64) * 1_000_003 - 17).collect();
-    write_i64_column_with_bloom_to_path(
-        &path,
-        "v",
-        &values,
-        CompressionCodec::Snappy,
-        0.01,
-    )
-    .unwrap();
+    write_i64_column_with_bloom_to_path(&path, "v", &values, CompressionCodec::Snappy, 0.01)
+        .unwrap();
 
     let reader = open_with_bloom(&path);
     let rg = reader.get_row_group(0).unwrap();
@@ -107,14 +95,8 @@ fn plain_f64_bloom_roundtrip() {
     let path = dir.path().join("plain_f64_bloom.parquet");
 
     let values: Vec<f64> = (0..1024).map(|i| (i as f64) * 0.5 - 100.0).collect();
-    write_f64_column_with_bloom_to_path(
-        &path,
-        "v",
-        &values,
-        CompressionCodec::Snappy,
-        0.01,
-    )
-    .unwrap();
+    write_f64_column_with_bloom_to_path(&path, "v", &values, CompressionCodec::Snappy, 0.01)
+        .unwrap();
 
     let reader = open_with_bloom(&path);
     let rg = reader.get_row_group(0).unwrap();
@@ -135,14 +117,8 @@ fn plain_byte_array_bloom_roundtrip() {
     let owned: Vec<String> = (0..512).map(|i| format!("string-{i:04}")).collect();
     let values: Vec<&[u8]> = owned.iter().map(|s| s.as_bytes()).collect();
 
-    write_byte_array_column_with_bloom_to_path(
-        &path,
-        "v",
-        &values,
-        CompressionCodec::Snappy,
-        0.01,
-    )
-    .unwrap();
+    write_byte_array_column_with_bloom_to_path(&path, "v", &values, CompressionCodec::Snappy, 0.01)
+        .unwrap();
 
     let reader = open_with_bloom(&path);
     let rg = reader.get_row_group(0).unwrap();
@@ -162,7 +138,10 @@ fn plain_byte_array_bloom_roundtrip() {
             break;
         }
     }
-    assert!(any_absent, "SBBF reported every never-inserted probe present");
+    assert!(
+        any_absent,
+        "SBBF reported every never-inserted probe present"
+    );
 }
 
 #[test]
@@ -174,14 +153,8 @@ fn plain_bloom_offset_recorded_in_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("offset_check.parquet");
     let values: Vec<i32> = (0..256).collect();
-    write_i32_column_with_bloom_to_path(
-        &path,
-        "v",
-        &values,
-        CompressionCodec::Uncompressed,
-        0.01,
-    )
-    .unwrap();
+    write_i32_column_with_bloom_to_path(&path, "v", &values, CompressionCodec::Uncompressed, 0.01)
+        .unwrap();
 
     let file = ematix_parquet_io::ParquetFile::open(&path).unwrap();
     let md = file.metadata().unwrap();

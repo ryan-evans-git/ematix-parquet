@@ -137,6 +137,176 @@ fn format_to_codec(e: ematix_parquet_format::error::FormatError) -> CodecError {
     CodecError::InvalidInput(format!("format: {e}"))
 }
 
+// ============================================================
+// Split-Block Bloom Filter builder (write side)
+// ============================================================
+//
+// Symmetric to `SplitBlockBloomFilter` above. Insert values via
+// `insert_hash(h)` or `insert_bytes(slice)`, then call
+// `into_bytes()` to serialise a `BloomFilterHeader` + bitset that
+// the decoder above can read back verbatim.
+//
+// Sizing the filter: `optimal_num_blocks(distinct_count, fpp)`
+// returns the smallest power-of-two num_blocks that achieves the
+// requested false-positive probability. Spec recommends p ≈ 0.01
+// for column-chunk bloom filters.
+
+/// In-memory SBBF builder. The bitset is owned; insertions OR the
+/// per-block masks directly into it.
+pub struct SplitBlockBloomFilterBuilder {
+    bitset: Vec<u8>,
+    num_blocks: u32,
+}
+
+impl SplitBlockBloomFilterBuilder {
+    /// New empty builder with `num_blocks` 32-byte blocks (so the
+    /// bitset is `32 * num_blocks` bytes). `num_blocks` should
+    /// come from `optimal_num_blocks` unless the caller has its
+    /// own sizing rule.
+    pub fn new(num_blocks: u32) -> Self {
+        let bytes = 32 * num_blocks as usize;
+        Self {
+            bitset: vec![0u8; bytes],
+            num_blocks,
+        }
+    }
+
+    /// Insert a precomputed XXHash64(value) into the filter. Use
+    /// `insert_bytes` if you want this crate to hash for you.
+    pub fn insert_hash(&mut self, h: u64) {
+        if self.num_blocks == 0 {
+            return;
+        }
+        let block_idx = ((h >> 32) * self.num_blocks as u64) >> 32;
+        let block_off = (block_idx as usize) * 32;
+        let h_lo = h as u32;
+        for i in 0..8 {
+            let mask_bit = (h_lo.wrapping_mul(SALT[i])) >> 27;
+            let mask = 1u32 << mask_bit;
+            let word_off = block_off + i * 4;
+            let mut word = u32::from_le_bytes([
+                self.bitset[word_off],
+                self.bitset[word_off + 1],
+                self.bitset[word_off + 2],
+                self.bitset[word_off + 3],
+            ]);
+            word |= mask;
+            let b = word.to_le_bytes();
+            self.bitset[word_off] = b[0];
+            self.bitset[word_off + 1] = b[1];
+            self.bitset[word_off + 2] = b[2];
+            self.bitset[word_off + 3] = b[3];
+        }
+    }
+
+    /// Hash `bytes` with `parquet_xxh64` and insert.
+    pub fn insert_bytes(&mut self, bytes: &[u8]) {
+        self.insert_hash(parquet_xxh64(bytes));
+    }
+
+    /// Number of 32-byte blocks in the bitset (returned by-value
+    /// for callers that want to verify post-construction).
+    pub fn num_blocks(&self) -> u32 {
+        self.num_blocks
+    }
+
+    /// Serialise as `BloomFilterHeader` Thrift followed by the
+    /// bitset bytes — the on-disk layout the spec calls for and
+    /// `SplitBlockBloomFilter::from_bytes` decodes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_bloom_filter_header(&mut out, self.bitset.len() as i32);
+        out.extend_from_slice(&self.bitset);
+        out
+    }
+}
+
+/// Recommended `num_blocks` for a target false-positive
+/// probability `fpp` with `n` distinct values. Rounds up to the
+/// next power of two (the spec doesn't require this, but most
+/// readers assume it). Floors at 1 block (32 bytes).
+///
+/// Derivation: per the SBBF spec, the false-positive rate is
+/// ≈ `(1 - exp(-8n / m))^8` where `m = num_blocks * 256` is the
+/// bit count. Solving for `m` given a target fpp:
+/// `m = -8n / ln(1 - fpp^(1/8))`.
+pub fn optimal_num_blocks(n: usize, fpp: f64) -> u32 {
+    if n == 0 {
+        return 1;
+    }
+    let fpp = fpp.clamp(1e-12, 0.5);
+    let m = -8.0 * n as f64 / (1.0 - fpp.powf(0.125)).ln();
+    let bytes = (m / 8.0).ceil() as u64;
+    let mut blocks = (bytes.div_ceil(32)).max(1);
+    // Round up to next power of two.
+    if !blocks.is_power_of_two() {
+        blocks = blocks.next_power_of_two();
+    }
+    blocks.min(u32::MAX as u64) as u32
+}
+
+/// Hand-rolled `BloomFilterHeader` Thrift writer. Equivalent to
+/// `metadata_writer::write_bloom_filter_header` would be if the
+/// format crate exposed one — but for v0.9.1 we keep the
+/// serialisation local to the codec so the bloom-builder PR
+/// doesn't have to touch the format crate's metadata writer
+/// (that's needed only for the full writer-integration step:
+/// emitting bloom filters into the parquet file's body and
+/// updating `ColumnMetaData.bloom_filter_offset`).
+///
+/// Compact-protocol layout:
+///   field 1 i32 num_bytes
+///   field 2 struct BloomFilterAlgorithm { union — SplitBlock = field 1, void }
+///   field 3 struct BloomFilterHash      { union — XxHash     = field 1, void }
+///   field 4 struct BloomFilterCompression { union — Uncompressed = field 1, void }
+///   stop
+fn write_bloom_filter_header(out: &mut Vec<u8>, num_bytes: i32) {
+    // Field 1: i32 num_bytes — compact i32 is zigzag varint.
+    out.push((1u8 << 4) | 5); // field id 1, type i32 (5)
+    write_zigzag_i32(out, num_bytes);
+
+    // Field 2: BloomFilterAlgorithm (struct/union)
+    out.push((1u8 << 4) | 12); // field id 2 (delta 1 from id 1), type struct (12)
+    {
+        // Union field 1: SplitBlockAlgorithm — a struct with no fields, encoded as STOP.
+        out.push((1u8 << 4) | 12); // field id 1, type struct (12)
+        out.push(0); // inner struct STOP
+        out.push(0); // union STOP
+    }
+
+    // Field 3: BloomFilterHash (struct/union)
+    out.push((1u8 << 4) | 12); // field id 3 (delta 1), type struct
+    {
+        // Union field 1: XxHash — empty struct
+        out.push((1u8 << 4) | 12);
+        out.push(0);
+        out.push(0);
+    }
+
+    // Field 4: BloomFilterCompression (struct/union)
+    out.push((1u8 << 4) | 12); // field id 4 (delta 1), type struct
+    {
+        // Union field 1: Uncompressed — empty struct
+        out.push((1u8 << 4) | 12);
+        out.push(0);
+        out.push(0);
+    }
+
+    out.push(0); // outer struct STOP
+}
+
+fn write_zigzag_i32(out: &mut Vec<u8>, v: i32) {
+    let mut z: u32 = ((v << 1) ^ (v >> 31)) as u32;
+    loop {
+        if (z & !0x7F) == 0 {
+            out.push(z as u8);
+            return;
+        }
+        out.push(((z & 0x7F) | 0x80) as u8);
+        z >>= 7;
+    }
+}
+
 // ---- XXHash64 ------------------------------------------------------
 //
 // Parquet uses XXHash64 with seed=0. Inline implementation rather
@@ -266,5 +436,75 @@ mod tests {
         for len in 0..=80 {
             let _ = parquet_xxh64(&data[..len]);
         }
+    }
+
+    #[test]
+    fn builder_round_trips_through_decoder() {
+        // Build a filter, insert a known set of values, serialise,
+        // parse with the decoder, confirm every inserted value is
+        // reported "possibly present" and a handful of non-inserted
+        // values are reported "absent" (fpp permitting).
+        let inserted: Vec<&[u8]> = vec![
+            b"alpha", b"bravo", b"charlie", b"delta", b"echo", b"foxtrot", b"golf", b"hotel",
+            b"india", b"juliet",
+        ];
+        let blocks = optimal_num_blocks(inserted.len(), 0.01);
+        let mut b = SplitBlockBloomFilterBuilder::new(blocks);
+        for v in &inserted {
+            b.insert_bytes(v);
+        }
+        let bytes = b.into_bytes();
+        let filter = SplitBlockBloomFilter::from_bytes(&bytes).expect("decode");
+
+        // Every inserted value must be reported present.
+        for v in &inserted {
+            assert!(
+                filter.contains_bytes(v),
+                "inserted value {v:?} reported absent (false negative — impossible for a correct SBBF)"
+            );
+        }
+
+        // Non-inserted values should mostly be reported absent.
+        // 100 distinct strings, expect ≤ ~3 false positives at fpp 0.01.
+        let mut fp = 0;
+        for i in 0..100 {
+            let key = format!("absent_{i}");
+            if filter.contains_bytes(key.as_bytes()) {
+                fp += 1;
+            }
+        }
+        assert!(fp < 10, "too many false positives: {fp} / 100");
+    }
+
+    #[test]
+    fn optimal_num_blocks_is_power_of_two_and_grows_with_n() {
+        let b1 = optimal_num_blocks(100, 0.01);
+        let b2 = optimal_num_blocks(10_000, 0.01);
+        let b3 = optimal_num_blocks(1_000_000, 0.01);
+        assert!(b1.is_power_of_two());
+        assert!(b2.is_power_of_two());
+        assert!(b3.is_power_of_two());
+        assert!(b1 < b2 && b2 < b3);
+    }
+
+    #[test]
+    fn empty_builder_serialises_and_decodes() {
+        // Edge case: a builder with the smallest valid filter
+        // (1 block = 32 bytes bitset) must round-trip.
+        let b = SplitBlockBloomFilterBuilder::new(1);
+        let bytes = b.into_bytes();
+        let filter = SplitBlockBloomFilter::from_bytes(&bytes).expect("decode");
+        assert_eq!(filter.num_blocks(), 1);
+        // No values inserted → every membership check returns false.
+        assert!(!filter.contains_bytes(b"anything"));
+    }
+
+    #[test]
+    fn builder_insert_hash_and_insert_bytes_agree() {
+        let mut a = SplitBlockBloomFilterBuilder::new(4);
+        let mut b = SplitBlockBloomFilterBuilder::new(4);
+        a.insert_hash(parquet_xxh64(b"x"));
+        b.insert_bytes(b"x");
+        assert_eq!(a.into_bytes(), b.into_bytes());
     }
 }

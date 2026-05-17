@@ -8,15 +8,19 @@
 //! efficiency.
 //!
 //! ## Known bottleneck
-//! `ParquetFile.file: Mutex<File>` serializes every `read_range` call
-//! across workers. With this synthetic single-column small-decode
-//! fixture, the mutex hold time eats into the speedup at higher
-//! thread counts (peak observed ~1.8× on a 14-core M-series). Real
-//! ematix-flow workloads (multi-column, complex predicates, larger
-//! per-RG compute) push the per-worker compute much higher and the
-//! mutex stops being the bottleneck. Switching `ParquetFile` to
-//! `pread`-based unlocked I/O is a separate optimisation; not part
-//! of Π.15.
+//! As of v0.10 `ParquetFile.read_range` uses lock-free positional
+//! I/O (`pread(2)` on Unix; `seek_read` on Windows), so the file
+//! mutex is gone. Sequential decode also got faster as a result
+//! (no mutex acquisition per read).
+//!
+//! On this synthetic single-column 50-RG fixture the speedup
+//! plateaus around 1.3–2.0× (host-dependent) — the remaining
+//! bottleneck is likely DRAM bandwidth, since the whole working
+//! set is small (~26 MB at 3.3M i64) and 14 cores quickly
+//! saturate per-socket memory throughput on the decompress pass.
+//! Real ematix-flow workloads (multi-column, complex predicates,
+//! larger per-RG compute) push per-worker compute much higher
+//! relative to memory traffic and should see more linear scaling.
 //!
 //! On Linux also runs a NUMA-pinned variant via `build_numa_pinned_pool`
 //! (Π.15c+d). On macOS / Windows the NUMA path is cfg'd out so that

@@ -1752,6 +1752,129 @@ pub fn write_i32_column_dict_with_bloom_to_path(
     Ok(())
 }
 
+/// `write_i64_column_dict_to_path` with an SBBF built over the
+/// distinct values (8-byte LE hash input).
+pub fn write_i64_column_dict_with_bloom_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[i64],
+    codec: CompressionCodec,
+    target_fpp: f64,
+) -> Result<()> {
+    use crate::bloom::{optimal_num_blocks, SplitBlockBloomFilterBuilder};
+    let stats = stats_i64(values);
+    let (dict, indices) = build_dict_i64(values);
+    let dict_body = encode_plain_i64(&dict);
+
+    let num_blocks = optimal_num_blocks(dict.len(), target_fpp);
+    let mut builder = SplitBlockBloomFilterBuilder::new(num_blocks);
+    let mut le_buf = [0u8; 8];
+    for &v in &dict {
+        le_buf.copy_from_slice(&v.to_le_bytes());
+        builder.insert_bytes(&le_buf);
+    }
+    let bloom_bytes = builder.into_bytes();
+
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_dict_inner(
+        &mut w,
+        name,
+        ParquetType::Int64,
+        values.len(),
+        dict_body,
+        dict.len(),
+        &indices,
+        codec,
+        stats,
+        Some(&bloom_bytes),
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+/// `write_f64_column_dict_to_path` with an SBBF built over the
+/// distinct values (8-byte LE hash input — same shape parquet-rs
+/// uses for double columns).
+pub fn write_f64_column_dict_with_bloom_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[f64],
+    codec: CompressionCodec,
+    target_fpp: f64,
+) -> Result<()> {
+    use crate::bloom::{optimal_num_blocks, SplitBlockBloomFilterBuilder};
+    let stats = stats_f64(values);
+    let (dict, indices) = build_dict_f64(values);
+    let dict_body = encode_plain_f64(&dict);
+
+    let num_blocks = optimal_num_blocks(dict.len(), target_fpp);
+    let mut builder = SplitBlockBloomFilterBuilder::new(num_blocks);
+    let mut le_buf = [0u8; 8];
+    for &v in &dict {
+        le_buf.copy_from_slice(&v.to_le_bytes());
+        builder.insert_bytes(&le_buf);
+    }
+    let bloom_bytes = builder.into_bytes();
+
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_dict_inner(
+        &mut w,
+        name,
+        ParquetType::Double,
+        values.len(),
+        dict_body,
+        dict.len(),
+        &indices,
+        codec,
+        stats,
+        Some(&bloom_bytes),
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+/// `write_byte_array_column_dict_to_path` with an SBBF built over
+/// the distinct values. Hash input is the raw bytes — **without**
+/// any length prefix (per the Parquet spec).
+pub fn write_byte_array_column_dict_with_bloom_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[&[u8]],
+    codec: CompressionCodec,
+    target_fpp: f64,
+) -> Result<()> {
+    use crate::bloom::{optimal_num_blocks, SplitBlockBloomFilterBuilder};
+    let stats = stats_byte_array(values);
+    let (dict, indices) = build_dict_byte_array(values);
+    let dict_body = encode_plain_byte_array(&dict);
+
+    let num_blocks = optimal_num_blocks(dict.len(), target_fpp);
+    let mut builder = SplitBlockBloomFilterBuilder::new(num_blocks);
+    for v in &dict {
+        builder.insert_bytes(v);
+    }
+    let bloom_bytes = builder.into_bytes();
+
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_dict_inner(
+        &mut w,
+        name,
+        ParquetType::ByteArray,
+        values.len(),
+        dict_body,
+        dict.len(),
+        &indices,
+        codec,
+        stats,
+        Some(&bloom_bytes),
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
 pub fn write_f64_column_dict_to_path(
     path: impl AsRef<Path>,
     name: &str,

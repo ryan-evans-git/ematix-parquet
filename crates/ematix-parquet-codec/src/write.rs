@@ -168,10 +168,58 @@ pub fn write_table<W: Write>(
 /// V2 is the current parquet-mr / parquet-rs default for new files;
 /// choose it for interop with newer ecosystem readers that might
 /// short-circuit V1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PageVersion {
+    #[default]
     V1,
     V2,
+}
+
+/// Bundled per-table + per-column knobs for the multi-column table
+/// writer. Use [`write_table_with_options_to_path`] when you need
+/// any combination of per-column codec, dict opt-in, or bloom
+/// filters — keeps the API surface flat as more knobs land.
+///
+/// Per-column slices, when set, must have length equal to the
+/// columns slice passed to the writer; mismatch returns an
+/// `InvalidInput` error.
+///
+/// Default: V1 pages, single row group (`row_group_size = usize::MAX`),
+/// uncompressed everywhere, no dict, no bloom.
+#[derive(Debug, Clone)]
+pub struct WriteOptions<'a> {
+    /// Row count at which a new row group is cut. `usize::MAX` keeps
+    /// the whole table in one row group.
+    pub row_group_size: usize,
+    /// V1 or V2 data page header shape.
+    pub page_version: PageVersion,
+    /// Codec applied to every column unless `codec_per_column`
+    /// overrides it for that column.
+    pub default_codec: CompressionCodec,
+    /// Per-column codec override. Length must equal columns.len().
+    pub codec_per_column: Option<&'a [CompressionCodec]>,
+    /// Per-column dict-encoding opt-in. `true` writes a per-RG
+    /// dictionary page + RLE_DICTIONARY indices for that column.
+    /// Length must equal columns.len().
+    pub dict_per_column: Option<&'a [bool]>,
+    /// Per-column bloom filter target FPP. `Some(fpp)` builds an
+    /// SBBF sized via `optimal_num_blocks` over every value in the
+    /// RG slice; `None` skips bloom for that column. Length must
+    /// equal columns.len().
+    pub bloom_fpps: Option<&'a [Option<f64>]>,
+}
+
+impl Default for WriteOptions<'_> {
+    fn default() -> Self {
+        Self {
+            row_group_size: usize::MAX,
+            page_version: PageVersion::V1,
+            default_codec: CompressionCodec::Uncompressed,
+            codec_per_column: None,
+            dict_per_column: None,
+            bloom_fpps: None,
+        }
+    }
 }
 
 /// Multi-row-group variant. `row_group_size` is the row count at
@@ -344,6 +392,44 @@ pub fn write_table_with_dict_and_blooms_to_path<P: AsRef<Path>>(
     Ok(())
 }
 
+/// Most flexible table writer. Accepts a [`WriteOptions`] bundling
+/// every per-table and per-column knob (codec, dict, bloom, page
+/// version, row-group size). Use this when you need any combination
+/// of those that isn't already covered by a named entry point.
+///
+/// The existing named entry points (`write_table_to_path`,
+/// `write_table_with_blooms_to_path`, `write_table_with_dict_to_path`,
+/// etc.) remain for the common cases — this one is the catch-all.
+pub fn write_table_with_options_to_path<P: AsRef<Path>>(
+    path: P,
+    columns: &[(&str, ColumnData<'_>)],
+    options: &WriteOptions<'_>,
+) -> Result<()> {
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_table_with_options(&mut w, columns, options)?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+/// `write_table_with_options_to_path` for an arbitrary `Write` sink.
+pub fn write_table_with_options<W: Write>(
+    out: &mut W,
+    columns: &[(&str, ColumnData<'_>)],
+    options: &WriteOptions<'_>,
+) -> Result<()> {
+    write_table_inner_full_v2(
+        out,
+        columns,
+        options.default_codec,
+        options.row_group_size,
+        options.page_version,
+        options.bloom_fpps,
+        options.dict_per_column,
+        options.codec_per_column,
+    )
+}
+
 fn write_table_inner<W: Write>(
     out: &mut W,
     columns: &[(&str, ColumnData<'_>)],
@@ -373,6 +459,29 @@ fn write_table_inner_full<W: Write>(
     bloom_fpps: Option<&[Option<f64>]>,
     dict_per_column: Option<&[bool]>,
 ) -> Result<()> {
+    write_table_inner_full_v2(
+        out,
+        columns,
+        codec,
+        row_group_size,
+        page_version,
+        bloom_fpps,
+        dict_per_column,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_table_inner_full_v2<W: Write>(
+    out: &mut W,
+    columns: &[(&str, ColumnData<'_>)],
+    default_codec: CompressionCodec,
+    row_group_size: usize,
+    page_version: PageVersion,
+    bloom_fpps: Option<&[Option<f64>]>,
+    dict_per_column: Option<&[bool]>,
+    codec_per_column: Option<&[CompressionCodec]>,
+) -> Result<()> {
     if columns.is_empty() {
         return Err(CodecError::InvalidInput(
             "write_table requires at least one column".into(),
@@ -382,6 +491,15 @@ fn write_table_inner_full<W: Write>(
         return Err(CodecError::InvalidInput(
             "row_group_size must be > 0".into(),
         ));
+    }
+    if let Some(c) = codec_per_column {
+        if c.len() != columns.len() {
+            return Err(CodecError::InvalidInput(format!(
+                "codec_per_column length {} != columns length {}",
+                c.len(),
+                columns.len()
+            )));
+        }
     }
     if let Some(d) = dict_per_column {
         if d.len() != columns.len() {
@@ -407,6 +525,7 @@ fn write_table_inner_full<W: Write>(
             }
         }
     }
+    let codec = default_codec;
     let total_rows = columns[0].1.row_count();
     for (name, c) in &columns[1..] {
         if c.row_count() != total_rows {
@@ -456,6 +575,10 @@ fn write_table_inner_full<W: Write>(
             let col_slice = col.slice(row_start..row_end);
             let stats = compute_stats(&col_slice);
 
+            // Per-column codec resolution: explicit override per
+            // column, else the table-wide default.
+            let col_codec = codec_per_column.map(|cs| cs[col_ix]).unwrap_or(codec);
+
             // Build the bloom filter (if requested for this column)
             // from the RG slice — per-(RG, column) granularity, the
             // spec-correct shape for row-group pruning. Built over
@@ -474,7 +597,7 @@ fn write_table_inner_full<W: Write>(
                     .encode_dict()
                     .expect("encode_dict None already rejected by precondition checks");
                 let dict_uncomp = dict_body.len();
-                let dict_compressed = compress_body(&dict_body, codec)?;
+                let dict_compressed = compress_body(&dict_body, col_codec)?;
                 let dict_comp = dict_compressed.len();
                 let dict_header = PageHeader {
                     page_type: PageType::DictionaryPage,
@@ -503,7 +626,7 @@ fn write_table_inner_full<W: Write>(
                 data_body.push(bit_width);
                 data_body.extend_from_slice(&encode_rle_bit_packed(&indices, bit_width));
                 let data_uncomp = data_body.len();
-                let data_compressed = compress_body(&data_body, codec)?;
+                let data_compressed = compress_body(&data_body, col_codec)?;
                 let data_comp = data_compressed.len();
                 let data_header = PageHeader {
                     page_type: PageType::DataPage,
@@ -544,7 +667,7 @@ fn write_table_inner_full<W: Write>(
                 // ---- PLAIN data page (V1 or V2) ----
                 let body = col_slice.encode_plain();
                 let uncompressed_size = body.len();
-                let compressed_body = compress_body(&body, codec)?;
+                let compressed_body = compress_body(&body, col_codec)?;
                 let compressed_size = compressed_body.len();
                 let header = match page_version {
                     PageVersion::V1 => PageHeader {
@@ -581,7 +704,7 @@ fn write_table_inner_full<W: Write>(
                             encoding: Encoding::Plain,
                             definition_levels_byte_length: 0,
                             repetition_levels_byte_length: 0,
-                            is_compressed: codec != CompressionCodec::Uncompressed,
+                            is_compressed: col_codec != CompressionCodec::Uncompressed,
                             statistics: Some(stats.as_statistics()),
                         }),
                     },
@@ -662,7 +785,7 @@ fn write_table_inner_full<W: Write>(
     for (rg_ix, (chunk_rows, prepared)) in prepared_groups.iter().enumerate() {
         let mut row_group_columns: Vec<ColumnChunk<'_>> = Vec::with_capacity(columns.len());
         let mut total_byte_size: i64 = 0;
-        for ((name, col), prep) in columns.iter().zip(prepared.iter()) {
+        for (col_ix, ((name, col), prep)) in columns.iter().zip(prepared.iter()).enumerate() {
             // Encodings list shape mirrors what parquet-rs writes: a
             // dict-encoded column advertises PLAIN (for the dict page),
             // RLE (for the level/index streams), and PLAIN_DICTIONARY
@@ -676,11 +799,12 @@ fn write_table_inner_full<W: Write>(
             // byte. For dict columns that's the dict page; otherwise
             // the data page.
             let chunk_file_offset = prep.dictionary_page_offset.unwrap_or(prep.data_page_offset);
+            let col_codec = codec_per_column.map(|cs| cs[col_ix]).unwrap_or(codec);
             let cm = ColumnMetaData {
                 column_type: col.parquet_type(),
                 encodings,
                 path_in_schema: vec![name.as_bytes()],
-                codec,
+                codec: col_codec,
                 num_values: *chunk_rows as i64,
                 total_uncompressed_size: prep.total_uncompressed_size,
                 total_compressed_size: prep.total_compressed_size,

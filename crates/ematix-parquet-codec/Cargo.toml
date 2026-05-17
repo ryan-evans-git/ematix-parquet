@@ -152,5 +152,15 @@ required-features = ["encryption"]
 name = "bench_adaptive_dispatch"
 path = "examples/bench_adaptive_dispatch.rs"
 
+# Π.15e parallel multi-RG decode scaling bench. Builds a temp 50-RG
+# i64 file and times sequential vs rayon at thread counts 1, 2, 4,
+# 8, ... up to host CPU count. On Linux also runs the NUMA-pinned
+# variant via build_numa_pinned_pool (Π.15c+d).
+# Run: cargo run --release --example bench_parallel_scaling -p ematix-parquet-codec --features parallel
+[[example]]
+name = "bench_parallel_scaling"
+path = "examples/bench_parallel_scaling.rs"
+required-features = ["parallel"]
+
 [lints]
 workspace = true

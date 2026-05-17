@@ -187,6 +187,8 @@ pub fn unpack_indices_into(
     #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
     {
         match bit_width {
+            4 => return crate::bitpack_neon::unpack_indices_into_neon_bw4(packed, num_values, out),
+            8 => return crate::bitpack_neon::unpack_indices_into_neon_bw8(packed, num_values, out),
             12 => {
                 return crate::bitpack_neon::unpack_indices_into_neon_bw12(packed, num_values, out)
             }

@@ -2262,8 +2262,176 @@ pub fn read_column_f64_batches(
     })
 }
 
-// Note: BYTE_ARRAY batched API is not provided in this iteration.
-// `Vec<u8>` is not `Copy`, and the dict-encoded path needs a separate
-// index-then-gather-then-clone strategy. Callers needing chunked
-// byte_array can use `read_column_byte_array_offsets_into` with their
-// own slicing for now.
+// ---- BYTE_ARRAY batched API ---------------------------------------
+//
+// Mirrors `ColumnBatchIter` for `Vec<Vec<u8>>` output. `Vec<u8>` isn't
+// `Copy`, so we can't go through the generic `T: Copy` path — instead
+// the dict body is kept as `Vec<Vec<u8>>` and each dict-encoded data
+// page does an index-then-gather-then-clone pass to materialize one
+// `Vec<u8>` per row into `carry`. The per-row clone is unavoidable
+// for an owned-value API; callers that want an allocation-light
+// shape should use `read_column_byte_array_offsets_into` with their
+// own batching.
+
+/// Iterator yielding `Vec<Vec<u8>>` batches from a single BYTE_ARRAY
+/// column chunk. Constructed via [`read_column_byte_array_batches`].
+pub struct ColumnByteArrayBatchIter {
+    chunk_bytes: Vec<u8>,
+    walker_pos: usize,
+    codec: CompressionCodec,
+    total_values: usize,
+    emitted_to_carry: usize,
+    batch_size: usize,
+    dict: Vec<Vec<u8>>,
+    decomp: Vec<u8>,
+    carry: Vec<Vec<u8>>,
+    carry_pos: usize,
+    finished: bool,
+}
+
+impl ColumnByteArrayBatchIter {
+    fn fill_one_page(&mut self) -> Result<bool> {
+        if self.emitted_to_carry >= self.total_values {
+            return Ok(false);
+        }
+        let mut walker = PageWalker::new(&self.chunk_bytes[self.walker_pos..]);
+        loop {
+            let pair = walker.next_page().map_err(io_to_codec)?;
+            let (hdr, body) = match pair {
+                Some(p) => p,
+                None => {
+                    self.walker_pos = self.chunk_bytes.len();
+                    return Ok(false);
+                }
+            };
+            let consumed = walker.position();
+            self.walker_pos += consumed;
+
+            match hdr.page_type {
+                PageType::DictionaryPage => {
+                    decompress_into(self.codec, body, &mut self.decomp)?;
+                    let slices = decode_plain_byte_array(&self.decomp)?;
+                    self.dict = slices.into_iter().map(|s| s.to_vec()).collect();
+                    walker = PageWalker::new(&self.chunk_bytes[self.walker_pos..]);
+                    continue;
+                }
+                PageType::DataPage | PageType::DataPageV2 => {
+                    let info = data_page_view(&hdr, body, self.codec, &mut self.decomp)?;
+                    let before = self.carry.len();
+                    match info.encoding {
+                        Encoding::Plain => {
+                            let slices = decode_plain_byte_array(info.values)?;
+                            self.carry.extend(slices.into_iter().map(|s| s.to_vec()));
+                        }
+                        Encoding::RleDictionary | Encoding::PlainDictionary => {
+                            if self.dict.is_empty() {
+                                return Err(CodecError::InvalidInput(
+                                    "dict-encoded data page before dictionary".into(),
+                                ));
+                            }
+                            // index-then-gather-then-clone — the only
+                            // shape that works for an owned `Vec<u8>`
+                            // batched output.
+                            let indices = crate::dict::decode_rle_dictionary_indices(
+                                info.values,
+                                info.num_values,
+                            )?;
+                            self.carry.reserve(info.num_values);
+                            for idx in indices {
+                                let v = self.dict.get(idx as usize).ok_or_else(|| {
+                                    CodecError::InvalidInput("dictionary index out of range".into())
+                                })?;
+                                self.carry.push(v.clone());
+                            }
+                        }
+                        other => {
+                            return Err(CodecError::Unsupported(format!(
+                                "encoding not yet dispatched by façade: {other:?}"
+                            )));
+                        }
+                    }
+                    let added = self.carry.len() - before;
+                    self.emitted_to_carry += added;
+                    return Ok(true);
+                }
+                PageType::IndexPage => {
+                    walker = PageWalker::new(&self.chunk_bytes[self.walker_pos..]);
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn drain_one_batch(&mut self) -> Option<Result<Vec<Vec<u8>>>> {
+        if self.finished {
+            return None;
+        }
+        while self.carry.len() - self.carry_pos < self.batch_size
+            && self.emitted_to_carry < self.total_values
+        {
+            match self.fill_one_page() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    self.finished = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+        let available = self.carry.len() - self.carry_pos;
+        if available == 0 {
+            self.finished = true;
+            return None;
+        }
+        let n = available.min(self.batch_size);
+        // Drain n owned Vec<u8> out of `carry` starting at carry_pos.
+        // `drain` on a slice would reorder; instead splice the prefix
+        // out when fully drained, otherwise hand-move with mem::take.
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for i in 0..n {
+            batch.push(std::mem::take(&mut self.carry[self.carry_pos + i]));
+        }
+        self.carry_pos += n;
+        if self.carry_pos == self.carry.len() {
+            self.carry.clear();
+            self.carry_pos = 0;
+        }
+        Some(Ok(batch))
+    }
+}
+
+impl Iterator for ColumnByteArrayBatchIter {
+    type Item = Result<Vec<Vec<u8>>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.drain_one_batch()
+    }
+}
+
+/// Stream BYTE_ARRAY batches of (mostly) `batch_size` rows from a
+/// column chunk. The final batch may be shorter. Each row is an
+/// owned `Vec<u8>` (one allocation per row); for a denser shape
+/// see `read_column_byte_array_offsets_into`.
+pub fn read_column_byte_array_batches(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    batch_size: usize,
+) -> Result<ColumnByteArrayBatchIter> {
+    if batch_size == 0 {
+        return Err(CodecError::InvalidInput("batch_size must be > 0".into()));
+    }
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    Ok(ColumnByteArrayBatchIter {
+        chunk_bytes,
+        walker_pos: 0,
+        codec,
+        total_values,
+        emitted_to_carry: 0,
+        batch_size,
+        dict: Vec::new(),
+        decomp: Vec::new(),
+        carry: Vec::with_capacity(batch_size),
+        carry_pos: 0,
+        finished: false,
+    })
+}

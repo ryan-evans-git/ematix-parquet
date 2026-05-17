@@ -21,6 +21,11 @@ no-neon = []
 # into the dep graph; surfaces the `encrypted` module + encrypted
 # read/write entry points. Default builds stay crypto-free.
 encryption = ["dep:ematix-parquet-crypto"]
+# Π.15 multi-RG parallel decode. Pulls `rayon` in; surfaces the
+# `parallel` module + `read_columns_parallel` entry point. Default
+# builds stay rayon-free so single-threaded consumers don't pay the
+# thread-pool startup cost or the dep-tree weight.
+parallel = ["dep:rayon"]
 
 [dependencies]
 ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.8" }
@@ -33,6 +38,9 @@ ematix-parquet-io = { path = "../ematix-parquet-io", version = "0.8" }
 # `--features encryption` is set. The crypto crate itself stays
 # unconditionally compiled (it's small) but its surface is gated.
 ematix-parquet-crypto = { path = "../ematix-parquet-crypto", version = "0.8", optional = true }
+# Work-stealing thread pool for `read_columns_parallel` (Π.15).
+# Optional — only present when `--features parallel` is set.
+rayon = { version = "1.10", optional = true }
 # Snappy is the default codec for almost every parquet writer in the
 # wild (and the one TPC-H data uses). Pinning to a known-stable cut
 # of `snap` until benchmarks tell us we want a hand-rolled one.

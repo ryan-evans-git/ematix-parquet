@@ -532,3 +532,183 @@ macro_rules! dispatch_unpack_indices {
     };
 }
 use dispatch_unpack_indices;
+
+// ---- u64-output unpacker (DELTA-i64 high-bit-width path) -----------
+//
+// Mirrors `unpack_indices_into` / `unpack_chunks_indices` but emits
+// u64 values and supports bit_widths in 1..=64. The wide path uses a
+// u128 accumulator because at NUM_BITS > 57 a single value can span
+// 9 source bytes (start_bit % 8 of up to 7, plus NUM_BITS bits),
+// which doesn't fit in u64. No SIMD specializations — DELTA-i64 with
+// bit_width > 32 is rare in practice (writer normally falls back to
+// PLAIN at that point), so scalar correctness wins over peak speed.
+
+/// Public u64-output sibling of [`unpack_indices_into`].
+///
+/// Supports `bit_width` in 0..=64. Writes `num_values` u64 values
+/// into `out`. Caller is responsible for reserving capacity; the
+/// function does its own `reserve`.
+pub fn unpack_indices64_into(
+    packed: &[u8],
+    num_values: usize,
+    bit_width: u8,
+    out: &mut Vec<u64>,
+) -> Result<()> {
+    if bit_width > 64 {
+        return Err(CodecError::BitWidthOutOfRange(bit_width));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    if bit_width == 0 {
+        out.resize(out.len() + num_values, 0);
+        return Ok(());
+    }
+    out.reserve(num_values);
+    dispatch_unpack_indices64!(bit_width, packed, num_values, out)
+}
+
+/// Monomorphized worker for the u64-output path. Const-generic on
+/// the bit width so each width compiles to its own straight-line
+/// scalar kernel. Uses a u128 accumulator to safely handle the
+/// >57-bit case where a single value can span 9 bytes.
+#[inline(always)]
+fn unpack_chunks_indices64<const NUM_BITS: usize>(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u64>,
+) -> Result<()> {
+    debug_assert!(NUM_BITS >= 1 && NUM_BITS <= 64);
+    let mask: u128 = if NUM_BITS == 64 {
+        u64::MAX as u128
+    } else {
+        (1u128 << NUM_BITS) - 1
+    };
+
+    let chunk_bytes = (NUM_BITS * 32) / 8;
+    let full_chunks = num_values / 32;
+    let tail = num_values % 32;
+
+    let out_start_len = out.len();
+    let mut packed_idx = 0usize;
+    let mut written = 0usize;
+    // SAFETY: caller reserved `num_values` capacity; writes never
+    // exceed it because the total equals num_values exactly.
+    unsafe {
+        let out_ptr = out.as_mut_ptr().add(out_start_len);
+        for _ in 0..full_chunks {
+            let chunk = &packed[packed_idx..packed_idx + chunk_bytes];
+            for i in 0..32usize {
+                let start_bit = i * NUM_BITS;
+                let start_byte = start_bit / 8;
+                let bit_in_byte = (start_bit % 8) as u32;
+                let bytes_needed = (NUM_BITS + bit_in_byte as usize).div_ceil(8);
+                let mut acc: u128 = 0;
+                for j in 0..bytes_needed {
+                    acc |= (chunk[start_byte + j] as u128) << (j * 8);
+                }
+                *out_ptr.add(written + i) = ((acc >> bit_in_byte) & mask) as u64;
+            }
+            written += 32;
+            packed_idx += chunk_bytes;
+        }
+        out.set_len(out_start_len + written);
+    }
+
+    if tail > 0 {
+        let tail_bytes = (tail * NUM_BITS).div_ceil(8);
+        let chunk = &packed[packed_idx..packed_idx + tail_bytes];
+        let mut buf: u128 = 0;
+        let mut bits: u32 = 0;
+        let mut byte_idx = 0usize;
+        for _ in 0..tail {
+            while bits < NUM_BITS as u32 {
+                buf |= (chunk[byte_idx] as u128) << bits;
+                byte_idx += 1;
+                bits += 8;
+            }
+            // SAFETY: capacity reserved; tail < 32.
+            unsafe {
+                let out_ptr = out.as_mut_ptr().add(out.len());
+                *out_ptr = (buf & mask) as u64;
+                out.set_len(out.len() + 1);
+            }
+            buf >>= NUM_BITS;
+            bits -= NUM_BITS as u32;
+        }
+    }
+    Ok(())
+}
+
+macro_rules! dispatch_unpack_indices64 {
+    ($bw:expr, $packed:expr, $n:expr, $out:expr) => {
+        match $bw {
+            1 => unpack_chunks_indices64::<1>($packed, $n, $out),
+            2 => unpack_chunks_indices64::<2>($packed, $n, $out),
+            3 => unpack_chunks_indices64::<3>($packed, $n, $out),
+            4 => unpack_chunks_indices64::<4>($packed, $n, $out),
+            5 => unpack_chunks_indices64::<5>($packed, $n, $out),
+            6 => unpack_chunks_indices64::<6>($packed, $n, $out),
+            7 => unpack_chunks_indices64::<7>($packed, $n, $out),
+            8 => unpack_chunks_indices64::<8>($packed, $n, $out),
+            9 => unpack_chunks_indices64::<9>($packed, $n, $out),
+            10 => unpack_chunks_indices64::<10>($packed, $n, $out),
+            11 => unpack_chunks_indices64::<11>($packed, $n, $out),
+            12 => unpack_chunks_indices64::<12>($packed, $n, $out),
+            13 => unpack_chunks_indices64::<13>($packed, $n, $out),
+            14 => unpack_chunks_indices64::<14>($packed, $n, $out),
+            15 => unpack_chunks_indices64::<15>($packed, $n, $out),
+            16 => unpack_chunks_indices64::<16>($packed, $n, $out),
+            17 => unpack_chunks_indices64::<17>($packed, $n, $out),
+            18 => unpack_chunks_indices64::<18>($packed, $n, $out),
+            19 => unpack_chunks_indices64::<19>($packed, $n, $out),
+            20 => unpack_chunks_indices64::<20>($packed, $n, $out),
+            21 => unpack_chunks_indices64::<21>($packed, $n, $out),
+            22 => unpack_chunks_indices64::<22>($packed, $n, $out),
+            23 => unpack_chunks_indices64::<23>($packed, $n, $out),
+            24 => unpack_chunks_indices64::<24>($packed, $n, $out),
+            25 => unpack_chunks_indices64::<25>($packed, $n, $out),
+            26 => unpack_chunks_indices64::<26>($packed, $n, $out),
+            27 => unpack_chunks_indices64::<27>($packed, $n, $out),
+            28 => unpack_chunks_indices64::<28>($packed, $n, $out),
+            29 => unpack_chunks_indices64::<29>($packed, $n, $out),
+            30 => unpack_chunks_indices64::<30>($packed, $n, $out),
+            31 => unpack_chunks_indices64::<31>($packed, $n, $out),
+            32 => unpack_chunks_indices64::<32>($packed, $n, $out),
+            33 => unpack_chunks_indices64::<33>($packed, $n, $out),
+            34 => unpack_chunks_indices64::<34>($packed, $n, $out),
+            35 => unpack_chunks_indices64::<35>($packed, $n, $out),
+            36 => unpack_chunks_indices64::<36>($packed, $n, $out),
+            37 => unpack_chunks_indices64::<37>($packed, $n, $out),
+            38 => unpack_chunks_indices64::<38>($packed, $n, $out),
+            39 => unpack_chunks_indices64::<39>($packed, $n, $out),
+            40 => unpack_chunks_indices64::<40>($packed, $n, $out),
+            41 => unpack_chunks_indices64::<41>($packed, $n, $out),
+            42 => unpack_chunks_indices64::<42>($packed, $n, $out),
+            43 => unpack_chunks_indices64::<43>($packed, $n, $out),
+            44 => unpack_chunks_indices64::<44>($packed, $n, $out),
+            45 => unpack_chunks_indices64::<45>($packed, $n, $out),
+            46 => unpack_chunks_indices64::<46>($packed, $n, $out),
+            47 => unpack_chunks_indices64::<47>($packed, $n, $out),
+            48 => unpack_chunks_indices64::<48>($packed, $n, $out),
+            49 => unpack_chunks_indices64::<49>($packed, $n, $out),
+            50 => unpack_chunks_indices64::<50>($packed, $n, $out),
+            51 => unpack_chunks_indices64::<51>($packed, $n, $out),
+            52 => unpack_chunks_indices64::<52>($packed, $n, $out),
+            53 => unpack_chunks_indices64::<53>($packed, $n, $out),
+            54 => unpack_chunks_indices64::<54>($packed, $n, $out),
+            55 => unpack_chunks_indices64::<55>($packed, $n, $out),
+            56 => unpack_chunks_indices64::<56>($packed, $n, $out),
+            57 => unpack_chunks_indices64::<57>($packed, $n, $out),
+            58 => unpack_chunks_indices64::<58>($packed, $n, $out),
+            59 => unpack_chunks_indices64::<59>($packed, $n, $out),
+            60 => unpack_chunks_indices64::<60>($packed, $n, $out),
+            61 => unpack_chunks_indices64::<61>($packed, $n, $out),
+            62 => unpack_chunks_indices64::<62>($packed, $n, $out),
+            63 => unpack_chunks_indices64::<63>($packed, $n, $out),
+            64 => unpack_chunks_indices64::<64>($packed, $n, $out),
+            other => Err($crate::error::CodecError::BitWidthOutOfRange(other)),
+        }
+    };
+}
+use dispatch_unpack_indices64;

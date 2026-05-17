@@ -77,6 +77,68 @@ pub fn decode_rle_dictionary_indices(body: &[u8], num_values: usize) -> Result<V
     Ok(out)
 }
 
+/// Decode `num_values` u8 indices from a data-page body whose
+/// `bit_width` is ≤ 8 (i.e. dict has ≤ 256 entries).
+///
+/// Saves 3 bytes/row of working-set vs `decode_rle_dictionary_indices`
+/// on the caller-held `indices` buffer — directly enabling Arrow
+/// `DictionaryArray<UInt8, T>` materialisation for low-cardinality
+/// columns (`l_returnflag`, `l_linestatus`, status enums, etc.).
+///
+/// Errors with `BitWidthOutOfRange` if the page's `bit_width` is > 8.
+/// Callers that don't know the dict size up-front can probe column
+/// metadata's `dictionary_page_offset` + dict-page header to check
+/// before calling; the error is the safe default.
+///
+/// Implementation: re-uses `decode_rle_dictionary_indices`'s
+/// constant-width unpacker and narrows to u8 in one final pass.
+/// At bw ≤ 8, every value fits in u8 so the narrow is a no-op cast.
+/// A future optimisation could implement a direct u8 unpacker if
+/// the narrow pass becomes a measurable bottleneck.
+pub fn decode_rle_dictionary_indices_u8(body: &[u8], num_values: usize) -> Result<Vec<u8>> {
+    if body.is_empty() {
+        return Err(CodecError::EmptyDictPageBody);
+    }
+    let bit_width = body[0];
+    if bit_width > 8 {
+        return Err(CodecError::BitWidthOutOfRange(bit_width));
+    }
+    let wide = decode_rle_dictionary_indices(body, num_values)?;
+    // Every value in `wide` is < 256 (since bit_width ≤ 8) so the
+    // cast is exact. Debug-assert as a tripwire.
+    let mut out: Vec<u8> = Vec::with_capacity(wide.len());
+    for v in wide {
+        debug_assert!(v < 256, "u8-narrow: dict index {v} ≥ 256");
+        out.push(v as u8);
+    }
+    Ok(out)
+}
+
+/// `decode_rle_dictionary_indices_u8` writing into a caller-provided
+/// buffer (appended, not cleared). Lets the dict-preserved BYTE_ARRAY
+/// reader accumulate per-page indices across the chunk without
+/// per-page allocation.
+pub fn decode_rle_dictionary_indices_u8_into(
+    body: &[u8],
+    num_values: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if body.is_empty() {
+        return Err(CodecError::EmptyDictPageBody);
+    }
+    let bit_width = body[0];
+    if bit_width > 8 {
+        return Err(CodecError::BitWidthOutOfRange(bit_width));
+    }
+    let wide = decode_rle_dictionary_indices(body, num_values)?;
+    out.reserve(wide.len());
+    for v in wide {
+        debug_assert!(v < 256, "u8-narrow: dict index {v} ≥ 256");
+        out.push(v as u8);
+    }
+    Ok(())
+}
+
 /// Fused dict-decode: walk the RLE/bit-packed index stream and look
 /// each index up in `dict`, appending values directly to `out`.
 ///

@@ -628,6 +628,160 @@ pub fn read_column_byte_array_dict_preserved_into(
 }
 
 // ============================================================
+// Dict-preserved BYTE_ARRAY reader, u8-indices variant
+// ============================================================
+//
+// `read_column_byte_array_dict_preserved_u8` mirrors the u32 reader
+// above but emits `indices: Vec<u8>` — saving 3 bytes/row of
+// working-set on dict-encoded BYTE_ARRAY columns with ≤ 256 unique
+// values. Pairs naturally with Arrow's
+// `DictionaryArray<UInt8, Utf8|Binary>` so ematix-flow downstream
+// operators get a 4× smaller indices buffer on low-cardinality
+// columns (l_returnflag, l_linestatus, status enums, etc.).
+//
+// **Constraints.** Errors with `BitWidthOutOfRange` if any data
+// page has `bit_width > 8` — chunk can't be expressed as u8 indices.
+// Callers that don't know the dict size up-front should either:
+//   (a) read the dictionary page header first and check dict_len ≤ 256, or
+//   (b) call this and fall back to the u32 variant on error.
+
+/// Dict-preserved BYTE_ARRAY column with **u8 indices** (dict ≤ 256
+/// entries). Smaller-working-set sibling of `DictPreservedColumn`.
+#[derive(Debug, Clone, Default)]
+pub struct DictPreservedColumnU8 {
+    /// Concatenated dictionary entries, addressed by `dict_offsets`.
+    pub dict_bytes: Vec<u8>,
+    /// Offset i,i+1 delimit entry i in `dict_bytes`. Length = dict_len + 1.
+    pub dict_offsets: Vec<u32>,
+    /// One u8 per row in the chunk. `indices[row]` < dict_len ≤ 256.
+    pub indices: Vec<u8>,
+}
+
+/// See `DictPreservedColumnU8`. Allocates a fresh column; for hot
+/// paths use `read_column_byte_array_dict_preserved_u8_into` to
+/// reuse buffers.
+pub fn read_column_byte_array_dict_preserved_u8(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<DictPreservedColumnU8> {
+    let mut col = DictPreservedColumnU8::default();
+    read_column_byte_array_dict_preserved_u8_into(
+        file,
+        row_group,
+        column,
+        &mut col.dict_bytes,
+        &mut col.dict_offsets,
+        &mut col.indices,
+    )?;
+    Ok(col)
+}
+
+/// `read_column_byte_array_dict_preserved_u8` writing into caller-
+/// provided buffers (each cleared then filled). Errors if any data
+/// page's `bit_width` > 8 (dict has more than 256 entries) — caller
+/// must fall back to the u32 variant.
+pub fn read_column_byte_array_dict_preserved_u8_into(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+    dict_bytes: &mut Vec<u8>,
+    dict_offsets: &mut Vec<u32>,
+    indices: &mut Vec<u8>,
+) -> Result<()> {
+    dict_bytes.clear();
+    dict_offsets.clear();
+    indices.clear();
+
+    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let mut walker = PageWalker::new(&chunk_bytes);
+    let mut decomp: Vec<u8> = Vec::new();
+
+    let mut have_dict = false;
+    dict_offsets.push(0);
+    indices.reserve(total_values);
+
+    while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
+        match hdr.page_type {
+            PageType::DictionaryPage => {
+                decompress_into(codec, body, &mut decomp)?;
+                let slices = decode_plain_byte_array(&decomp)?;
+                if slices.len() > 256 {
+                    return Err(CodecError::InvalidInput(format!(
+                        "dict-preserved u8 read: dictionary has {} entries (> 256); use the u32 variant",
+                        slices.len()
+                    )));
+                }
+                let total_dict_bytes: usize = slices.iter().map(|s| s.len()).sum();
+                dict_bytes.reserve(total_dict_bytes);
+                dict_offsets.reserve(slices.len());
+                let mut acc: u32 = 0;
+                for s in &slices {
+                    dict_bytes.extend_from_slice(s);
+                    acc = acc.checked_add(s.len() as u32).ok_or_else(|| {
+                        CodecError::InvalidInput("dict bytes exceed u32::MAX".into())
+                    })?;
+                    dict_offsets.push(acc);
+                }
+                have_dict = true;
+            }
+            PageType::DataPage | PageType::DataPageV2 => {
+                if !have_dict {
+                    return Err(CodecError::InvalidInput(
+                        "dict-preserved u8 read: data page before dictionary (column has no DictionaryPage)".into(),
+                    ));
+                }
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                match info.encoding {
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        // `decode_rle_dictionary_indices_u8_into` enforces
+                        // bit_width ≤ 8; we just need to validate every
+                        // index is < dict_len.
+                        let before = indices.len();
+                        crate::dict::decode_rle_dictionary_indices_u8_into(
+                            info.values,
+                            info.num_values,
+                            indices,
+                        )?;
+                        let dict_len = dict_offsets.len() - 1;
+                        if let Some(bad) = indices[before..]
+                            .iter()
+                            .find(|&&i| (i as usize) >= dict_len)
+                        {
+                            return Err(CodecError::InvalidInput(format!(
+                                "dictionary index {bad} out of range (dict_len = {dict_len})"
+                            )));
+                        }
+                    }
+                    Encoding::Plain => {
+                        return Err(CodecError::InvalidInput(
+                            "dict-preserved u8 read: data page is PLAIN-encoded (writer fell back from dict — chunk cannot be expressed as one dict + indices)".into(),
+                        ));
+                    }
+                    other => {
+                        return Err(CodecError::Unsupported(format!(
+                            "dict-preserved u8 read: data page encoding not supported: {other:?}"
+                        )));
+                    }
+                }
+            }
+            PageType::IndexPage => {}
+        }
+        if indices.len() >= total_values {
+            break;
+        }
+    }
+
+    if !have_dict {
+        return Err(CodecError::InvalidInput(
+            "dict-preserved u8 read: column chunk has no DictionaryPage".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+// ============================================================
 // Π.14e — adaptive-dispatch read façade
 // ============================================================
 //

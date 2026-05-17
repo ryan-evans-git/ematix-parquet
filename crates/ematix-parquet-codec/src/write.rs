@@ -107,6 +107,34 @@ impl<'a> ColumnData<'a> {
             ColumnData::ByteArray(v) => ColumnData::ByteArray(&v[range]),
         }
     }
+
+    /// Build a per-(RG, col) dictionary: returns the PLAIN-encoded
+    /// dict body, the dict length (distinct value count), and the
+    /// per-row indices into the dict.
+    ///
+    /// `None` for types we don't dict-encode (currently Bool — there's
+    /// no win over PLAIN's 1-byte-per-value layout for 2-state data).
+    fn encode_dict(&self) -> Option<(Vec<u8>, usize, Vec<u32>)> {
+        match self {
+            ColumnData::I32(v) => {
+                let (dict, indices) = build_dict_i32(v);
+                Some((encode_plain_i32(&dict), dict.len(), indices))
+            }
+            ColumnData::I64(v) => {
+                let (dict, indices) = build_dict_i64(v);
+                Some((encode_plain_i64(&dict), dict.len(), indices))
+            }
+            ColumnData::F64(v) => {
+                let (dict, indices) = build_dict_f64(v);
+                Some((encode_plain_f64(&dict), dict.len(), indices))
+            }
+            ColumnData::ByteArray(v) => {
+                let (dict, indices) = build_dict_byte_array(v);
+                Some((encode_plain_byte_array(&dict), dict.len(), indices))
+            }
+            ColumnData::Bool(_) => None,
+        }
+    }
 }
 
 /// Write a multi-column single-row-group Parquet file.
@@ -247,6 +275,75 @@ pub fn write_table_with_row_group_size<W: Write>(
     write_table_inner(out, columns, codec, row_group_size, PageVersion::V1, None)
 }
 
+/// Multi-column / multi-row-group writer with **per-column
+/// dictionary encoding opt-in**. `dict_per_column[i] == true` writes
+/// column `i` as PLAIN_DICTIONARY (a dictionary page + an indices
+/// data page per row group); `false` keeps it as plain PLAIN.
+/// Slice length must equal `columns.len()`.
+///
+/// Each row group gets its own per-column dictionary — this is the
+/// spec shape, and what makes per-RG pushdown (and selective RG
+/// loads) effective. BOOLEAN columns can't be dict-encoded (no win
+/// over PLAIN's 1-byte layout) and will error if opted in. V2 page
+/// headers + dict encoding combined isn't yet supported.
+pub fn write_table_with_dict_to_path<P: AsRef<Path>>(
+    path: P,
+    columns: &[(&str, ColumnData<'_>)],
+    codec: CompressionCodec,
+    row_group_size: usize,
+    dict_per_column: &[bool],
+) -> Result<()> {
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_table_inner_full(
+        &mut w,
+        columns,
+        codec,
+        row_group_size,
+        PageVersion::V1,
+        None,
+        Some(dict_per_column),
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+/// Combines `write_table_with_dict_to_path` and
+/// `write_table_with_blooms_to_path`: per-column dict opt-in **and**
+/// per-column bloom-filter opt-in. Both slices must equal
+/// `columns.len()`. Bloom filters are built over every value in the
+/// RG slice regardless of dict encoding (spec-correct shape for
+/// row-group pruning).
+pub fn write_table_with_dict_and_blooms_to_path<P: AsRef<Path>>(
+    path: P,
+    columns: &[(&str, ColumnData<'_>)],
+    codec: CompressionCodec,
+    row_group_size: usize,
+    dict_per_column: &[bool],
+    bloom_fpps: &[Option<f64>],
+) -> Result<()> {
+    if bloom_fpps.len() != columns.len() {
+        return Err(CodecError::InvalidInput(format!(
+            "write_table_with_dict_and_blooms: bloom_fpps length {} != columns length {}",
+            bloom_fpps.len(),
+            columns.len()
+        )));
+    }
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_table_inner_full(
+        &mut w,
+        columns,
+        codec,
+        row_group_size,
+        PageVersion::V1,
+        Some(bloom_fpps),
+        Some(dict_per_column),
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
 fn write_table_inner<W: Write>(
     out: &mut W,
     columns: &[(&str, ColumnData<'_>)],
@@ -254,6 +351,27 @@ fn write_table_inner<W: Write>(
     row_group_size: usize,
     page_version: PageVersion,
     bloom_fpps: Option<&[Option<f64>]>,
+) -> Result<()> {
+    write_table_inner_full(
+        out,
+        columns,
+        codec,
+        row_group_size,
+        page_version,
+        bloom_fpps,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_table_inner_full<W: Write>(
+    out: &mut W,
+    columns: &[(&str, ColumnData<'_>)],
+    codec: CompressionCodec,
+    row_group_size: usize,
+    page_version: PageVersion,
+    bloom_fpps: Option<&[Option<f64>]>,
+    dict_per_column: Option<&[bool]>,
 ) -> Result<()> {
     if columns.is_empty() {
         return Err(CodecError::InvalidInput(
@@ -264,6 +382,30 @@ fn write_table_inner<W: Write>(
         return Err(CodecError::InvalidInput(
             "row_group_size must be > 0".into(),
         ));
+    }
+    if let Some(d) = dict_per_column {
+        if d.len() != columns.len() {
+            return Err(CodecError::InvalidInput(format!(
+                "dict_per_column length {} != columns length {}",
+                d.len(),
+                columns.len()
+            )));
+        }
+        // V1 only for dict pages — V2 dict has different on-disk
+        // semantics (dict isn't a page type but a column-chunk-level
+        // construct) and isn't wired here.
+        if page_version == PageVersion::V2 && d.iter().any(|&b| b) {
+            return Err(CodecError::Unsupported(
+                "dict-encoded columns + V2 pages not yet supported".into(),
+            ));
+        }
+        for (ix, (name, col)) in columns.iter().enumerate() {
+            if d[ix] && matches!(col, ColumnData::Bool(_)) {
+                return Err(CodecError::Unsupported(format!(
+                    "column {name:?}: dict encoding not supported for BOOLEAN"
+                )));
+            }
+        }
     }
     let total_rows = columns[0].1.row_count();
     for (name, c) in &columns[1..] {
@@ -279,12 +421,12 @@ fn write_table_inner<W: Write>(
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
     let mut written: u64 = 4;
 
-    /// Per-column descriptor inside one row group: where its single
-    /// data page landed and its (owned) stats bytes. Bloom offset/
-    /// length are `Some` iff this (RG, column) had a bloom filter
-    /// written immediately after its data page.
+    /// Per-column descriptor inside one row group: where its data
+    /// page landed, optional dict page offset for dict-encoded
+    /// columns, and bloom offset/length when bloom was requested.
     struct PreparedColumn {
         data_page_offset: i64,
+        dictionary_page_offset: Option<i64>,
         total_uncompressed_size: i64,
         total_compressed_size: i64,
         stats: ColumnStats,
@@ -313,27 +455,64 @@ fn write_table_inner<W: Write>(
         for (col_ix, (_name, col)) in columns.iter().enumerate() {
             let col_slice = col.slice(row_start..row_end);
             let stats = compute_stats(&col_slice);
-            let body = col_slice.encode_plain();
-            let uncompressed_size = body.len();
-            let compressed_body = compress_body(&body, codec)?;
-            let compressed_size = compressed_body.len();
 
             // Build the bloom filter (if requested for this column)
             // from the RG slice — per-(RG, column) granularity, the
-            // spec-correct shape for row-group pruning.
+            // spec-correct shape for row-group pruning. Built over
+            // every value (matches the spec; dict-encoding the on-disk
+            // representation doesn't change which values the filter
+            // must answer for).
             let bloom_bytes: Option<Vec<u8>> = bloom_fpps
                 .and_then(|fpps| fpps[col_ix])
                 .map(|fpp| build_bloom_for_column(&col_slice, fpp));
 
-            let header = match page_version {
-                PageVersion::V1 => PageHeader {
+            let is_dict = dict_per_column.map(|d| d[col_ix]).unwrap_or(false);
+
+            let (data_page_offset, dictionary_page_offset, total_uncomp, total_comp) = if is_dict {
+                // ---- DictionaryPage ----
+                let (dict_body, dict_len, indices) = col_slice
+                    .encode_dict()
+                    .expect("encode_dict None already rejected by precondition checks");
+                let dict_uncomp = dict_body.len();
+                let dict_compressed = compress_body(&dict_body, codec)?;
+                let dict_comp = dict_compressed.len();
+                let dict_header = PageHeader {
+                    page_type: PageType::DictionaryPage,
+                    uncompressed_page_size: dict_uncomp as i32,
+                    compressed_page_size: dict_comp as i32,
+                    crc: None,
+                    data_page_header: None,
+                    index_page_header: None,
+                    dictionary_page_header: Some(DictionaryPageHeader {
+                        num_values: dict_len as i32,
+                        encoding: Encoding::Plain,
+                        is_sorted: Some(false),
+                    }),
+                    data_page_header_v2: None,
+                };
+                let dict_header_bytes = write_page_header(&dict_header);
+                let dict_page_offset = written as i64;
+                out.write_all(&dict_header_bytes).map_err(io_to_codec)?;
+                written += dict_header_bytes.len() as u64;
+                out.write_all(&dict_compressed).map_err(io_to_codec)?;
+                written += dict_compressed.len() as u64;
+
+                // ---- DataPage (RLE_DICTIONARY indices) ----
+                let bit_width = min_bit_width_for_dict(dict_len);
+                let mut data_body = Vec::with_capacity(1 + indices.len());
+                data_body.push(bit_width);
+                data_body.extend_from_slice(&encode_rle_bit_packed(&indices, bit_width));
+                let data_uncomp = data_body.len();
+                let data_compressed = compress_body(&data_body, codec)?;
+                let data_comp = data_compressed.len();
+                let data_header = PageHeader {
                     page_type: PageType::DataPage,
-                    uncompressed_page_size: uncompressed_size as i32,
-                    compressed_page_size: compressed_size as i32,
+                    uncompressed_page_size: data_uncomp as i32,
+                    compressed_page_size: data_comp as i32,
                     crc: None,
                     data_page_header: Some(DataPageHeader {
                         num_values: chunk_rows as i32,
-                        encoding: Encoding::Plain,
+                        encoding: Encoding::PlainDictionary,
                         definition_level_encoding: Encoding::Rle,
                         repetition_level_encoding: Encoding::Rle,
                         statistics: Some(stats.as_statistics()),
@@ -341,37 +520,85 @@ fn write_table_inner<W: Write>(
                     index_page_header: None,
                     dictionary_page_header: None,
                     data_page_header_v2: None,
-                },
-                PageVersion::V2 => PageHeader {
-                    page_type: PageType::DataPageV2,
-                    uncompressed_page_size: uncompressed_size as i32,
-                    compressed_page_size: compressed_size as i32,
-                    crc: None,
-                    data_page_header: None,
-                    index_page_header: None,
-                    dictionary_page_header: None,
-                    // REQUIRED columns: no rep/def levels, no nulls.
-                    // The V2 body is therefore just the (compressed)
-                    // value bytes — identical layout to V1.
-                    data_page_header_v2: Some(DataPageHeaderV2 {
-                        num_values: chunk_rows as i32,
-                        num_nulls: 0,
-                        num_rows: chunk_rows as i32,
-                        encoding: Encoding::Plain,
-                        definition_levels_byte_length: 0,
-                        repetition_levels_byte_length: 0,
-                        is_compressed: codec != CompressionCodec::Uncompressed,
-                        statistics: Some(stats.as_statistics()),
-                    }),
-                },
-            };
-            let header_bytes = write_page_header(&header);
+                };
+                let data_header_bytes = write_page_header(&data_header);
+                let data_page_off = written as i64;
+                out.write_all(&data_header_bytes).map_err(io_to_codec)?;
+                written += data_header_bytes.len() as u64;
+                out.write_all(&data_compressed).map_err(io_to_codec)?;
+                written += data_compressed.len() as u64;
 
-            let data_page_offset = written as i64;
-            out.write_all(&header_bytes).map_err(io_to_codec)?;
-            written += header_bytes.len() as u64;
-            out.write_all(&compressed_body).map_err(io_to_codec)?;
-            written += compressed_body.len() as u64;
+                let total_uncomp =
+                    (dict_header_bytes.len() + dict_uncomp + data_header_bytes.len() + data_uncomp)
+                        as i64;
+                let total_comp =
+                    (dict_header_bytes.len() + dict_comp + data_header_bytes.len() + data_comp)
+                        as i64;
+                (
+                    data_page_off,
+                    Some(dict_page_offset),
+                    total_uncomp,
+                    total_comp,
+                )
+            } else {
+                // ---- PLAIN data page (V1 or V2) ----
+                let body = col_slice.encode_plain();
+                let uncompressed_size = body.len();
+                let compressed_body = compress_body(&body, codec)?;
+                let compressed_size = compressed_body.len();
+                let header = match page_version {
+                    PageVersion::V1 => PageHeader {
+                        page_type: PageType::DataPage,
+                        uncompressed_page_size: uncompressed_size as i32,
+                        compressed_page_size: compressed_size as i32,
+                        crc: None,
+                        data_page_header: Some(DataPageHeader {
+                            num_values: chunk_rows as i32,
+                            encoding: Encoding::Plain,
+                            definition_level_encoding: Encoding::Rle,
+                            repetition_level_encoding: Encoding::Rle,
+                            statistics: Some(stats.as_statistics()),
+                        }),
+                        index_page_header: None,
+                        dictionary_page_header: None,
+                        data_page_header_v2: None,
+                    },
+                    PageVersion::V2 => PageHeader {
+                        page_type: PageType::DataPageV2,
+                        uncompressed_page_size: uncompressed_size as i32,
+                        compressed_page_size: compressed_size as i32,
+                        crc: None,
+                        data_page_header: None,
+                        index_page_header: None,
+                        dictionary_page_header: None,
+                        // REQUIRED columns: no rep/def levels, no nulls.
+                        // The V2 body is therefore just the (compressed)
+                        // value bytes — identical layout to V1.
+                        data_page_header_v2: Some(DataPageHeaderV2 {
+                            num_values: chunk_rows as i32,
+                            num_nulls: 0,
+                            num_rows: chunk_rows as i32,
+                            encoding: Encoding::Plain,
+                            definition_levels_byte_length: 0,
+                            repetition_levels_byte_length: 0,
+                            is_compressed: codec != CompressionCodec::Uncompressed,
+                            statistics: Some(stats.as_statistics()),
+                        }),
+                    },
+                };
+                let header_bytes = write_page_header(&header);
+                let data_page_off = written as i64;
+                out.write_all(&header_bytes).map_err(io_to_codec)?;
+                written += header_bytes.len() as u64;
+                out.write_all(&compressed_body).map_err(io_to_codec)?;
+                written += compressed_body.len() as u64;
+                (
+                    data_page_off,
+                    None,
+                    (header_bytes.len() + uncompressed_size) as i64,
+                    (header_bytes.len() + compressed_size) as i64,
+                )
+            };
 
             // Write the bloom filter (if any) immediately after the
             // data page; record the offset/length for ColumnMetaData.
@@ -388,8 +615,9 @@ fn write_table_inner<W: Write>(
 
             prepared.push(PreparedColumn {
                 data_page_offset,
-                total_uncompressed_size: (header_bytes.len() + uncompressed_size) as i64,
-                total_compressed_size: (header_bytes.len() + compressed_size) as i64,
+                dictionary_page_offset,
+                total_uncompressed_size: total_uncomp,
+                total_compressed_size: total_comp,
                 stats,
                 bloom_filter_offset,
                 bloom_filter_length,
@@ -435,9 +663,22 @@ fn write_table_inner<W: Write>(
         let mut row_group_columns: Vec<ColumnChunk<'_>> = Vec::with_capacity(columns.len());
         let mut total_byte_size: i64 = 0;
         for ((name, col), prep) in columns.iter().zip(prepared.iter()) {
+            // Encodings list shape mirrors what parquet-rs writes: a
+            // dict-encoded column advertises PLAIN (for the dict page),
+            // RLE (for the level/index streams), and PLAIN_DICTIONARY
+            // (the data-page encoding id).
+            let encodings = if prep.dictionary_page_offset.is_some() {
+                vec![Encoding::Plain, Encoding::Rle, Encoding::PlainDictionary]
+            } else {
+                vec![Encoding::Plain, Encoding::Rle]
+            };
+            // file_offset points at the column chunk's first on-disk
+            // byte. For dict columns that's the dict page; otherwise
+            // the data page.
+            let chunk_file_offset = prep.dictionary_page_offset.unwrap_or(prep.data_page_offset);
             let cm = ColumnMetaData {
                 column_type: col.parquet_type(),
-                encodings: vec![Encoding::Plain, Encoding::Rle],
+                encodings,
                 path_in_schema: vec![name.as_bytes()],
                 codec,
                 num_values: *chunk_rows as i64,
@@ -446,7 +687,7 @@ fn write_table_inner<W: Write>(
                 key_value_metadata: None,
                 data_page_offset: prep.data_page_offset,
                 index_page_offset: None,
-                dictionary_page_offset: None,
+                dictionary_page_offset: prep.dictionary_page_offset,
                 statistics: Some(prep.stats.as_statistics()),
                 encoding_stats: None,
                 bloom_filter_offset: prep.bloom_filter_offset,
@@ -455,7 +696,7 @@ fn write_table_inner<W: Write>(
             };
             row_group_columns.push(ColumnChunk {
                 file_path: None,
-                file_offset: prep.data_page_offset,
+                file_offset: chunk_file_offset,
                 meta_data: Some(cm),
                 offset_index_offset: None,
                 offset_index_length: None,

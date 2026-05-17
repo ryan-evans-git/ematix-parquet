@@ -1438,6 +1438,38 @@ fn write_single_column_dict<W: Write>(
     codec: CompressionCodec,
     stats: ColumnStats,
 ) -> Result<()> {
+    write_single_column_dict_inner(
+        out,
+        column_name,
+        parquet_type,
+        num_values,
+        dict_body,
+        dict_len,
+        indices,
+        codec,
+        stats,
+        None,
+    )
+}
+
+/// Same as `write_single_column_dict` but allows attaching a
+/// pre-serialised Split-Block Bloom Filter blob (header + bitset)
+/// to the column chunk. Written immediately after the data page;
+/// records `bloom_filter_offset` + `bloom_filter_length` on the
+/// ColumnMetaData so downstream readers can find it via the spec.
+#[allow(clippy::too_many_arguments)]
+fn write_single_column_dict_inner<W: Write>(
+    out: &mut W,
+    column_name: &str,
+    parquet_type: ParquetType,
+    num_values: usize,
+    dict_body: Vec<u8>,
+    dict_len: usize,
+    indices: &[u32],
+    codec: CompressionCodec,
+    stats: ColumnStats,
+    bloom_bytes: Option<&[u8]>,
+) -> Result<()> {
     out.write_all(PARQUET_MAGIC).map_err(io_to_codec)?;
     let mut written: u64 = 4;
 
@@ -1500,6 +1532,20 @@ fn write_single_column_dict<W: Write>(
     out.write_all(&data_compressed).map_err(io_to_codec)?;
     written += data_compressed.len() as u64;
 
+    // ---- Optional Split-Block Bloom Filter ----
+    // Per spec, the bloom filter for a column chunk lives
+    // immediately after that chunk's data; the absolute byte
+    // offset goes into ColumnMetaData.bloom_filter_offset.
+    let (bloom_filter_offset, bloom_filter_length) = if let Some(blob) = bloom_bytes {
+        let offset = written as i64;
+        out.write_all(blob).map_err(io_to_codec)?;
+        let length = blob.len() as i32;
+        written += blob.len() as u64;
+        (Some(offset), Some(length))
+    } else {
+        (None, None)
+    };
+
     let total_uncompressed_size =
         (dict_header_bytes.len() + dict_uncomp_size + data_header_bytes.len() + data_uncomp_size)
             as i64;
@@ -1547,8 +1593,8 @@ fn write_single_column_dict<W: Write>(
         dictionary_page_offset: Some(dict_page_offset),
         statistics: Some(stats.as_statistics()),
         encoding_stats: None,
-        bloom_filter_offset: None,
-        bloom_filter_length: None,
+        bloom_filter_offset,
+        bloom_filter_length,
         size_statistics: None,
     };
     let cc = ColumnChunk {
@@ -1649,6 +1695,58 @@ pub fn write_i32_column_dict_to_path(
         &indices,
         codec,
         stats,
+    )?;
+    w.flush().map_err(io_to_codec)?;
+    Ok(())
+}
+
+/// Same as `write_i32_column_dict_to_path` but also emits a
+/// Split-Block Bloom Filter built from the column's distinct
+/// values, and records its offset/length in the ColumnMetaData
+/// so downstream readers can consult it via the spec.
+///
+/// `target_fpp` sizes the filter via `bloom::optimal_num_blocks`.
+/// 0.01 is a reasonable default; smaller is more selective but
+/// uses more bytes (filter size scales linearly with -log fpp).
+pub fn write_i32_column_dict_with_bloom_to_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    values: &[i32],
+    codec: CompressionCodec,
+    target_fpp: f64,
+) -> Result<()> {
+    use crate::bloom::{optimal_num_blocks, SplitBlockBloomFilterBuilder};
+
+    let stats = stats_i32(values);
+    let (dict, indices) = build_dict_i32(values);
+    let dict_body = encode_plain_i32(&dict);
+
+    // Bloom filter is built over the *distinct* values (the dict).
+    // Each i32 is hashed as its 4-byte LE encoding — the same shape
+    // every other Parquet writer uses for the spec's "PLAIN-encoded
+    // bytes" hash input.
+    let num_blocks = optimal_num_blocks(dict.len(), target_fpp);
+    let mut builder = SplitBlockBloomFilterBuilder::new(num_blocks);
+    let mut le_buf = [0u8; 4];
+    for &v in &dict {
+        le_buf.copy_from_slice(&v.to_le_bytes());
+        builder.insert_bytes(&le_buf);
+    }
+    let bloom_bytes = builder.into_bytes();
+
+    let f = File::create(path.as_ref()).map_err(io_to_codec)?;
+    let mut w = BufWriter::new(f);
+    write_single_column_dict_inner(
+        &mut w,
+        name,
+        ParquetType::Int32,
+        values.len(),
+        dict_body,
+        dict.len(),
+        &indices,
+        codec,
+        stats,
+        Some(&bloom_bytes),
     )?;
     w.flush().map_err(io_to_codec)?;
     Ok(())

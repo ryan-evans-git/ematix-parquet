@@ -544,14 +544,26 @@ fn encode_column_metadata(w: &mut Writer, cm: &ColumnMetaData<'_>) {
         prev = 12;
     }
 
-    // 13: encoding_stats, 14/15: bloom filter,
-    // 16: size_statistics — all panic; not yet on the write path.
+    // 13: encoding_stats — not yet wired.
     if cm.encoding_stats.is_some() {
         panic!("ColumnMetaData.encoding_stats write not yet implemented");
     }
-    if cm.bloom_filter_offset.is_some() || cm.bloom_filter_length.is_some() {
-        panic!("ColumnMetaData.bloom_filter_* write not yet implemented");
+
+    // 14: bloom_filter_offset (i64, optional)
+    if let Some(offset) = cm.bloom_filter_offset {
+        w.write_field_header(14, FieldType::I64, prev);
+        w.write_zigzag_i64(offset);
+        prev = 14;
     }
+
+    // 15: bloom_filter_length (i32, optional)
+    if let Some(length) = cm.bloom_filter_length {
+        w.write_field_header(15, FieldType::I32, prev);
+        w.write_zigzag_i32(length);
+        prev = 15;
+    }
+
+    // 16: size_statistics — not yet wired.
     if cm.size_statistics.is_some() {
         panic!("ColumnMetaData.size_statistics write not yet implemented");
     }

@@ -1406,3 +1406,446 @@ fn scalar_bw_n(packed: &[u8], n: usize, bit_width: u8, out: &mut Vec<u32>) {
         bits -= bit_width as u32;
     }
 }
+
+// ---- bw=8: byte-aligned trivial AVX2 expansion ---------------------
+//
+// AVX2 mirror of `bitpack_neon::unpack_indices_into_neon_bw8`. One
+// 32-value block = 32 source bytes = 4 × 8-u32 SIMD stores via two
+// `_mm256_cvtepu8_epi32` widens.
+
+pub fn unpack_indices_into_avx2_bw8(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = num_values;
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw8: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 32;
+
+    unsafe {
+        unpack_avx2_bw8_unchecked(packed, full_blocks, out);
+    }
+
+    let processed = full_blocks * 32;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed..], remaining, 8, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw8_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    for blk in 0..full_blocks {
+        // 32 source bytes per block. Each 8-byte chunk widens into
+        // a 256-bit register of 8 u32 via _mm256_cvtepu8_epi32 (reads
+        // the low 64 bits of a __m128i).
+        for chunk in 0..4 {
+            let v64: __m128i = _mm_loadl_epi64(src_ptr.add(chunk * 8) as *const __m128i);
+            let widened: __m256i = _mm256_cvtepu8_epi32(v64);
+            _mm256_storeu_si256(out_ptr.add(blk * 32 + chunk * 8) as *mut __m256i, widened);
+        }
+        src_ptr = src_ptr.add(32);
+    }
+    out.set_len(out_start_len + full_blocks * 32);
+}
+
+// ---- bw=4: nibble-aligned AVX2 expansion ---------------------------
+//
+// AVX2 mirror of `bitpack_neon::unpack_indices_into_neon_bw4`. 32
+// values = 16 source bytes. Two values per byte (lo nibble first per
+// parquet LSB-first packing). Strategy: load 16 bytes, mask the low
+// nibble in one register and shift-right-4 in another, then interleave
+// them per byte position before widening to u32.
+
+pub fn unpack_indices_into_avx2_bw4(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = num_values.div_ceil(2);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw4: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 32;
+
+    unsafe {
+        unpack_avx2_bw4_unchecked(packed, full_blocks, out);
+    }
+
+    let processed = full_blocks * 32;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed / 2..], remaining, 4, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw4_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+    let mask_nibble: __m128i = _mm_set1_epi8(0x0F);
+
+    for blk in 0..full_blocks {
+        // 16 source bytes → 32 nibbles → 32 u32 values.
+        let bytes: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        // Low nibbles = byte & 0x0F.
+        let lo_nibbles: __m128i = _mm_and_si128(bytes, mask_nibble);
+        // High nibbles = (byte >> 4) & 0x0F. AVX2 has no per-byte shift,
+        // so do a 16-bit srli then re-mask.
+        let hi_nibbles: __m128i = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask_nibble);
+        // Interleave: value[2i] from lo_nibbles[i], value[2i+1] from
+        // hi_nibbles[i]. `_mm_unpacklo_epi8 / _mm_unpackhi_epi8`
+        // produce exactly that pattern.
+        let interleaved_lo: __m128i = _mm_unpacklo_epi8(lo_nibbles, hi_nibbles);
+        let interleaved_hi: __m128i = _mm_unpackhi_epi8(lo_nibbles, hi_nibbles);
+
+        // Each 16-byte interleaved register widens via two
+        // _mm256_cvtepu8_epi32 calls (low 64 bits at a time).
+        let il_lo: __m256i = _mm256_cvtepu8_epi32(interleaved_lo);
+        let il_hi: __m256i = _mm256_cvtepu8_epi32(_mm_srli_si128(interleaved_lo, 8));
+        let ih_lo: __m256i = _mm256_cvtepu8_epi32(interleaved_hi);
+        let ih_hi: __m256i = _mm256_cvtepu8_epi32(_mm_srli_si128(interleaved_hi, 8));
+
+        let dst = out_ptr.add(blk * 32);
+        _mm256_storeu_si256(dst as *mut __m256i, il_lo);
+        _mm256_storeu_si256(dst.add(8) as *mut __m256i, il_hi);
+        _mm256_storeu_si256(dst.add(16) as *mut __m256i, ih_lo);
+        _mm256_storeu_si256(dst.add(24) as *mut __m256i, ih_hi);
+        src_ptr = src_ptr.add(16);
+    }
+    out.set_len(out_start_len + full_blocks * 32);
+}
+
+// ---- bw=1: bit-test AVX2 unpack ------------------------------------
+//
+// 8 values per byte. 32 values = 4 source bytes. Strategy: broadcast
+// the 4 input bytes to 32 lanes, AND with a per-lane bit-mask, and
+// compare-not-equal-zero to produce 0/1. The bit-mask layout per byte
+// is [1, 2, 4, 8, 16, 32, 64, 128] for value indices [0..8].
+
+pub fn unpack_indices_into_avx2_bw1(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = num_values.div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw1: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 32;
+
+    unsafe {
+        unpack_avx2_bw1_unchecked(packed, full_blocks, out);
+    }
+
+    let processed = full_blocks * 32;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed / 8..], remaining, 1, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw1_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    // Per-byte bit-mask for the 8 values packed into one source byte.
+    // Parquet LSB-first: value[0] is bit 0 = mask 1.
+    let bit_masks: __m256i = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+    let ones: __m256i = _mm256_set1_epi32(1);
+
+    for blk in 0..full_blocks {
+        // Each block = 4 source bytes (32 values). Handle one byte at
+        // a time → 8 u32 outputs each.
+        for b in 0..4 {
+            let byte_val = *src_ptr.add(b) as i32;
+            // Broadcast the byte into all 8 lanes, then AND with the
+            // per-lane bit-mask and compare to bit_masks (== nonzero).
+            let v: __m256i = _mm256_set1_epi32(byte_val);
+            let masked: __m256i = _mm256_and_si256(v, bit_masks);
+            // masked == bit_masks iff the bit is set. Compare-eq
+            // produces -1 / 0; AND with 1 to land 1 / 0.
+            let cmp: __m256i = _mm256_cmpeq_epi32(masked, bit_masks);
+            let result: __m256i = _mm256_and_si256(cmp, ones);
+            _mm256_storeu_si256(out_ptr.add(blk * 32 + b * 8) as *mut __m256i, result);
+        }
+        src_ptr = src_ptr.add(4);
+    }
+    out.set_len(out_start_len + full_blocks * 32);
+}
+
+// ---- bw=20: AVX2, mirrors bw=17/18 shape ---------------------------
+//
+// 8 values per block = 20 source bytes. Each value lives in 20 bits;
+// per-lane start bytes are [0, 2, 5, 7, 10, 12, 15, 17] with bit
+// offsets [0, 4, 0, 4, 0, 4, 0, 4]. The block reads 26 bytes total
+// (two 16-byte windows with the second offset by 10).
+
+pub fn unpack_indices_into_avx2_bw20(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 20).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw20: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+
+    let full_blocks = num_values / 8;
+    // Each block reads up to byte 26; safety check for the final iter.
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 20 * (full_blocks - 1) + 26 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    unsafe {
+        unpack_avx2_bw20_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 20 / 8..], remaining, 20, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw20_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    // Per-lane right-shift amounts (bit_offset within source byte).
+    let shifts: __m256i = _mm256_setr_epi32(0, 4, 0, 4, 0, 4, 0, 4);
+    let mask: __m256i = _mm256_set1_epi32(0x0F_FFFF);
+
+    for blk in 0..full_blocks {
+        // For each of the 8 lanes, gather 4 source bytes starting at
+        // [0, 2, 5, 7, 10, 12, 15, 17] in the block. Build the 8 u32
+        // values by gathering via aligned offsets.
+        //
+        // No AVX2 byte-level gather, so we do this scalar in a small
+        // stack buffer and then AVX2-load it for the shift+mask.
+        let mut staging = [0u32; 8];
+        let offsets = [0usize, 2, 5, 7, 10, 12, 15, 17];
+        for (lane, &off) in offsets.iter().enumerate() {
+            // Read 4 bytes little-endian into a u32.
+            let b0 = *src_ptr.add(off) as u32;
+            let b1 = *src_ptr.add(off + 1) as u32;
+            let b2 = *src_ptr.add(off + 2) as u32;
+            let b3 = *src_ptr.add(off + 3) as u32;
+            staging[lane] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+        let v: __m256i = _mm256_loadu_si256(staging.as_ptr() as *const __m256i);
+        let shifted: __m256i = _mm256_srlv_epi32(v, shifts);
+        let masked: __m256i = _mm256_and_si256(shifted, mask);
+        _mm256_storeu_si256(out_ptr.add(blk * 8) as *mut __m256i, masked);
+        src_ptr = src_ptr.add(20);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}
+
+// ---- bw=21: AVX2, lane-specific shifts ----------------------------
+//
+// 8 values per block = 21 source bytes. Per-lane start bytes [0, 2,
+// 5, 7, 10, 13, 15, 18] with bit offsets [0, 5, 2, 7, 4, 1, 6, 3] —
+// every lane has a different shift.
+
+pub fn unpack_indices_into_avx2_bw21(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 21).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw21: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+
+    let full_blocks = num_values / 8;
+    // Reads up to byte 22; safety check for the last block.
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 21 * (full_blocks - 1) + 22 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    unsafe {
+        unpack_avx2_bw21_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 21 / 8..], remaining, 21, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw21_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    let shifts: __m256i = _mm256_setr_epi32(0, 5, 2, 7, 4, 1, 6, 3);
+    let mask: __m256i = _mm256_set1_epi32(0x1F_FFFF);
+
+    for blk in 0..full_blocks {
+        let mut staging = [0u32; 8];
+        // Per-lane start bytes for bw=21.
+        let offsets = [0usize, 2, 5, 7, 10, 13, 15, 18];
+        for (lane, &off) in offsets.iter().enumerate() {
+            let b0 = *src_ptr.add(off) as u32;
+            let b1 = *src_ptr.add(off + 1) as u32;
+            let b2 = *src_ptr.add(off + 2) as u32;
+            let b3 = *src_ptr.add(off + 3) as u32;
+            staging[lane] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+        let v: __m256i = _mm256_loadu_si256(staging.as_ptr() as *const __m256i);
+        let shifted: __m256i = _mm256_srlv_epi32(v, shifts);
+        let masked: __m256i = _mm256_and_si256(shifted, mask);
+        _mm256_storeu_si256(out_ptr.add(blk * 8) as *mut __m256i, masked);
+        src_ptr = src_ptr.add(21);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}
+
+// ---- bw=5: AVX2, lane-specific shifts ------------------------------
+//
+// 8 values per block = 5 source bytes. Per-lane start bytes
+// [0, 0, 1, 1, 2, 3, 3, 4] with bit offsets [0, 5, 2, 7, 4, 1, 6, 3].
+// Each lane reads a 4-byte little-endian window (always fits within
+// 8 bytes, so we read the block + safety guard at the tail).
+
+pub fn unpack_indices_into_avx2_bw5(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 5).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw5: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+
+    let full_blocks = num_values / 8;
+    // Each block reads bytes 0..=7 (lane 7 + 4 bytes = byte 8).
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 5 * (full_blocks - 1) + 8 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    unsafe {
+        unpack_avx2_bw5_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 5 / 8..], remaining, 5, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw5_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+
+    let shifts: __m256i = _mm256_setr_epi32(0, 5, 2, 7, 4, 1, 6, 3);
+    let mask: __m256i = _mm256_set1_epi32(0x1F);
+    let offsets = [0usize, 0, 1, 1, 2, 3, 3, 4];
+
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    for blk in 0..full_blocks {
+        let mut staging = [0u32; 8];
+        for (lane, &off) in offsets.iter().enumerate() {
+            let b0 = *src_ptr.add(off) as u32;
+            let b1 = *src_ptr.add(off + 1) as u32;
+            let b2 = *src_ptr.add(off + 2) as u32;
+            let b3 = *src_ptr.add(off + 3) as u32;
+            staging[lane] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+        let v: __m256i = _mm256_loadu_si256(staging.as_ptr() as *const __m256i);
+        let shifted: __m256i = _mm256_srlv_epi32(v, shifts);
+        let masked: __m256i = _mm256_and_si256(shifted, mask);
+        _mm256_storeu_si256(out_ptr.add(blk * 8) as *mut __m256i, masked);
+        src_ptr = src_ptr.add(5);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}

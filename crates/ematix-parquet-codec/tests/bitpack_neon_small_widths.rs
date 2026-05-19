@@ -10,7 +10,8 @@
 #![cfg(target_arch = "aarch64")]
 
 use ematix_parquet_codec::bitpack_neon::{
-    unpack_indices_into_neon_bw4, unpack_indices_into_neon_bw8,
+    unpack_indices_into_neon_bw1, unpack_indices_into_neon_bw20, unpack_indices_into_neon_bw21,
+    unpack_indices_into_neon_bw4, unpack_indices_into_neon_bw5, unpack_indices_into_neon_bw8,
 };
 
 /// Pack `values` LSB-first at `bit_width`. Bit-exact mirror of the
@@ -173,4 +174,187 @@ fn dispatch_routes_bw4_through_neon_matching_results() {
     let mut got = Vec::new();
     unpack_indices_into(&packed, v.len(), 4, &mut got).unwrap();
     assert_eq!(got, v);
+}
+
+// ---- bw=1 -----------------------------------------------------------
+
+fn check_neon_bw1(values: &[u32]) {
+    let packed = pack(values, 1);
+    let mut got = Vec::new();
+    unpack_indices_into_neon_bw1(&packed, values.len(), &mut got).unwrap();
+    assert_eq!(got, values, "bw1: NEON output mismatch");
+}
+
+#[test]
+fn bw1_alternating_pattern() {
+    let v: Vec<u32> = (0..32u32).map(|i| i & 1).collect();
+    check_neon_bw1(&v);
+}
+
+#[test]
+fn bw1_all_zeros_and_all_ones() {
+    check_neon_bw1(&vec![0u32; 256]);
+    check_neon_bw1(&vec![1u32; 256]);
+}
+
+#[test]
+fn bw1_partial_tail() {
+    for n in [33usize, 65, 100, 1023] {
+        let v: Vec<u32> = (0..n as u32).map(|i| (i * 7) & 1).collect();
+        check_neon_bw1(&v);
+    }
+}
+
+#[test]
+fn bw1_random() {
+    let mut seed: u32 = 0xC0FFEE;
+    let v: Vec<u32> = (0..2048)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & 1
+        })
+        .collect();
+    check_neon_bw1(&v);
+}
+
+// ---- bw=5 -----------------------------------------------------------
+
+fn check_neon_bw5(values: &[u32]) {
+    let packed = pack(values, 5);
+    let mut got = Vec::new();
+    unpack_indices_into_neon_bw5(&packed, values.len(), &mut got).unwrap();
+    assert_eq!(got, values, "bw5: NEON output mismatch");
+}
+
+#[test]
+fn bw5_one_block_known_pattern() {
+    let v: Vec<u32> = (0..8u32).collect();
+    check_neon_bw5(&v);
+}
+
+#[test]
+fn bw5_full_range() {
+    // Every distinct 5-bit value across a 32-value chunk.
+    let v: Vec<u32> = (0..32u32).map(|i| i & 0x1F).collect();
+    check_neon_bw5(&v);
+}
+
+#[test]
+fn bw5_partial_tail() {
+    for n in [9usize, 17, 65, 100, 1023] {
+        let v: Vec<u32> = (0..n as u32).map(|i| (i * 13) & 0x1F).collect();
+        check_neon_bw5(&v);
+    }
+}
+
+#[test]
+fn bw5_random() {
+    let mut seed: u32 = 0xFADEBABE;
+    let v: Vec<u32> = (0..2048)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & 0x1F
+        })
+        .collect();
+    check_neon_bw5(&v);
+}
+
+// ---- bw=20 ----------------------------------------------------------
+
+fn check_neon_bw20(values: &[u32]) {
+    let packed = pack(values, 20);
+    let mut got = Vec::new();
+    unpack_indices_into_neon_bw20(&packed, values.len(), &mut got).unwrap();
+    assert_eq!(got, values, "bw20: NEON output mismatch");
+}
+
+#[test]
+fn bw20_one_block_known_pattern() {
+    let v: Vec<u32> = (0..8u32).map(|i| i.wrapping_mul(0xA5A5)).collect();
+    check_neon_bw20(&v);
+}
+
+#[test]
+fn bw20_full_range() {
+    // Exercise values near the 20-bit boundary.
+    let v: Vec<u32> = (0..32u32).map(|i| (i * 31_337) & 0x0F_FFFF).collect();
+    check_neon_bw20(&v);
+}
+
+#[test]
+fn bw20_partial_tail() {
+    for n in [9usize, 17, 100, 1023] {
+        let v: Vec<u32> = (0..n as u32).map(|i| (i * 17) & 0x0F_FFFF).collect();
+        check_neon_bw20(&v);
+    }
+}
+
+#[test]
+fn bw20_random() {
+    let mut seed: u32 = 0xBADC0FFE;
+    let v: Vec<u32> = (0..2048)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & 0x0F_FFFF
+        })
+        .collect();
+    check_neon_bw20(&v);
+}
+
+// ---- bw=21 ----------------------------------------------------------
+
+fn check_neon_bw21(values: &[u32]) {
+    let packed = pack(values, 21);
+    let mut got = Vec::new();
+    unpack_indices_into_neon_bw21(&packed, values.len(), &mut got).unwrap();
+    assert_eq!(got, values, "bw21: NEON output mismatch");
+}
+
+#[test]
+fn bw21_one_block_known_pattern() {
+    let v: Vec<u32> = (0..8u32).map(|i| i.wrapping_mul(0x12345)).collect();
+    check_neon_bw21(&v);
+}
+
+#[test]
+fn bw21_full_range() {
+    let v: Vec<u32> = (0..32u32).map(|i| (i * 31_337) & 0x1F_FFFF).collect();
+    check_neon_bw21(&v);
+}
+
+#[test]
+fn bw21_partial_tail() {
+    for n in [9usize, 17, 100, 1023] {
+        let v: Vec<u32> = (0..n as u32).map(|i| (i * 17) & 0x1F_FFFF).collect();
+        check_neon_bw21(&v);
+    }
+}
+
+#[test]
+fn bw21_random() {
+    let mut seed: u32 = 0xFEEDC0DE;
+    let v: Vec<u32> = (0..2048)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & 0x1F_FFFF
+        })
+        .collect();
+    check_neon_bw21(&v);
+}
+
+// ---- dispatch routing -----------------------------------------------
+
+#[test]
+fn dispatch_routes_bw1_5_20_21_through_neon() {
+    use ematix_parquet_codec::bitpack::unpack_indices_into;
+    for &bw in &[1u8, 5, 20, 21] {
+        let mask: u32 = if bw == 32 { u32::MAX } else { (1u32 << bw) - 1 };
+        let v: Vec<u32> = (0..256u32)
+            .map(|i| (i.wrapping_mul(1_597_463)) & mask)
+            .collect();
+        let packed = pack(&v, bw);
+        let mut got = Vec::new();
+        unpack_indices_into(&packed, v.len(), bw, &mut got).unwrap();
+        assert_eq!(got, v, "bw{bw} dispatch mismatch");
+    }
 }

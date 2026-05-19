@@ -134,6 +134,26 @@ impl ParquetFile {
     /// `ReadFile` with explicit offset on Windows). Concurrent calls
     /// from multiple threads do not interfere.
     pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.read_range_into(&mut buf, offset, length)?;
+        Ok(buf)
+    }
+
+    /// Like `read_range`, but writes into a caller-provided buffer
+    /// (resized + filled). Lets hot paths reuse one allocation across
+    /// many reads — eliminates the per-call Vec alloc + zero-fill +
+    /// drop-time `madvise(MADV_DONTNEED)` that dominates profiles of
+    /// scan-heavy workloads (10-15% of CPU on a 22-query TPC-H bench).
+    ///
+    /// `buf.len()` is set to exactly `length` on success; any prior
+    /// contents are overwritten. Buffer capacity is retained for the
+    /// next call.
+    pub fn read_range_into(
+        &self,
+        buf: &mut Vec<u8>,
+        offset: u64,
+        length: u64,
+    ) -> Result<()> {
         if offset.saturating_add(length) > self.file_size {
             return Err(IoError::OutOfRangeRead {
                 offset,
@@ -141,9 +161,20 @@ impl ParquetFile {
                 file_size: self.file_size,
             });
         }
-        let mut buf = vec![0u8; length as usize];
-        read_exact_at(&self.file, &mut buf, offset)?;
-        Ok(buf)
+        let n = length as usize;
+        // `resize` grows or shrinks `buf` to exactly `n` bytes. When
+        // capacity is already ≥ n, this is a no-op alloc-wise — only
+        // a length-field update + zero-fill of newly-exposed cells
+        // (which we'll overwrite with the pread anyway, but the
+        // stdlib API guarantees zero-fill).
+        //
+        // For the steady-state hot path where every column chunk is
+        // close to the same size, capacity reaches the max chunk
+        // size after the first call and stays there — zero further
+        // allocs.
+        buf.resize(n, 0);
+        read_exact_at(&self.file, &mut buf[..n], offset)?;
+        Ok(())
     }
 }
 

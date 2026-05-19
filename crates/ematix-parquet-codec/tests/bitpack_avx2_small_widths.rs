@@ -346,11 +346,7 @@ fn dispatch_routes_new_widths_through_avx2() {
 
 // ---- lookup variants (bw=4 / 6 / 8) ---------------------------------
 
-fn check_lookup_avx2<T: Copy + std::fmt::Debug + PartialEq>(
-    bw: u8,
-    indices: &[u32],
-    dict: &[T],
-) {
+fn check_lookup_avx2<T: Copy + std::fmt::Debug + PartialEq>(bw: u8, indices: &[u32], dict: &[T]) {
     if !have_avx2() {
         return;
     }
@@ -402,7 +398,9 @@ fn avx2_lookup_bw4_out_of_range_errors() {
     }
     use ematix_parquet_codec::bitpack_avx2::unpack_lookup_into_avx2_bw4;
     let dict: Vec<u8> = (0..8).collect();
-    let indices: Vec<u32> = (0..32u32).map(|i| if i == 17 { 12 } else { i & 7 }).collect();
+    let indices: Vec<u32> = (0..32u32)
+        .map(|i| if i == 17 { 12 } else { i & 7 })
+        .collect();
     let packed = pack(&indices, 4);
     let mut got: Vec<u8> = Vec::new();
     let r = unpack_lookup_into_avx2_bw4(&packed, indices.len(), &dict, &mut got);

@@ -148,12 +148,7 @@ impl ParquetFile {
     /// `buf.len()` is set to exactly `length` on success; any prior
     /// contents are overwritten. Buffer capacity is retained for the
     /// next call.
-    pub fn read_range_into(
-        &self,
-        buf: &mut Vec<u8>,
-        offset: u64,
-        length: u64,
-    ) -> Result<()> {
+    pub fn read_range_into(&self, buf: &mut Vec<u8>, offset: u64, length: u64) -> Result<()> {
         if offset.saturating_add(length) > self.file_size {
             return Err(IoError::OutOfRangeRead {
                 offset,

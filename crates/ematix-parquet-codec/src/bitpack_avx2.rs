@@ -2083,11 +2083,9 @@ unsafe fn unpack_avx2_bw3_unchecked(packed: &[u8], full_blocks: usize, out: &mut
     use std::arch::x86_64::*;
 
     // Lo lanes (0..3): byte windows [0..4], [0..4], [0..4], [1..5].
-    let shuffle_lo: __m128i =
-        _mm_setr_epi8(0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 4);
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 4);
     // Hi lanes (4..7): byte windows [1..5], [1..5], [2..6], [2..6].
-    let shuffle_hi: __m128i =
-        _mm_setr_epi8(1, 2, 3, 4, 1, 2, 3, 4, 2, 3, 4, 5, 2, 3, 4, 5);
+    let shuffle_hi: __m128i = _mm_setr_epi8(1, 2, 3, 4, 1, 2, 3, 4, 2, 3, 4, 5, 2, 3, 4, 5);
     let shifts_lo: __m128i = _mm_setr_epi32(0, 3, 6, 1);
     let shifts_hi: __m128i = _mm_setr_epi32(4, 7, 2, 5);
     let mask: __m128i = _mm_set1_epi32(0x07);

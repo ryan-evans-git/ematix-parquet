@@ -528,11 +528,7 @@ fn dispatch_routes_bw1_5_20_21_through_neon() {
 // verifies dict[idx[i]] is produced for every i. Tail-only inputs
 // exercise the scalar fallback path; out-of-range indices must error.
 
-fn check_lookup<T: Copy + std::fmt::Debug + PartialEq>(
-    bw: u8,
-    indices: &[u32],
-    dict: &[T],
-) {
+fn check_lookup<T: Copy + std::fmt::Debug + PartialEq>(bw: u8, indices: &[u32], dict: &[T]) {
     use ematix_parquet_codec::bitpack_neon::{
         unpack_lookup_into_neon_bw4, unpack_lookup_into_neon_bw6, unpack_lookup_into_neon_bw8,
     };
@@ -582,7 +578,9 @@ fn lookup_bw4_small_dict_bounds_path() {
 fn lookup_bw4_out_of_range_errors() {
     use ematix_parquet_codec::bitpack_neon::unpack_lookup_into_neon_bw4;
     let dict: Vec<u8> = (0..8).collect();
-    let indices: Vec<u32> = (0..32u32).map(|i| if i == 17 { 12 } else { i & 7 }).collect();
+    let indices: Vec<u32> = (0..32u32)
+        .map(|i| if i == 17 { 12 } else { i & 7 })
+        .collect();
     let packed = pack(&indices, 4);
     let mut got: Vec<u8> = Vec::new();
     let r = unpack_lookup_into_neon_bw4(&packed, indices.len(), &dict, &mut got);

@@ -10,8 +10,9 @@
 #![cfg(target_arch = "aarch64")]
 
 use ematix_parquet_codec::bitpack_neon::{
-    unpack_indices_into_neon_bw1, unpack_indices_into_neon_bw20, unpack_indices_into_neon_bw21,
-    unpack_indices_into_neon_bw4, unpack_indices_into_neon_bw5, unpack_indices_into_neon_bw8,
+    unpack_indices_into_neon_bw1, unpack_indices_into_neon_bw2, unpack_indices_into_neon_bw20,
+    unpack_indices_into_neon_bw21, unpack_indices_into_neon_bw3, unpack_indices_into_neon_bw4,
+    unpack_indices_into_neon_bw5, unpack_indices_into_neon_bw8,
 };
 
 /// Pack `values` LSB-first at `bit_width`. Bit-exact mirror of the
@@ -217,6 +218,168 @@ fn bw1_random() {
     check_neon_bw1(&v);
 }
 
+// ---- bw=2 -----------------------------------------------------------
+
+fn check_neon_bw2(values: &[u32]) {
+    let packed = pack(values, 2);
+    let mut got = Vec::new();
+    unpack_indices_into_neon_bw2(&packed, values.len(), &mut got).unwrap();
+    assert_eq!(got, values, "bw2: NEON output mismatch");
+}
+
+#[test]
+fn bw2_one_block_known_pattern() {
+    // 32 values cycling 0,1,2,3 — exercises every 2-bit value.
+    let v: Vec<u32> = (0..32u32).map(|i| i & 0x03).collect();
+    check_neon_bw2(&v);
+}
+
+#[test]
+fn bw2_4_streams_interleave_correct() {
+    // First byte should pack values [0, 1, 2, 3] as
+    // (0) | (1<<2) | (2<<4) | (3<<6) = 0b11_10_01_00 = 0xE4.
+    let v: Vec<u32> = (0..32u32).map(|i| i & 0x03).collect();
+    let packed = pack(&v, 2);
+    assert_eq!(packed[0], 0xE4, "lsb-first packing check");
+    let mut got = Vec::new();
+    unpack_indices_into_neon_bw2(&packed, v.len(), &mut got).unwrap();
+    assert_eq!(got, v);
+}
+
+#[test]
+fn bw2_multi_block() {
+    let v: Vec<u32> = (0..512u32).map(|i| i & 0x03).collect();
+    check_neon_bw2(&v);
+}
+
+#[test]
+fn bw2_partial_tail() {
+    for n in [33usize, 34, 35, 36, 64, 65, 100, 511, 1023] {
+        let v: Vec<u32> = (0..n as u32).map(|i| (i * 7) & 0x03).collect();
+        check_neon_bw2(&v);
+    }
+}
+
+#[test]
+fn bw2_random() {
+    let mut seed: u32 = 0xC0DEFACE;
+    let v: Vec<u32> = (0..2048)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & 0x03
+        })
+        .collect();
+    check_neon_bw2(&v);
+}
+
+#[test]
+fn bw2_empty_is_noop() {
+    let mut out = Vec::new();
+    unpack_indices_into_neon_bw2(&[], 0, &mut out).unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn bw2_dispatch_routes_through_neon() {
+    use ematix_parquet_codec::bitpack::unpack_indices_into;
+    let v: Vec<u32> = (0..512u32).map(|i| (i * 13) & 0x03).collect();
+    let packed = pack(&v, 2);
+    let mut got = Vec::new();
+    unpack_indices_into(&packed, v.len(), 2, &mut got).unwrap();
+    assert_eq!(got, v);
+}
+
+// ---- bw=3 -----------------------------------------------------------
+
+fn check_neon_bw3(values: &[u32]) {
+    let packed = pack(values, 3);
+    // The bw=3 NEON kernel reads 16 bytes per block; pad packed so
+    // even small inputs hit the SIMD path. (Real callers — RLE pages —
+    // always have generous trailing slack.)
+    let mut padded = packed.clone();
+    padded.resize(packed.len().max(64), 0);
+    let mut got = Vec::new();
+    unpack_indices_into_neon_bw3(&padded, values.len(), &mut got).unwrap();
+    assert_eq!(got, values, "bw3: NEON output mismatch");
+}
+
+#[test]
+fn bw3_one_block_known_pattern() {
+    // 0..8 — covers every distinct 3-bit value.
+    let v: Vec<u32> = (0..8u32).collect();
+    check_neon_bw3(&v);
+}
+
+#[test]
+fn bw3_packed_bytes_match_spec() {
+    // 8 values [0,1,2,3,4,5,6,7] pack LSB-first into 3 bytes:
+    //   byte 0 = v0 | v1<<3 | (v2&3)<<6     = 0 | 8 | 0x80 = 0x88
+    //   byte 1 = (v2>>2) | v3<<1 | v4<<4 | (v5&1)<<7 = 0 | 6 | 0x40 | 0x80 = 0xC6
+    //   byte 2 = (v5>>1) | v6<<2 | v7<<5    = 2 | 0x18 | 0xE0 = 0xFA
+    let v: Vec<u32> = (0..8u32).collect();
+    let packed = pack(&v, 3);
+    assert_eq!(packed[0], 0x88);
+    assert_eq!(packed[1], 0xC6);
+    assert_eq!(packed[2], 0xFA);
+}
+
+#[test]
+fn bw3_multi_block_full_range() {
+    let v: Vec<u32> = (0..256u32).map(|i| i & 0x07).collect();
+    check_neon_bw3(&v);
+}
+
+#[test]
+fn bw3_partial_tail() {
+    for n in [9usize, 17, 33, 65, 100, 511, 1023] {
+        let v: Vec<u32> = (0..n as u32).map(|i| (i * 13) & 0x07).collect();
+        check_neon_bw3(&v);
+    }
+}
+
+#[test]
+fn bw3_random() {
+    let mut seed: u32 = 0xBADBEEF1;
+    let v: Vec<u32> = (0..2048)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed & 0x07
+        })
+        .collect();
+    check_neon_bw3(&v);
+}
+
+#[test]
+fn bw3_small_input_uses_scalar_fallback() {
+    // Force the safety guard to bypass SIMD: only the bare minimum
+    // packed bytes provided. Scalar path must still produce correct
+    // results.
+    let v: Vec<u32> = (0..8u32).collect();
+    let packed = pack(&v, 3);
+    assert_eq!(packed.len(), 3); // exact required, no slack
+    let mut got = Vec::new();
+    unpack_indices_into_neon_bw3(&packed, v.len(), &mut got).unwrap();
+    assert_eq!(got, v);
+}
+
+#[test]
+fn bw3_empty_is_noop() {
+    let mut out = Vec::new();
+    unpack_indices_into_neon_bw3(&[], 0, &mut out).unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn bw3_dispatch_routes_through_neon() {
+    use ematix_parquet_codec::bitpack::unpack_indices_into;
+    let v: Vec<u32> = (0..512u32).map(|i| (i * 19) & 0x07).collect();
+    let mut packed = pack(&v, 3);
+    packed.resize(packed.len().max(64), 0);
+    let mut got = Vec::new();
+    unpack_indices_into(&packed, v.len(), 3, &mut got).unwrap();
+    assert_eq!(got, v);
+}
+
 // ---- bw=5 -----------------------------------------------------------
 
 fn check_neon_bw5(values: &[u32]) {
@@ -356,5 +519,158 @@ fn dispatch_routes_bw1_5_20_21_through_neon() {
         let mut got = Vec::new();
         unpack_indices_into(&packed, v.len(), bw, &mut got).unwrap();
         assert_eq!(got, v, "bw{bw} dispatch mismatch");
+    }
+}
+
+// ---- lookup variants (bw=4 / 6 / 8) ---------------------------------
+//
+// Each test pre-packs LSB-first, then drives the NEON lookup kernel and
+// verifies dict[idx[i]] is produced for every i. Tail-only inputs
+// exercise the scalar fallback path; out-of-range indices must error.
+
+fn check_lookup<T: Copy + std::fmt::Debug + PartialEq>(bw: u8, indices: &[u32], dict: &[T]) {
+    use ematix_parquet_codec::bitpack_neon::{
+        unpack_lookup_into_neon_bw4, unpack_lookup_into_neon_bw6, unpack_lookup_into_neon_bw8,
+    };
+    let packed = pack(indices, bw);
+    let mut got: Vec<T> = Vec::new();
+    match bw {
+        4 => unpack_lookup_into_neon_bw4(&packed, indices.len(), dict, &mut got).unwrap(),
+        6 => {
+            // bw=6 kernel reads 16 bytes per block; pad source.
+            let mut padded = packed.clone();
+            padded.resize(packed.len().max(64), 0);
+            unpack_lookup_into_neon_bw6(&padded, indices.len(), dict, &mut got).unwrap();
+        }
+        8 => unpack_lookup_into_neon_bw8(&packed, indices.len(), dict, &mut got).unwrap(),
+        _ => unreachable!(),
+    }
+    let expected: Vec<T> = indices.iter().map(|&i| dict[i as usize]).collect();
+    assert_eq!(got, expected, "bw{bw}: lookup mismatch");
+}
+
+#[test]
+fn lookup_bw4_round_trip() {
+    let dict: Vec<i64> = (1000..1016i64).collect();
+    let indices: Vec<u32> = (0..256u32).map(|i| i & 0x0F).collect();
+    check_lookup(4, &indices, &dict);
+}
+
+#[test]
+fn lookup_bw4_tail() {
+    let dict: Vec<f64> = (0..16).map(|i| i as f64 * 0.25).collect();
+    for n in [33usize, 65, 100, 511, 1023] {
+        let indices: Vec<u32> = (0..n as u32).map(|i| (i * 7) & 0x0F).collect();
+        check_lookup(4, &indices, &dict);
+    }
+}
+
+#[test]
+fn lookup_bw4_small_dict_bounds_path() {
+    // dict_size = 15 forces the bounds-checked path (max idx = 15
+    // wouldn't fit if dict.len() <= 15).
+    let dict: Vec<u8> = (0..15).collect();
+    let indices: Vec<u32> = (0..64u32).map(|i| i & 0x0E).collect(); // even, all < 15
+    check_lookup(4, &indices, &dict);
+}
+
+#[test]
+fn lookup_bw4_out_of_range_errors() {
+    use ematix_parquet_codec::bitpack_neon::unpack_lookup_into_neon_bw4;
+    let dict: Vec<u8> = (0..8).collect();
+    let indices: Vec<u32> = (0..32u32)
+        .map(|i| if i == 17 { 12 } else { i & 7 })
+        .collect();
+    let packed = pack(&indices, 4);
+    let mut got: Vec<u8> = Vec::new();
+    let r = unpack_lookup_into_neon_bw4(&packed, indices.len(), &dict, &mut got);
+    assert!(r.is_err());
+}
+
+#[test]
+fn lookup_bw6_round_trip() {
+    let dict: Vec<i32> = (2000..2064i32).collect();
+    let indices: Vec<u32> = (0..256u32).map(|i| i & 0x3F).collect();
+    check_lookup(6, &indices, &dict);
+}
+
+#[test]
+fn lookup_bw6_tail() {
+    let dict: Vec<f64> = (0..64).map(|i| i as f64).collect();
+    for n in [9usize, 17, 33, 65, 100, 1023] {
+        let indices: Vec<u32> = (0..n as u32).map(|i| (i * 13) & 0x3F).collect();
+        check_lookup(6, &indices, &dict);
+    }
+}
+
+#[test]
+fn lookup_bw6_bounds_checked_path() {
+    let dict: Vec<u16> = (0..50).collect();
+    let indices: Vec<u32> = (0..128u32).map(|i| i % 50).collect();
+    check_lookup(6, &indices, &dict);
+}
+
+#[test]
+fn lookup_bw8_round_trip() {
+    let dict: Vec<u64> = (10_000..10_256u64).collect();
+    let indices: Vec<u32> = (0..1024u32).map(|i| i & 0xFF).collect();
+    check_lookup(8, &indices, &dict);
+}
+
+#[test]
+fn lookup_bw8_tail() {
+    let dict: Vec<i64> = (0..256i64).collect();
+    for n in [33usize, 64, 100, 1023] {
+        let indices: Vec<u32> = (0..n as u32).map(|i| (i * 31) & 0xFF).collect();
+        check_lookup(8, &indices, &dict);
+    }
+}
+
+#[test]
+fn lookup_bw8_small_dict_bounds_path() {
+    // dict.len() = 7 ⇒ indices > 6 must error.
+    use ematix_parquet_codec::bitpack_neon::unpack_lookup_into_neon_bw8;
+    let dict: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6];
+    let indices: Vec<u32> = (0..32u32).map(|i| i % 7).collect();
+    let packed = pack(&indices, 8);
+    let mut got: Vec<u8> = Vec::new();
+    unpack_lookup_into_neon_bw8(&packed, indices.len(), &dict, &mut got).unwrap();
+    let expected: Vec<u8> = indices.iter().map(|&i| dict[i as usize]).collect();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn lookup_dispatch_routes_bw4_6_8() {
+    use ematix_parquet_codec::bitpack::unpack_lookup_into;
+    // bw=4
+    {
+        let dict: Vec<u64> = (0..16u64).collect();
+        let indices: Vec<u32> = (0..256u32).map(|i| i & 0x0F).collect();
+        let packed = pack(&indices, 4);
+        let mut got: Vec<u64> = Vec::new();
+        unpack_lookup_into(&packed, indices.len(), 4, &dict, &mut got).unwrap();
+        let expected: Vec<u64> = indices.iter().map(|&i| dict[i as usize]).collect();
+        assert_eq!(got, expected);
+    }
+    // bw=6
+    {
+        let dict: Vec<u64> = (0..64u64).collect();
+        let indices: Vec<u32> = (0..256u32).map(|i| (i * 5) & 0x3F).collect();
+        let mut packed = pack(&indices, 6);
+        packed.resize(packed.len().max(64), 0);
+        let mut got: Vec<u64> = Vec::new();
+        unpack_lookup_into(&packed, indices.len(), 6, &dict, &mut got).unwrap();
+        let expected: Vec<u64> = indices.iter().map(|&i| dict[i as usize]).collect();
+        assert_eq!(got, expected);
+    }
+    // bw=8
+    {
+        let dict: Vec<i64> = (0..256i64).collect();
+        let indices: Vec<u32> = (0..1024u32).map(|i| (i * 13) & 0xFF).collect();
+        let packed = pack(&indices, 8);
+        let mut got: Vec<i64> = Vec::new();
+        unpack_lookup_into(&packed, indices.len(), 8, &dict, &mut got).unwrap();
+        let expected: Vec<i64> = indices.iter().map(|&i| dict[i as usize]).collect();
+        assert_eq!(got, expected);
     }
 }

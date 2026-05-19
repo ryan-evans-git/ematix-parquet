@@ -582,22 +582,27 @@ pub fn read_column_byte_array_dict_preserved_into(
                 let info = data_page_view(&hdr, body, codec, &mut decomp)?;
                 match info.encoding {
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
-                        let mut page_indices = crate::dict::decode_rle_dictionary_indices(
+                        // Append directly into the caller-provided
+                        // `indices` Vec — eliminates the per-page
+                        // intermediate `Vec<u32>` alloc that the old
+                        // `decode_rle_dictionary_indices` returned.
+                        let pre_len = indices.len();
+                        crate::dict::decode_rle_dictionary_indices_into(
                             info.values,
                             info.num_values,
+                            indices,
                         )?;
-                        // Validate every index lands inside the dict.
-                        // The downstream Arrow consumer relies on this
-                        // invariant; checking once here keeps the hot
-                        // path on the gather side branch-free.
+                        // Validate the newly-appended range. Same
+                        // invariant as before: every idx < dict_len.
                         let dict_len = dict_offsets.len() - 1;
-                        if let Some(bad) = page_indices.iter().find(|&&i| (i as usize) >= dict_len)
+                        if let Some(bad) = indices[pre_len..]
+                            .iter()
+                            .find(|&&i| (i as usize) >= dict_len)
                         {
                             return Err(CodecError::InvalidInput(format!(
                                 "dictionary index {bad} out of range (dict_len = {dict_len})"
                             )));
                         }
-                        indices.append(&mut page_indices);
                     }
                     Encoding::Plain => {
                         return Err(CodecError::InvalidInput(

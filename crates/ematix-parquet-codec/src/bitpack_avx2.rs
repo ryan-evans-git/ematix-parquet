@@ -1543,6 +1543,576 @@ unsafe fn unpack_avx2_bw4_unchecked(packed: &[u8], full_blocks: usize, out: &mut
     out.set_len(out_start_len + full_blocks * 32);
 }
 
+// ---- bw=4 / bw=6 / bw=8 lookup variants (AVX2 mirrors) -------------
+//
+// Mirror `bitpack_neon::unpack_lookup_into_neon_bw{4,6,8}`. Each
+// stages a NEON-equivalent block into a stack buffer and runs the
+// scalar dict gather inline. Bounds-safe fast path skips per-element
+// checks when dict_size proves every index fits.
+
+/// AVX2 mirror of `bitpack_neon::unpack_lookup_into_neon_bw4`.
+pub fn unpack_lookup_into_avx2_bw4<T: Copy>(
+    packed: &[u8],
+    num_values: usize,
+    dict: &[T],
+    out: &mut Vec<T>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    if dict.is_empty() {
+        return Err(CodecError::DictIndexOutOfRange {
+            index: 0,
+            dict_size: 0,
+        });
+    }
+    let required_bytes = num_values.div_ceil(2);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw4 lookup: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+
+    let full_blocks = num_values / 32;
+    let dict_size = dict.len();
+    let dict_ptr = dict.as_ptr();
+    let out_start_len = out.len();
+
+    let mut staging = [0u32; 32];
+    let mut bad_idx: Option<u32> = None;
+    unsafe {
+        let out_ptr = out.as_mut_ptr().add(out_start_len);
+        let mut written = 0usize;
+
+        if dict_size > 15 {
+            unpack_avx2_bw4_into_staging(packed, full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i as usize);
+                }
+                written += 32;
+                Ok(())
+            })?;
+        } else {
+            unpack_avx2_bw4_into_staging(packed, full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    let i_usize = i as usize;
+                    if i_usize >= dict_size {
+                        bad_idx = Some(i);
+                        return Err(CodecError::DictIndexOutOfRange {
+                            index: i,
+                            dict_size,
+                        });
+                    }
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i_usize);
+                }
+                written += 32;
+                Ok(())
+            })?;
+        }
+        out.set_len(out_start_len + written);
+    }
+    if let Some(i) = bad_idx {
+        return Err(CodecError::DictIndexOutOfRange {
+            index: i,
+            dict_size,
+        });
+    }
+
+    let processed = full_blocks * 32;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut tail_idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed / 2..], remaining, 4, &mut tail_idxs);
+        for &i in &tail_idxs {
+            let i_usize = i as usize;
+            if i_usize >= dict_size {
+                return Err(CodecError::DictIndexOutOfRange {
+                    index: i,
+                    dict_size,
+                });
+            }
+            unsafe {
+                let out_ptr = out.as_mut_ptr().add(out.len());
+                *out_ptr = *dict_ptr.add(i_usize);
+                out.set_len(out.len() + 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw4_into_staging<F>(
+    packed: &[u8],
+    full_blocks: usize,
+    staging: &mut [u32; 32],
+    mut sink: F,
+) -> Result<()>
+where
+    F: FnMut(&[u32; 32]) -> Result<()>,
+{
+    use std::arch::x86_64::*;
+    let mut src_ptr = packed.as_ptr();
+    let staging_ptr = staging.as_mut_ptr();
+    let mask_nibble: __m128i = _mm_set1_epi8(0x0F);
+
+    for _ in 0..full_blocks {
+        let bytes: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let lo_nibbles: __m128i = _mm_and_si128(bytes, mask_nibble);
+        let hi_nibbles: __m128i = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask_nibble);
+        let interleaved_lo: __m128i = _mm_unpacklo_epi8(lo_nibbles, hi_nibbles);
+        let interleaved_hi: __m128i = _mm_unpackhi_epi8(lo_nibbles, hi_nibbles);
+
+        let il_lo: __m256i = _mm256_cvtepu8_epi32(interleaved_lo);
+        let il_hi: __m256i = _mm256_cvtepu8_epi32(_mm_srli_si128(interleaved_lo, 8));
+        let ih_lo: __m256i = _mm256_cvtepu8_epi32(interleaved_hi);
+        let ih_hi: __m256i = _mm256_cvtepu8_epi32(_mm_srli_si128(interleaved_hi, 8));
+
+        _mm256_storeu_si256(staging_ptr as *mut __m256i, il_lo);
+        _mm256_storeu_si256(staging_ptr.add(8) as *mut __m256i, il_hi);
+        _mm256_storeu_si256(staging_ptr.add(16) as *mut __m256i, ih_lo);
+        _mm256_storeu_si256(staging_ptr.add(24) as *mut __m256i, ih_hi);
+        sink(staging)?;
+        src_ptr = src_ptr.add(16);
+    }
+    Ok(())
+}
+
+/// AVX2 mirror of `bitpack_neon::unpack_lookup_into_neon_bw6`.
+pub fn unpack_lookup_into_avx2_bw6<T: Copy>(
+    packed: &[u8],
+    num_values: usize,
+    dict: &[T],
+    out: &mut Vec<T>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    if dict.is_empty() {
+        return Err(CodecError::DictIndexOutOfRange {
+            index: 0,
+            dict_size: 0,
+        });
+    }
+    let required_bytes = (num_values * 6).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw6 lookup: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if packed.len() < 16 {
+        0
+    } else {
+        ((packed.len() - 10) / 6).min(full_blocks)
+    };
+
+    let dict_size = dict.len();
+    let dict_ptr = dict.as_ptr();
+    let out_start_len = out.len();
+
+    let mut staging = [0u32; 8];
+    let mut bad_idx: Option<u32> = None;
+    unsafe {
+        let out_ptr = out.as_mut_ptr().add(out_start_len);
+        let mut written = 0usize;
+
+        if dict_size > 63 {
+            unpack_avx2_bw6_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i as usize);
+                }
+                written += 8;
+                Ok(())
+            })?;
+        } else {
+            unpack_avx2_bw6_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    let i_usize = i as usize;
+                    if i_usize >= dict_size {
+                        bad_idx = Some(i);
+                        return Err(CodecError::DictIndexOutOfRange {
+                            index: i,
+                            dict_size,
+                        });
+                    }
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i_usize);
+                }
+                written += 8;
+                Ok(())
+            })?;
+        }
+        out.set_len(out_start_len + written);
+    }
+    if let Some(i) = bad_idx {
+        return Err(CodecError::DictIndexOutOfRange {
+            index: i,
+            dict_size,
+        });
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut tail_idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 6 / 8..], remaining, 6, &mut tail_idxs);
+        for &i in &tail_idxs {
+            let i_usize = i as usize;
+            if i_usize >= dict_size {
+                return Err(CodecError::DictIndexOutOfRange {
+                    index: i,
+                    dict_size,
+                });
+            }
+            unsafe {
+                let out_ptr = out.as_mut_ptr().add(out.len());
+                *out_ptr = *dict_ptr.add(i_usize);
+                out.set_len(out.len() + 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw6_into_staging<F>(
+    packed: &[u8],
+    full_blocks: usize,
+    staging: &mut [u32; 8],
+    mut sink: F,
+) -> Result<()>
+where
+    F: FnMut(&[u32; 8]) -> Result<()>,
+{
+    use std::arch::x86_64::*;
+    // Lo lanes (0..3): u32 windows [0..4], [0..4], [1..5], [2..6].
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5);
+    // Hi lanes (4..7): u32 windows [3..7], [3..7], [4..8], [5..9].
+    let shuffle_hi: __m128i = _mm_setr_epi8(3, 4, 5, 6, 3, 4, 5, 6, 4, 5, 6, 7, 5, 6, 7, 8);
+    let shifts: __m128i = _mm_setr_epi32(0, 6, 4, 2);
+    let mask: __m128i = _mm_set1_epi32(0x3F);
+
+    let mut src_ptr = packed.as_ptr();
+    let staging_ptr = staging.as_mut_ptr();
+
+    for _ in 0..full_blocks {
+        let v0: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let lo_b: __m128i = _mm_shuffle_epi8(v0, shuffle_lo);
+        let hi_b: __m128i = _mm_shuffle_epi8(v0, shuffle_hi);
+        let lo_shifted: __m128i = _mm_srlv_epi32(lo_b, shifts);
+        let hi_shifted: __m128i = _mm_srlv_epi32(hi_b, shifts);
+        let lo_masked: __m128i = _mm_and_si128(lo_shifted, mask);
+        let hi_masked: __m128i = _mm_and_si128(hi_shifted, mask);
+        _mm_storeu_si128(staging_ptr as *mut __m128i, lo_masked);
+        _mm_storeu_si128(staging_ptr.add(4) as *mut __m128i, hi_masked);
+        sink(staging)?;
+        src_ptr = src_ptr.add(6);
+    }
+    Ok(())
+}
+
+/// AVX2 mirror of `bitpack_neon::unpack_lookup_into_neon_bw8`.
+pub fn unpack_lookup_into_avx2_bw8<T: Copy>(
+    packed: &[u8],
+    num_values: usize,
+    dict: &[T],
+    out: &mut Vec<T>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    if dict.is_empty() {
+        return Err(CodecError::DictIndexOutOfRange {
+            index: 0,
+            dict_size: 0,
+        });
+    }
+    let required_bytes = num_values;
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw8 lookup: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+
+    let full_blocks = num_values / 32;
+    let dict_size = dict.len();
+    let dict_ptr = dict.as_ptr();
+    let out_start_len = out.len();
+
+    let mut staging = [0u32; 32];
+    let mut bad_idx: Option<u32> = None;
+    unsafe {
+        let out_ptr = out.as_mut_ptr().add(out_start_len);
+        let mut written = 0usize;
+
+        if dict_size > 255 {
+            unpack_avx2_bw8_into_staging(packed, full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i as usize);
+                }
+                written += 32;
+                Ok(())
+            })?;
+        } else {
+            unpack_avx2_bw8_into_staging(packed, full_blocks, &mut staging, |idxs| {
+                for (lane, &i) in idxs.iter().enumerate() {
+                    let i_usize = i as usize;
+                    if i_usize >= dict_size {
+                        bad_idx = Some(i);
+                        return Err(CodecError::DictIndexOutOfRange {
+                            index: i,
+                            dict_size,
+                        });
+                    }
+                    *out_ptr.add(written + lane) = *dict_ptr.add(i_usize);
+                }
+                written += 32;
+                Ok(())
+            })?;
+        }
+        out.set_len(out_start_len + written);
+    }
+    if let Some(i) = bad_idx {
+        return Err(CodecError::DictIndexOutOfRange {
+            index: i,
+            dict_size,
+        });
+    }
+
+    let processed = full_blocks * 32;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut tail_idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed..], remaining, 8, &mut tail_idxs);
+        for &i in &tail_idxs {
+            let i_usize = i as usize;
+            if i_usize >= dict_size {
+                return Err(CodecError::DictIndexOutOfRange {
+                    index: i,
+                    dict_size,
+                });
+            }
+            unsafe {
+                let out_ptr = out.as_mut_ptr().add(out.len());
+                *out_ptr = *dict_ptr.add(i_usize);
+                out.set_len(out.len() + 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw8_into_staging<F>(
+    packed: &[u8],
+    full_blocks: usize,
+    staging: &mut [u32; 32],
+    mut sink: F,
+) -> Result<()>
+where
+    F: FnMut(&[u32; 32]) -> Result<()>,
+{
+    use std::arch::x86_64::*;
+    let mut src_ptr = packed.as_ptr();
+    let staging_ptr = staging.as_mut_ptr();
+
+    for _ in 0..full_blocks {
+        // 32 source bytes = two __m128i loads, each widening to a
+        // __m256i u32x8 via two _mm256_cvtepu8_epi32 (low 8 / high 8).
+        let b0: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let b1: __m128i = _mm_loadu_si128(src_ptr.add(16) as *const __m128i);
+        let q0: __m256i = _mm256_cvtepu8_epi32(b0);
+        let q1: __m256i = _mm256_cvtepu8_epi32(_mm_srli_si128(b0, 8));
+        let q2: __m256i = _mm256_cvtepu8_epi32(b1);
+        let q3: __m256i = _mm256_cvtepu8_epi32(_mm_srli_si128(b1, 8));
+        _mm256_storeu_si256(staging_ptr as *mut __m256i, q0);
+        _mm256_storeu_si256(staging_ptr.add(8) as *mut __m256i, q1);
+        _mm256_storeu_si256(staging_ptr.add(16) as *mut __m256i, q2);
+        _mm256_storeu_si256(staging_ptr.add(24) as *mut __m256i, q3);
+        sink(staging)?;
+        src_ptr = src_ptr.add(32);
+    }
+    Ok(())
+}
+
+// ---- bw=2: 4-streams-per-byte AVX2 expansion -----------------------
+//
+// AVX2 mirror of `bitpack_neon::unpack_indices_into_neon_bw2`. 32
+// values = 8 source bytes. Per byte: 4 values stacked at bit offsets
+// 0 / 2 / 4 / 6 (LSB-first). Strategy: load 8 bytes into the low half
+// of a __m128i, build 4 streams via shift + mask, then 4-way
+// interleave with `_mm_unpacklo_epi8` (byte) + `_mm_unpacklo/hi_epi16`
+// (u16-pair) to land 32 output bytes in [s0, s1, s2, s3, ...] order
+// before widening to u32x32.
+
+pub fn unpack_indices_into_avx2_bw2(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = num_values.div_ceil(4);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw2: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 32;
+
+    unsafe {
+        unpack_avx2_bw2_unchecked(packed, full_blocks, out);
+    }
+
+    let processed = full_blocks * 32;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed / 4..], remaining, 2, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw2_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+    let mask2: __m128i = _mm_set1_epi8(0x03);
+
+    for blk in 0..full_blocks {
+        // 8 source bytes (32 values) loaded into the low 64 bits.
+        let src: __m128i = _mm_loadl_epi64(src_ptr as *const __m128i);
+        // Four parallel streams. AVX2 has no per-byte shift; do u16
+        // shifts then re-mask.
+        let s0 = _mm_and_si128(src, mask2);
+        let s1 = _mm_and_si128(_mm_srli_epi16(src, 2), mask2);
+        let s2 = _mm_and_si128(_mm_srli_epi16(src, 4), mask2);
+        let s3 = _mm_and_si128(_mm_srli_epi16(src, 6), mask2);
+
+        // Pair (s0, s1) and (s2, s3) at byte granularity:
+        // unpacklo_epi8 zips low-8 bytes of each → 16 bytes.
+        let p01: __m128i = _mm_unpacklo_epi8(s0, s1);
+        let p23: __m128i = _mm_unpacklo_epi8(s2, s3);
+
+        // 4-way interleave via u16-pair zip: each u16 lane of p01
+        // already holds (s0[i] | s1[i]<<8); zipping against p23 yields
+        // [s0[i], s1[i], s2[i], s3[i], ...] at byte granularity.
+        let block_lo: __m128i = _mm_unpacklo_epi16(p01, p23); // values 0..16
+        let block_hi: __m128i = _mm_unpackhi_epi16(p01, p23); // values 16..32
+
+        // Widen each 16-byte block to two u32x8 vectors.
+        let q0: __m256i = _mm256_cvtepu8_epi32(block_lo);
+        let q1: __m256i = _mm256_cvtepu8_epi32(_mm_srli_si128(block_lo, 8));
+        let q2: __m256i = _mm256_cvtepu8_epi32(block_hi);
+        let q3: __m256i = _mm256_cvtepu8_epi32(_mm_srli_si128(block_hi, 8));
+
+        let dst = out_ptr.add(blk * 32);
+        _mm256_storeu_si256(dst as *mut __m256i, q0);
+        _mm256_storeu_si256(dst.add(8) as *mut __m256i, q1);
+        _mm256_storeu_si256(dst.add(16) as *mut __m256i, q2);
+        _mm256_storeu_si256(dst.add(24) as *mut __m256i, q3);
+        src_ptr = src_ptr.add(8);
+    }
+    out.set_len(out_start_len + full_blocks * 32);
+}
+
+// ---- bw=3: AVX2, PSHUFB + variable shift ---------------------------
+//
+// AVX2 mirror of `bitpack_neon::unpack_indices_into_neon_bw3`. 8
+// values = 3 source bytes; values span at most 2 bytes (3 + 7 = 10
+// bits). Per-lane (byte, bit_off): (0,0), (0,3), (0,6), (1,1),
+// (1,4), (1,7), (2,2), (2,5). Two `_mm_shuffle_epi8` gathers
+// build 4-byte windows per lane; `_mm_srlv_epi32` does the per-lane
+// right shift; mask to 3 bits. Single 16-byte load covers both
+// shuffles (max byte index is 5).
+
+pub fn unpack_indices_into_avx2_bw3(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 3).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw3: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if packed.len() < 16 {
+        0
+    } else {
+        ((packed.len() - 13) / 3).min(full_blocks)
+    };
+
+    unsafe {
+        unpack_avx2_bw3_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 3 / 8..], remaining, 3, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw3_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+
+    // Lo lanes (0..3): byte windows [0..4], [0..4], [0..4], [1..5].
+    let shuffle_lo: __m128i =
+        _mm_setr_epi8(0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 4);
+    // Hi lanes (4..7): byte windows [1..5], [1..5], [2..6], [2..6].
+    let shuffle_hi: __m128i =
+        _mm_setr_epi8(1, 2, 3, 4, 1, 2, 3, 4, 2, 3, 4, 5, 2, 3, 4, 5);
+    let shifts_lo: __m128i = _mm_setr_epi32(0, 3, 6, 1);
+    let shifts_hi: __m128i = _mm_setr_epi32(4, 7, 2, 5);
+    let mask: __m128i = _mm_set1_epi32(0x07);
+
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    for blk in 0..full_blocks {
+        let v0: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let lo_b: __m128i = _mm_shuffle_epi8(v0, shuffle_lo);
+        let hi_b: __m128i = _mm_shuffle_epi8(v0, shuffle_hi);
+        let lo_shifted: __m128i = _mm_srlv_epi32(lo_b, shifts_lo);
+        let hi_shifted: __m128i = _mm_srlv_epi32(hi_b, shifts_hi);
+        let lo_masked: __m128i = _mm_and_si128(lo_shifted, mask);
+        let hi_masked: __m128i = _mm_and_si128(hi_shifted, mask);
+
+        _mm_storeu_si128(out_ptr.add(blk * 8) as *mut __m128i, lo_masked);
+        _mm_storeu_si128(out_ptr.add(blk * 8 + 4) as *mut __m128i, hi_masked);
+
+        src_ptr = src_ptr.add(3);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}
+
 // ---- bw=1: bit-test AVX2 unpack ------------------------------------
 //
 // 8 values per byte. 32 values = 4 source bytes. Strategy: broadcast

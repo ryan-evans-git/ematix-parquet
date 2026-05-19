@@ -8,8 +8,9 @@
 #![cfg(target_arch = "x86_64")]
 
 use ematix_parquet_codec::bitpack_avx2::{
-    unpack_indices_into_avx2_bw1, unpack_indices_into_avx2_bw20, unpack_indices_into_avx2_bw21,
-    unpack_indices_into_avx2_bw4, unpack_indices_into_avx2_bw5, unpack_indices_into_avx2_bw8,
+    unpack_indices_into_avx2_bw1, unpack_indices_into_avx2_bw2, unpack_indices_into_avx2_bw20,
+    unpack_indices_into_avx2_bw21, unpack_indices_into_avx2_bw3, unpack_indices_into_avx2_bw4,
+    unpack_indices_into_avx2_bw5, unpack_indices_into_avx2_bw8,
 };
 
 fn have_avx2() -> bool {
@@ -56,10 +57,18 @@ fn check(width: u8, values: &[u32]) {
     if !have_avx2() {
         return;
     }
-    let packed = pack(values, width);
+    let mut packed = pack(values, width);
+    // bw=3 reads 16 bytes per SIMD block; pad the source so even tiny
+    // inputs hit the SIMD path (real callers always have generous
+    // trailing slack from page framing).
+    if width == 3 {
+        packed.resize(packed.len().max(64), 0);
+    }
     let mut got = Vec::new();
     match width {
         1 => unpack_indices_into_avx2_bw1(&packed, values.len(), &mut got).unwrap(),
+        2 => unpack_indices_into_avx2_bw2(&packed, values.len(), &mut got).unwrap(),
+        3 => unpack_indices_into_avx2_bw3(&packed, values.len(), &mut got).unwrap(),
         4 => unpack_indices_into_avx2_bw4(&packed, values.len(), &mut got).unwrap(),
         5 => unpack_indices_into_avx2_bw5(&packed, values.len(), &mut got).unwrap(),
         8 => unpack_indices_into_avx2_bw8(&packed, values.len(), &mut got).unwrap(),
@@ -93,6 +102,69 @@ fn avx2_bw1_partial_tail() {
 #[test]
 fn avx2_bw1_random() {
     check(1, &pseudo_random(0xC0FFEE, 2048, 1));
+}
+
+// ---- bw=2 -----------------------------------------------------------
+
+#[test]
+fn avx2_bw2_full_range() {
+    check(2, &(0..32u32).map(|i| i & 0x03).collect::<Vec<_>>());
+}
+
+#[test]
+fn avx2_bw2_4_streams_interleave() {
+    // First byte should pack [0,1,2,3] LSB-first as 0xE4.
+    let v: Vec<u32> = (0..32u32).map(|i| i & 0x03).collect();
+    let packed = pack(&v, 2);
+    assert_eq!(packed[0], 0xE4);
+    check(2, &v);
+}
+
+#[test]
+fn avx2_bw2_multi_block() {
+    check(2, &(0..512u32).map(|i| i & 0x03).collect::<Vec<_>>());
+}
+
+#[test]
+fn avx2_bw2_partial_tail() {
+    for n in [33usize, 34, 35, 36, 64, 65, 100, 511, 1023] {
+        check(
+            2,
+            &(0..n as u32).map(|i| (i * 7) & 0x03).collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+fn avx2_bw2_random() {
+    check(2, &pseudo_random(0xC0DEFACE, 2048, 0x03));
+}
+
+// ---- bw=3 -----------------------------------------------------------
+
+#[test]
+fn avx2_bw3_one_block() {
+    check(3, &(0..8u32).collect::<Vec<_>>());
+}
+
+#[test]
+fn avx2_bw3_full_range() {
+    check(3, &(0..256u32).map(|i| i & 0x07).collect::<Vec<_>>());
+}
+
+#[test]
+fn avx2_bw3_partial_tail() {
+    for n in [9usize, 17, 33, 65, 100, 511, 1023] {
+        check(
+            3,
+            &(0..n as u32).map(|i| (i * 13) & 0x07).collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+fn avx2_bw3_random() {
+    check(3, &pseudo_random(0xBADBEEF1, 2048, 0x07));
 }
 
 // ---- bw=4 -----------------------------------------------------------
@@ -269,5 +341,148 @@ fn dispatch_routes_new_widths_through_avx2() {
         let mut got = Vec::new();
         unpack_indices_into(&packed, v.len(), bw, &mut got).unwrap();
         assert_eq!(got, v, "bw{bw} dispatch mismatch");
+    }
+}
+
+// ---- lookup variants (bw=4 / 6 / 8) ---------------------------------
+
+fn check_lookup_avx2<T: Copy + std::fmt::Debug + PartialEq>(
+    bw: u8,
+    indices: &[u32],
+    dict: &[T],
+) {
+    if !have_avx2() {
+        return;
+    }
+    use ematix_parquet_codec::bitpack_avx2::{
+        unpack_lookup_into_avx2_bw4, unpack_lookup_into_avx2_bw6, unpack_lookup_into_avx2_bw8,
+    };
+    let mut packed = pack(indices, bw);
+    if bw == 6 {
+        packed.resize(packed.len().max(64), 0);
+    }
+    let mut got: Vec<T> = Vec::new();
+    match bw {
+        4 => unpack_lookup_into_avx2_bw4(&packed, indices.len(), dict, &mut got).unwrap(),
+        6 => unpack_lookup_into_avx2_bw6(&packed, indices.len(), dict, &mut got).unwrap(),
+        8 => unpack_lookup_into_avx2_bw8(&packed, indices.len(), dict, &mut got).unwrap(),
+        _ => unreachable!(),
+    }
+    let expected: Vec<T> = indices.iter().map(|&i| dict[i as usize]).collect();
+    assert_eq!(got, expected, "bw{bw}: AVX2 lookup mismatch");
+}
+
+#[test]
+fn avx2_lookup_bw4_round_trip() {
+    let dict: Vec<i64> = (1000..1016i64).collect();
+    let indices: Vec<u32> = (0..256u32).map(|i| i & 0x0F).collect();
+    check_lookup_avx2(4, &indices, &dict);
+}
+
+#[test]
+fn avx2_lookup_bw4_tail() {
+    let dict: Vec<f64> = (0..16).map(|i| i as f64 * 0.25).collect();
+    for n in [33usize, 65, 100, 511, 1023] {
+        let indices: Vec<u32> = (0..n as u32).map(|i| (i * 7) & 0x0F).collect();
+        check_lookup_avx2(4, &indices, &dict);
+    }
+}
+
+#[test]
+fn avx2_lookup_bw4_small_dict_bounds_path() {
+    let dict: Vec<u8> = (0..15).collect();
+    let indices: Vec<u32> = (0..64u32).map(|i| i & 0x0E).collect();
+    check_lookup_avx2(4, &indices, &dict);
+}
+
+#[test]
+fn avx2_lookup_bw4_out_of_range_errors() {
+    if !have_avx2() {
+        return;
+    }
+    use ematix_parquet_codec::bitpack_avx2::unpack_lookup_into_avx2_bw4;
+    let dict: Vec<u8> = (0..8).collect();
+    let indices: Vec<u32> = (0..32u32).map(|i| if i == 17 { 12 } else { i & 7 }).collect();
+    let packed = pack(&indices, 4);
+    let mut got: Vec<u8> = Vec::new();
+    let r = unpack_lookup_into_avx2_bw4(&packed, indices.len(), &dict, &mut got);
+    assert!(r.is_err());
+}
+
+#[test]
+fn avx2_lookup_bw6_round_trip() {
+    let dict: Vec<i32> = (2000..2064i32).collect();
+    let indices: Vec<u32> = (0..256u32).map(|i| i & 0x3F).collect();
+    check_lookup_avx2(6, &indices, &dict);
+}
+
+#[test]
+fn avx2_lookup_bw6_tail() {
+    let dict: Vec<f64> = (0..64).map(|i| i as f64).collect();
+    for n in [9usize, 17, 33, 65, 100, 1023] {
+        let indices: Vec<u32> = (0..n as u32).map(|i| (i * 13) & 0x3F).collect();
+        check_lookup_avx2(6, &indices, &dict);
+    }
+}
+
+#[test]
+fn avx2_lookup_bw6_bounds_checked_path() {
+    let dict: Vec<u16> = (0..50).collect();
+    let indices: Vec<u32> = (0..128u32).map(|i| i % 50).collect();
+    check_lookup_avx2(6, &indices, &dict);
+}
+
+#[test]
+fn avx2_lookup_bw8_round_trip() {
+    let dict: Vec<u64> = (10_000..10_256u64).collect();
+    let indices: Vec<u32> = (0..1024u32).map(|i| i & 0xFF).collect();
+    check_lookup_avx2(8, &indices, &dict);
+}
+
+#[test]
+fn avx2_lookup_bw8_tail() {
+    let dict: Vec<i64> = (0..256i64).collect();
+    for n in [33usize, 64, 100, 1023] {
+        let indices: Vec<u32> = (0..n as u32).map(|i| (i * 31) & 0xFF).collect();
+        check_lookup_avx2(8, &indices, &dict);
+    }
+}
+
+#[test]
+fn avx2_lookup_dispatch_routes_bw4_6_8() {
+    if !have_avx2() {
+        return;
+    }
+    use ematix_parquet_codec::bitpack::unpack_lookup_into;
+    // bw=4
+    {
+        let dict: Vec<u64> = (0..16u64).collect();
+        let indices: Vec<u32> = (0..256u32).map(|i| i & 0x0F).collect();
+        let packed = pack(&indices, 4);
+        let mut got: Vec<u64> = Vec::new();
+        unpack_lookup_into(&packed, indices.len(), 4, &dict, &mut got).unwrap();
+        let expected: Vec<u64> = indices.iter().map(|&i| dict[i as usize]).collect();
+        assert_eq!(got, expected);
+    }
+    // bw=6
+    {
+        let dict: Vec<u64> = (0..64u64).collect();
+        let indices: Vec<u32> = (0..256u32).map(|i| (i * 5) & 0x3F).collect();
+        let mut packed = pack(&indices, 6);
+        packed.resize(packed.len().max(64), 0);
+        let mut got: Vec<u64> = Vec::new();
+        unpack_lookup_into(&packed, indices.len(), 6, &dict, &mut got).unwrap();
+        let expected: Vec<u64> = indices.iter().map(|&i| dict[i as usize]).collect();
+        assert_eq!(got, expected);
+    }
+    // bw=8
+    {
+        let dict: Vec<i64> = (0..256i64).collect();
+        let indices: Vec<u32> = (0..1024u32).map(|i| (i * 13) & 0xFF).collect();
+        let packed = pack(&indices, 8);
+        let mut got: Vec<i64> = Vec::new();
+        unpack_lookup_into(&packed, indices.len(), 8, &dict, &mut got).unwrap();
+        let expected: Vec<i64> = indices.iter().map(|&i| dict[i as usize]).collect();
+        assert_eq!(got, expected);
     }
 }

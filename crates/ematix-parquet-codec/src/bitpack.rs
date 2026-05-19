@@ -73,6 +73,21 @@ pub fn unpack_lookup_into<T: Copy>(
     #[cfg(all(target_arch = "aarch64", not(feature = "no-neon")))]
     {
         match bit_width {
+            4 => {
+                return crate::bitpack_neon::unpack_lookup_into_neon_bw4(
+                    packed, num_values, dict, out,
+                );
+            }
+            6 => {
+                return crate::bitpack_neon::unpack_lookup_into_neon_bw6(
+                    packed, num_values, dict, out,
+                );
+            }
+            8 => {
+                return crate::bitpack_neon::unpack_lookup_into_neon_bw8(
+                    packed, num_values, dict, out,
+                );
+            }
             12 => {
                 return crate::bitpack_neon::unpack_lookup_into_neon_bw12(
                     packed, num_values, dict, out,
@@ -116,6 +131,21 @@ pub fn unpack_lookup_into<T: Copy>(
     {
         if is_x86_feature_detected!("avx2") {
             match bit_width {
+                4 => {
+                    return crate::bitpack_avx2::unpack_lookup_into_avx2_bw4(
+                        packed, num_values, dict, out,
+                    );
+                }
+                6 => {
+                    return crate::bitpack_avx2::unpack_lookup_into_avx2_bw6(
+                        packed, num_values, dict, out,
+                    );
+                }
+                8 => {
+                    return crate::bitpack_avx2::unpack_lookup_into_avx2_bw8(
+                        packed, num_values, dict, out,
+                    );
+                }
                 12 => {
                     return crate::bitpack_avx2::unpack_lookup_into_avx2_bw12(
                         packed, num_values, dict, out,
@@ -188,6 +218,8 @@ pub fn unpack_indices_into(
     {
         match bit_width {
             1 => return crate::bitpack_neon::unpack_indices_into_neon_bw1(packed, num_values, out),
+            2 => return crate::bitpack_neon::unpack_indices_into_neon_bw2(packed, num_values, out),
+            3 => return crate::bitpack_neon::unpack_indices_into_neon_bw3(packed, num_values, out),
             4 => return crate::bitpack_neon::unpack_indices_into_neon_bw4(packed, num_values, out),
             5 => return crate::bitpack_neon::unpack_indices_into_neon_bw5(packed, num_values, out),
             8 => return crate::bitpack_neon::unpack_indices_into_neon_bw8(packed, num_values, out),
@@ -228,6 +260,16 @@ pub fn unpack_indices_into(
             match bit_width {
                 1 => {
                     return crate::bitpack_avx2::unpack_indices_into_avx2_bw1(
+                        packed, num_values, out,
+                    )
+                }
+                2 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw2(
+                        packed, num_values, out,
+                    )
+                }
+                3 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw3(
                         packed, num_values, out,
                     )
                 }

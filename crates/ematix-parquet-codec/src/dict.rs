@@ -51,6 +51,24 @@ unsafe fn pld_l1<T>(_p: *const T) {}
 /// RLE runs emit a single value repeated. This is the path used by
 /// `DictColumnChunk` construction.
 pub fn decode_rle_dictionary_indices(body: &[u8], num_values: usize) -> Result<Vec<u32>> {
+    let mut out: Vec<u32> = Vec::with_capacity(num_values);
+    decode_rle_dictionary_indices_into(body, num_values, &mut out)?;
+    Ok(out)
+}
+
+/// `decode_rle_dictionary_indices` writing into a caller-provided
+/// `Vec<u32>`. The output is **appended** (not cleared) so callers can
+/// accumulate indices across many data pages of one column chunk with
+/// a single allocation.
+///
+/// Used by the dict-preserved BYTE_ARRAY reader and any other hot path
+/// that decodes a stream of RLE_DICTIONARY data pages and wants one
+/// `Vec<u32>` of indices at the end.
+pub fn decode_rle_dictionary_indices_into(
+    body: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
     if body.is_empty() {
         return Err(CodecError::EmptyDictPageBody);
     }
@@ -59,12 +77,13 @@ pub fn decode_rle_dictionary_indices(body: &[u8], num_values: usize) -> Result<V
         return Err(CodecError::BitWidthOutOfRange(bit_width));
     }
     if num_values == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let mut out: Vec<u32> = Vec::with_capacity(num_values);
+    out.reserve(num_values);
     if bit_width == 0 {
-        out.resize(num_values, 0);
-        return Ok(out);
+        let new_len = out.len() + num_values;
+        out.resize(new_len, 0);
+        return Ok(());
     }
 
     let value_bytes = (bit_width as usize).div_ceil(8);
@@ -81,7 +100,7 @@ pub fn decode_rle_dictionary_indices(body: &[u8], num_values: usize) -> Result<V
             let needed = (total * bit_width as usize).div_ceil(8);
             let chunk = cur.take(needed)?;
             let to_emit = (num_values - emitted).min(total);
-            unpack_indices_into(chunk, to_emit, bit_width, &mut out)?;
+            unpack_indices_into(chunk, to_emit, bit_width, out)?;
             emitted += to_emit;
         } else {
             let value_chunk = cur.take(value_bytes)?;
@@ -96,7 +115,7 @@ pub fn decode_rle_dictionary_indices(body: &[u8], num_values: usize) -> Result<V
             emitted += to_emit;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Decode `num_values` u8 indices from a data-page body whose

@@ -12,7 +12,7 @@ a write path that produces spec-compliant files.
 
 ## Status
 
-`v0.10.x` — v1.0 cut criteria are met (every Parquet shape we read
+`v0.11.x` — v1.0 cut criteria are met (every Parquet shape we read
 or write is covered, predicate pushdown lights up end-to-end, and
 the decode hot paths are hand-tuned for the columns that dominate
 analytical TPC-H workloads).
@@ -67,6 +67,13 @@ workers, a **BYTE_ARRAY batched/streaming decode API** sibling to
 the scalar one, plus **NEON `pld` L1 prefetch hints** in the dict
 gather and **NEON unpackers for bw=4 + bw=8** added to the
 specialisation table.
+The v0.11 cycle closes the **SIMD specialisation table** — every
+production bit width (bw=1, 4, 5, 8, 12, 14, 15, 16, 17, 18, 20,
+21) now has a hand-tuned kernel on **both** AArch64 NEON and
+x86_64 AVX2. The scalar const-generic path remains the fallback
+for the remaining widths (mostly bw=2/3/6/7/9/10/11/13/19/22+),
+which the column shapes we've measured don't hit often enough to
+justify dedicated SIMD.
 API is settling; pin by version range until we tag v1.0.
 
 ## What's implemented

@@ -1031,6 +1031,64 @@ Below-the-line follow-ups still outstanding:
 
 ---
 
+## v0.11.0 — SIMD specialisation parity (NEON + AVX2 small/mid widths)
+
+Closes the SIMD specialisation table on both architectures. Every
+production bit width that the scalar fallback was serving at the
+~7-9 GB/s range now has a hand-tuned SIMD kernel on **both**
+AArch64 NEON and x86_64 AVX2.
+
+**Coverage delta vs v0.10.0:**
+
+| Width | NEON v0.10 | NEON v0.11 | AVX2 v0.10 | AVX2 v0.11 |
+|-------|------------|------------|------------|------------|
+| 1     | scalar     | ✓ added    | scalar     | ✓ added    |
+| 4     | ✓ shipped  | ✓          | scalar     | ✓ added    |
+| 5     | scalar     | ✓ added    | scalar     | ✓ added    |
+| 8     | ✓ shipped  | ✓          | scalar     | ✓ added    |
+| 12    | ✓          | ✓          | ✓          | ✓          |
+| 14    | ✓          | ✓          | ✓          | ✓          |
+| 15    | ✓          | ✓          | ✓          | ✓          |
+| 16    | ✓          | ✓          | ✓          | ✓          |
+| 17    | ✓          | ✓          | ✓          | ✓          |
+| 18    | ✓          | ✓          | ✓          | ✓          |
+| 20    | scalar     | ✓ added    | scalar     | ✓ added    |
+| 21    | scalar     | ✓ added    | scalar     | ✓ added    |
+
+**Per-width strategies (PR #64):**
+- bw=1 — broadcast each source byte to 8 lanes, AND with per-lane
+  bit-mask, compare-eq → 0/1 outputs. 32 values per block from 4
+  source bytes.
+- bw=4 — nibble extract (low via AND 0x0F, high via shift-right-4),
+  interleave per parquet LSB-first packing, widen to u32x32.
+- bw=5 — extract one u16 per lane via shuffle table, variable-shift
+  right, mask 0x1F, widen to u32. NEON via `vqtbl1q + vshlq_s16`;
+  AVX2 via per-lane u32 staging + `_mm256_srlv_epi32`.
+- bw=8 — trivial byte-aligned widen. `vmovl` chains on NEON;
+  `_mm256_cvtepu8_epi32` on AVX2.
+- bw=20 — mirrors bw=17/18: two 16-byte loads (offsets 0, 10),
+  per-lane 4-byte windows, alternating shifts [0, 4, 0, 4, ...],
+  mask 0x0F_FFFF.
+- bw=21 — like bw=20 but lo and hi halves use different shuffle
+  tables (byte spacings differ) and every lane has a distinct
+  shift in [0, 5, 2, 7, 4, 1, 6, 3].
+
+Test surface added: 30 NEON tests + 22 AVX2 tests covering known
+patterns, full-range values, partial-tail sizes, and random inputs
+for each new width, plus dispatch-routing checks that the public
+entry point (`bitpack::unpack_indices_into`) routes each new width
+through SIMD instead of the scalar fallback.
+
+Widths still on the scalar const-generic path: bw=2, 3, 6, 7, 9,
+10, 11, 13, 19, 22..32. The column shapes measured in TPC-H
+lineitem and consumer workloads don't hit these often enough to
+justify dedicated kernels. The scalar path runs at ~7-9 GB/s
+output on M-series; revisit only if a workload demands.
+
+**Released as v0.11.0.**
+
+---
+
 ## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot
@@ -1077,9 +1135,12 @@ bottleneck. Marked **speculative**: may never ship.
 These are smaller items that don't merit a full phase but will be
 picked up opportunistically:
 
-- **NEON kernels for bw=1, 5, 20, 21** — v0.10 added bw=4 + bw=8;
-  bw=5 has awkward unaligned packing, bw=20/21 mirror bw=17/18,
-  bw=1 is uncommon in practice. Revisit when a workload demands.
+- **SIMD kernels for very-uncommon widths (bw=2, 3, 6, 7, 9, 10,
+  11, 13, 19, 22..32)** — the column shapes we've measured in
+  TPC-H lineitem and consumer workloads don't hit these often
+  enough to justify dedicated kernels. Scalar const-generic path
+  runs at ~7-9 GB/s output on M-series. Revisit only if a workload
+  demands.
 - **Π.11e — S3 integration tests** (long-deferred from v0.4.1).
   Costs real cloud spend and isn't a correctness gate — wired
   when the next end-to-end validation pass needs it.

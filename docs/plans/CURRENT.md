@@ -1126,6 +1126,76 @@ No breaking API changes.
 
 ---
 
+## v0.13.0 — SIMD specialisation table closed (NEON + AVX2)
+
+Closes the SIMD coverage table for every bit width that the spec
+allows (1..=32). After this release the const-generic scalar
+fallback is reserved for `bit_width == 0` and the partial-tail
+path after each block — every full block runs through a hand-tuned
+intrinsic kernel on both AArch64 NEON and x86_64 AVX2.
+
+Four PRs landed back-to-back on top of v0.12.0:
+
+**PR #69 (Phase 1) — fused-lookup parity for bw=1, 2, 3, 5, 20, 21**
+12 new kernels (6 widths × 2 archs). The lookup path is the hot
+one for dict-encoded scans; these widths already had raw-indices
+SIMD but were falling through to the scalar const-generic lookup.
+Each width has a `unpack_{neon,avx2}_bw{N}_into_staging` helper
+(mirroring the existing bw=12 staging-callback pattern) plus a
+`unpack_lookup_into_*_bw{N}<T: Copy>` wrapper with a bounds-safe
+fast path (`dict_size > (1 << bw) - 1`) and a bounds-checked path.
+
+**PR #70 (Phase 2) — raw-indices SIMD for bw=6, 7**
+4 new kernels (2 widths × 2 archs). bw=6 fused-lookup already
+shipped in v0.11; this completes the raw-indices side. bw=7 was
+new on both paths — raw-indices added here, fused-lookup in PR #69.
+Targets dicts of 33–128 distinct values (status enums, country
+codes, low-cardinality byte-array columns).
+
+**PR #71 (Phase 3) — raw-indices SIMD for bw=9, 10, 11, 13, 19**
+10 new kernels (5 widths × 2 archs). All follow the
+bw=12/14/...18 shape: one or two 16-byte loads per 8-value block,
+two shuffles building lo/hi 4-byte u32 windows, variable per-lane
+right-shift, mask, store. bw=19 uses two 16-byte loads (v0 = packed
+[0..16], v1 = packed[9..25]) because lane 7 starts at byte 16.
+Targets medium-dict workloads (256–512K distinct values:
+high-cardinality enums, mid-size strings, timestamps).
+
+**PR #72 (Phase 4) — raw-indices SIMD for bw=22..32**
+22 new kernels (11 widths × 2 archs). Macro-templated to keep
+per-width boilerplate to a single table row (offsets + shifts +
+mask). Per-band strategy:
+  - bw=22..25: u32 staging (max value bits 25 + max bit_off 7 = 32,
+    fits in u32).
+  - bw=26..31: u64 staging — a value at bit_off=7 spans 5 source
+    bytes (33 bits), so u32 lanes overflow. Gather 8 bytes per
+    lane, shift + mask in 64-bit SIMD lanes, narrow to u32 on
+    store.
+  - bw=32: byte-aligned trivial copy — one 256-bit load/store
+    per block, no shift, no mask.
+
+Phase 4 is raw-indices only; fused-lookup for bw=22..32 falls
+through to the const-generic scalar lookup. At these dict sizes
+(4M..4G distinct values) the gather is memory-bound, so the
+lookup-path SIMD savings are negligible relative to the cache
+behaviour. Fused-lookup parity for bw=22..32 stays open as a
+follow-up if a profile ever shows it matters.
+
+**Coverage table after v0.13.0:**
+
+| Path           | NEON      | AVX2      |
+|----------------|-----------|-----------|
+| Raw-indices    | 1..=32    | 1..=32    |
+| Fused-lookup   | 1..=21    | 1..=21    |
+
+Test count: 48 new SIMD kernels with bit-exact pack-helper oracles
+covering known patterns, partial-tail sizes, random inputs (including
+max-value-boundary at bw=32), and dispatcher routing per width.
+
+**Released as v0.13.0.**
+
+---
+
 ## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot
@@ -1172,12 +1242,11 @@ bottleneck. Marked **speculative**: may never ship.
 These are smaller items that don't merit a full phase but will be
 picked up opportunistically:
 
-- **SIMD kernels for very-uncommon widths (bw=2, 3, 6, 7, 9, 10,
-  11, 13, 19, 22..32)** — the column shapes we've measured in
-  TPC-H lineitem and consumer workloads don't hit these often
-  enough to justify dedicated kernels. Scalar const-generic path
-  runs at ~7-9 GB/s output on M-series. Revisit only if a workload
-  demands.
+- **Fused-lookup SIMD for bw=22..32** — v0.13.0 shipped raw-indices
+  SIMD for these widths but not the fused unpack + dict-gather
+  variant. The gather is memory-bound at 4M..4G distinct dict
+  entries, so the lookup-path SIMD wins are small relative to
+  cache behaviour. Wire if a real profile shows it matters.
 - **Π.11e — S3 integration tests** (long-deferred from v0.4.1).
   Costs real cloud spend and isn't a correctness gate — wired
   when the next end-to-end validation pass needs it.

@@ -12,7 +12,7 @@ ematix-parquet-io    = "0.12"
 
 ## Why
 
-- **Fast where it matters.** Dict-encoded numeric columns decode at 76–96 GB/s output through specialised SIMD kernels (raw-indices: bw=1, 2, 3, 4, 5, 8, 12, 14, 15, 16, 17, 18, 20, 21 on both NEON and AVX2; fused unpack + dict-gather: bw=4, 6, 8, 12, 14, 16, 17). Predicate-fused decode collapses unpack + filter + bitmap pack into a single pass — 3.7–6.3× faster than materialise-then-filter at low selectivity.
+- **Fast where it matters.** Dict-encoded numeric columns decode at 76–96 GB/s output. SIMD specialisation table is **complete** — every bit width 1..=32 has a hand-tuned raw-indices kernel on both NEON and AVX2, and bw=1..21 (the practical range) has fused unpack + dict-gather kernels too. Predicate-fused decode collapses unpack + filter + bitmap pack into a single pass — 3.7–6.3× faster than materialise-then-filter at low selectivity.
 - **Complete on read and write.** Every physical type, every encoding (PLAIN, dict, DELTA_BINARY_PACKED, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT), every mainstream codec (Snappy, Zstd, Gzip, Brotli, LZ4_RAW), V1 + V2 pages, page indexes, bloom filters, Parquet Modular Encryption.
 - **Light footprint.** The sync read/write stack has no third-party deps beyond the chosen compression codecs. Async, encryption, and parallel decode are opt-in features that pull deps only when you ask for them.
 - **Built for engines.** Decode-into-caller-buffer APIs, late-materialization (`*_masked_into`), Arrow-style `(bytes, offsets)` BYTE_ARRAY shape, dict-preserving readers for direct `DictionaryArray` construction, streaming batched decode, adaptive runtime dispatch on observed selectivity, and parallel multi-row-group decode with NUMA-aware worker pinning on Linux.

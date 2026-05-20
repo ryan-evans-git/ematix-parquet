@@ -1089,6 +1089,43 @@ output on M-series; revisit only if a workload demands.
 
 ---
 
+## v0.12.0 — buffer-reuse + small-bw SIMD coverage
+
+Three perf wins on top of v0.11.0, addressing the largest remaining
+hot-spots from a profiling pass of a 22-query TPC-H bench:
+
+- **`ParquetFile::read_range_into(&mut Vec<u8>, offset, length)`** —
+  buffer reuse on the hot path. Callers pre-allocate one chunk
+  buffer per RG and reuse across column reads, eliminating the
+  per-call `Vec` alloc + zero-fill + drop-time
+  `madvise(MADV_DONTNEED)` that profiling showed dominated
+  10–15% of CPU on scan-heavy workloads. The existing `read_range`
+  delegates through a fresh `Vec`, so no breaking change.
+- **SIMD coverage for bw=2 / bw=3 raw-indices and bw=4 / bw=6 /
+  bw=8 fused-lookup** on both NEON and AVX2. Closes the
+  small-bit-width gap the const-generic scalar path was filling at
+  ~7–9 GB/s. bw=2 uses 4 parallel shift+mask streams interleaved
+  via `vzip` (NEON) / `_mm_unpacklo_epi8 + _mm_unpacklo/hi_epi16`
+  (AVX2); bw=3 uses per-lane TBL gather + variable right-shift;
+  the fused-lookup kernels follow the bw=12/14 staging-callback
+  pattern with a bounds-safe fast path when `dict_size` proves
+  every unpacked index fits.
+- **`decode_rle_dictionary_indices_into`** — append-only,
+  zero-alloc variant of the existing `Vec`-returning function.
+  Threaded through
+  `read_column_byte_array_dict_preserved_into` so a
+  ~50-data-page TPC-H lineitem chunk goes from 50 transient
+  `Vec<u32>` allocations to zero.
+
+Adds `crates/ematix-parquet-io/examples/rg_count.rs` — a small
+diagnostic that prints per-file rows + row-group counts.
+
+No breaking API changes.
+
+**Released as v0.12.0.**
+
+---
+
 ## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot

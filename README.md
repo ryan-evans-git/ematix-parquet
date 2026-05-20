@@ -6,13 +6,13 @@ Hand-tuned SIMD on AArch64 (NEON) and x86_64 (AVX2). Full read and write coverag
 
 ```toml
 [dependencies]
-ematix-parquet-codec = "0.11"
-ematix-parquet-io    = "0.11"
+ematix-parquet-codec = "0.12"
+ematix-parquet-io    = "0.12"
 ```
 
 ## Why
 
-- **Fast where it matters.** Dict-encoded numeric columns decode at 76–96 GB/s output through specialised SIMD kernels (bw=1, 4, 5, 8, 12, 14, 15, 16, 17, 18, 20, 21 on both NEON and AVX2). Predicate-fused decode collapses unpack + filter + bitmap pack into a single pass — 3.7–6.3× faster than materialise-then-filter at low selectivity.
+- **Fast where it matters.** Dict-encoded numeric columns decode at 76–96 GB/s output through specialised SIMD kernels (raw-indices: bw=1, 2, 3, 4, 5, 8, 12, 14, 15, 16, 17, 18, 20, 21 on both NEON and AVX2; fused unpack + dict-gather: bw=4, 6, 8, 12, 14, 16, 17). Predicate-fused decode collapses unpack + filter + bitmap pack into a single pass — 3.7–6.3× faster than materialise-then-filter at low selectivity.
 - **Complete on read and write.** Every physical type, every encoding (PLAIN, dict, DELTA_BINARY_PACKED, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT), every mainstream codec (Snappy, Zstd, Gzip, Brotli, LZ4_RAW), V1 + V2 pages, page indexes, bloom filters, Parquet Modular Encryption.
 - **Light footprint.** The sync read/write stack has no third-party deps beyond the chosen compression codecs. Async, encryption, and parallel decode are opt-in features that pull deps only when you ask for them.
 - **Built for engines.** Decode-into-caller-buffer APIs, late-materialization (`*_masked_into`), Arrow-style `(bytes, offsets)` BYTE_ARRAY shape, dict-preserving readers for direct `DictionaryArray` construction, streaming batched decode, adaptive runtime dispatch on observed selectivity, and parallel multi-row-group decode with NUMA-aware worker pinning on Linux.
@@ -88,6 +88,8 @@ read_column_byte_array_offsets_masked_into(
 
 **Per-column write options.** `write_table_with_options_to_path(path, columns, &WriteOptions { ... })` bundles row-group size, page version, default codec, plus per-column slices for codec, dict-encoding opt-in, and bloom-filter target FPP. Different columns in the same row group can use different codecs.
 
+**Buffer reuse on the hot path.** `ParquetFile::read_range_into(&mut Vec<u8>, offset, length)` lets callers pre-allocate one chunk buffer per row group and reuse it across column reads — eliminates the per-call alloc + zero-fill that dominates profiles of scan-heavy workloads.
+
 **Parquet Modular Encryption.** AES-GCM read + write for both PME modes (plaintext footer / encrypted footer) behind a default-off `encryption` feature.
 
 ## Crate layout
@@ -102,13 +104,11 @@ read_column_byte_array_offsets_masked_into(
 
 ## Testing
 
-~680 tests across 50+ test binaries. Oracle tests round-trip every codec × type combination against an independent Parquet implementation in both directions — anything we write, a reference reader reads; anything a reference writer writes, we read. Plus unit tests on bit-unpack, RLE, predicate fusion, page-index parsing, compact-protocol primitives, and the encrypted code paths.
+~700 tests across 50+ test binaries. Oracle tests round-trip every codec × type combination against an independent Parquet implementation in both directions — anything we write, a reference reader reads; anything a reference writer writes, we read. Plus unit tests on bit-unpack, RLE, predicate fusion, page-index parsing, compact-protocol primitives, and the encrypted code paths.
 
 ## Status
 
-`v0.11.x` — v1.0 cut criteria are met (every Parquet shape covered, predicate pushdown end-to-end, decode hot paths SIMD-tuned on both architectures). API is settling; pin by version range until v1.0.
-
-See [`docs/plans/CURRENT.md`](docs/plans/CURRENT.md) for the per-phase history and what's still open.
+v1.0 cut criteria are met: every Parquet shape covered, predicate pushdown end-to-end, decode hot paths SIMD-tuned on both architectures. API is settling; pin by version range until v1.0. See [crates.io](https://crates.io/crates/ematix-parquet-codec) for the latest version and [`docs/plans/CURRENT.md`](docs/plans/CURRENT.md) for the per-phase history and what's still open.
 
 ## Build
 

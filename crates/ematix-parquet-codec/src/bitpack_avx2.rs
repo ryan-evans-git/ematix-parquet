@@ -3236,3 +3236,149 @@ where
     }
     Ok(())
 }
+
+// ---- bw=6: raw-indices AVX2 ----------------------------------------
+//
+// Same per-lane geometry as NEON bw=6. AVX2 uses `_mm_srlv_epi32`
+// (positive right-shift amounts) and `_mm_shuffle_epi8` for the
+// shuffle tables.
+
+pub fn unpack_indices_into_avx2_bw6(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 6).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw6: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if packed.len() < 16 {
+        0
+    } else {
+        ((packed.len() - 10) / 6).min(full_blocks)
+    };
+
+    unsafe {
+        unpack_avx2_bw6_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 6 / 8..], remaining, 6, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw6_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5);
+    let shuffle_hi: __m128i = _mm_setr_epi8(3, 4, 5, 6, 3, 4, 5, 6, 4, 5, 6, 7, 5, 6, 7, 8);
+    let shifts: __m128i = _mm_setr_epi32(0, 6, 4, 2);
+    let mask: __m128i = _mm_set1_epi32(0x3F);
+
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    for blk in 0..full_blocks {
+        let v0: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let lo_b: __m128i = _mm_shuffle_epi8(v0, shuffle_lo);
+        let hi_b: __m128i = _mm_shuffle_epi8(v0, shuffle_hi);
+        let lo_shifted: __m128i = _mm_srlv_epi32(lo_b, shifts);
+        let hi_shifted: __m128i = _mm_srlv_epi32(hi_b, shifts);
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8) as *mut __m128i,
+            _mm_and_si128(lo_shifted, mask),
+        );
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8 + 4) as *mut __m128i,
+            _mm_and_si128(hi_shifted, mask),
+        );
+        src_ptr = src_ptr.add(6);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}
+
+// ---- bw=7: raw-indices AVX2 ----------------------------------------
+//
+// Same per-lane geometry as NEON bw=7. Lo + hi halves have different
+// shuffle tables and shift vectors (every lane has a distinct shift).
+
+pub fn unpack_indices_into_avx2_bw7(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 7).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw7: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if packed.len() < 16 {
+        0
+    } else {
+        ((packed.len() - 9) / 7).min(full_blocks)
+    };
+
+    unsafe {
+        unpack_avx2_bw7_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 7 / 8..], remaining, 7, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw7_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5);
+    let shuffle_hi: __m128i = _mm_setr_epi8(3, 4, 5, 6, 4, 5, 6, 7, 5, 6, 7, 8, 6, 7, 8, 9);
+    let shifts_lo: __m128i = _mm_setr_epi32(0, 7, 6, 5);
+    let shifts_hi: __m128i = _mm_setr_epi32(4, 3, 2, 1);
+    let mask: __m128i = _mm_set1_epi32(0x7F);
+
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    for blk in 0..full_blocks {
+        let v0: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let lo_b: __m128i = _mm_shuffle_epi8(v0, shuffle_lo);
+        let hi_b: __m128i = _mm_shuffle_epi8(v0, shuffle_hi);
+        let lo_shifted: __m128i = _mm_srlv_epi32(lo_b, shifts_lo);
+        let hi_shifted: __m128i = _mm_srlv_epi32(hi_b, shifts_hi);
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8) as *mut __m128i,
+            _mm_and_si128(lo_shifted, mask),
+        );
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8 + 4) as *mut __m128i,
+            _mm_and_si128(hi_shifted, mask),
+        );
+        src_ptr = src_ptr.add(7);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}

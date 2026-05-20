@@ -322,6 +322,39 @@ pub fn unpack_indices_into(
             21 => {
                 return crate::bitpack_neon::unpack_indices_into_neon_bw21(packed, num_values, out)
             }
+            22 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw22(packed, num_values, out)
+            }
+            23 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw23(packed, num_values, out)
+            }
+            24 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw24(packed, num_values, out)
+            }
+            25 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw25(packed, num_values, out)
+            }
+            26 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw26(packed, num_values, out)
+            }
+            27 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw27(packed, num_values, out)
+            }
+            28 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw28(packed, num_values, out)
+            }
+            29 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw29(packed, num_values, out)
+            }
+            30 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw30(packed, num_values, out)
+            }
+            31 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw31(packed, num_values, out)
+            }
+            32 => {
+                return crate::bitpack_neon::unpack_indices_into_neon_bw32(packed, num_values, out)
+            }
             _ => {}
         }
     }
@@ -435,6 +468,61 @@ pub fn unpack_indices_into(
                 }
                 21 => {
                     return crate::bitpack_avx2::unpack_indices_into_avx2_bw21(
+                        packed, num_values, out,
+                    )
+                }
+                22 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw22(
+                        packed, num_values, out,
+                    )
+                }
+                23 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw23(
+                        packed, num_values, out,
+                    )
+                }
+                24 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw24(
+                        packed, num_values, out,
+                    )
+                }
+                25 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw25(
+                        packed, num_values, out,
+                    )
+                }
+                26 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw26(
+                        packed, num_values, out,
+                    )
+                }
+                27 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw27(
+                        packed, num_values, out,
+                    )
+                }
+                28 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw28(
+                        packed, num_values, out,
+                    )
+                }
+                29 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw29(
+                        packed, num_values, out,
+                    )
+                }
+                30 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw30(
+                        packed, num_values, out,
+                    )
+                }
+                31 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw31(
+                        packed, num_values, out,
+                    )
+                }
+                32 => {
+                    return crate::bitpack_avx2::unpack_indices_into_avx2_bw32(
                         packed, num_values, out,
                     )
                 }

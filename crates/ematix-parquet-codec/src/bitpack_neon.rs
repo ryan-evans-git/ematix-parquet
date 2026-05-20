@@ -4489,3 +4489,375 @@ unsafe fn unpack_neon_bw19_unchecked(packed: &[u8], full_blocks: usize, out: &mu
     }
     out.set_len(out_start_len + full_blocks * 8);
 }
+
+// ============================================================
+// bw=22..32: wide widths. Per-block geometry pre-tabulated by
+// `start_bit = lane * bw`, `start_byte = start_bit / 8`,
+// `bit_off = start_bit % 8`.
+//
+// For bw=22..25 each value fits in a 4-byte little-endian u32
+// window (max 25 + 7 = 32 bits). For bw=26..31 the value can span
+// 5 bytes, so we gather 8 bytes per lane into a u64 staging buffer.
+// bw=32 is byte-aligned (no shift / no mask).
+//
+// Dict sizes that need these widths exceed 2M distinct values;
+// rare in practice but the kernels close the SIMD specialisation
+// table so the const-generic scalar path is never the only option.
+// ============================================================
+
+#[inline]
+fn read_u32_le_at(packed: &[u8], off: usize) -> u32 {
+    let b0 = packed[off] as u32;
+    let b1 = packed[off + 1] as u32;
+    let b2 = packed[off + 2] as u32;
+    let b3 = packed[off + 3] as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+#[inline]
+fn read_u64_le_at(packed: &[u8], off: usize) -> u64 {
+    let mut acc: u64 = 0;
+    for i in 0..8 {
+        acc |= (packed[off + i] as u64) << (i * 8);
+    }
+    acc
+}
+
+// ---- bw=22..25: u32 staging ----------------------------------------
+
+macro_rules! neon_wide_u32_kernel {
+    ($pubfn:ident, $unchecked:ident, $bw:literal, $offsets:expr, $shifts:expr, $mask:literal, $block_bytes:literal) => {
+        pub fn $pubfn(packed: &[u8], num_values: usize, out: &mut Vec<u32>) -> Result<()> {
+            if num_values == 0 {
+                return Ok(());
+            }
+            let required_bytes = (num_values * $bw).div_ceil(8);
+            if packed.len() < required_bytes {
+                return Err(CodecError::Decompress(format!(
+                    concat!("neon bw", stringify!($bw), ": packed has {} bytes, need {}"),
+                    packed.len(),
+                    required_bytes
+                )));
+            }
+            out.reserve(num_values);
+            let full_blocks = num_values / 8;
+            // Last lane reads [start_byte + 4], so the final block needs
+            // start_byte_of_last_lane + 4 bytes available. Compute:
+            // max_byte_per_block = last_lane_start + 4.
+            let offsets: [usize; 8] = $offsets;
+            let max_read_per_block = offsets[7] + 4;
+            let safe_full_blocks = if full_blocks == 0 {
+                0
+            } else if packed.len() >= $block_bytes * (full_blocks - 1) + max_read_per_block {
+                full_blocks
+            } else {
+                full_blocks - 1
+            };
+            unsafe {
+                $unchecked(packed, safe_full_blocks, out);
+            }
+            let processed = safe_full_blocks * 8;
+            let remaining = num_values - processed;
+            if remaining > 0 {
+                scalar_bw_n(&packed[processed * $bw / 8..], remaining, $bw, out);
+            }
+            Ok(())
+        }
+
+        #[inline]
+        #[target_feature(enable = "neon")]
+        unsafe fn $unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+            use std::arch::aarch64::*;
+            let offsets: [usize; 8] = $offsets;
+            let shifts: [i32; 8] = $shifts;
+            let mask_v: uint32x4_t = vdupq_n_u32($mask as u32);
+            let shifts_lo: int32x4_t = vld1q_s32(shifts[0..4].as_ptr());
+            let shifts_hi: int32x4_t = vld1q_s32(shifts[4..8].as_ptr());
+
+            let mut src_ptr = packed.as_ptr();
+            let out_start_len = out.len();
+            let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+            for blk in 0..full_blocks {
+                let lane0 = read_u32_le_at(
+                    std::slice::from_raw_parts(src_ptr, offsets[7] + 4),
+                    offsets[0],
+                );
+                let lane1 = read_u32_le_at(
+                    std::slice::from_raw_parts(src_ptr, offsets[7] + 4),
+                    offsets[1],
+                );
+                let lane2 = read_u32_le_at(
+                    std::slice::from_raw_parts(src_ptr, offsets[7] + 4),
+                    offsets[2],
+                );
+                let lane3 = read_u32_le_at(
+                    std::slice::from_raw_parts(src_ptr, offsets[7] + 4),
+                    offsets[3],
+                );
+                let lane4 = read_u32_le_at(
+                    std::slice::from_raw_parts(src_ptr, offsets[7] + 4),
+                    offsets[4],
+                );
+                let lane5 = read_u32_le_at(
+                    std::slice::from_raw_parts(src_ptr, offsets[7] + 4),
+                    offsets[5],
+                );
+                let lane6 = read_u32_le_at(
+                    std::slice::from_raw_parts(src_ptr, offsets[7] + 4),
+                    offsets[6],
+                );
+                let lane7 = read_u32_le_at(
+                    std::slice::from_raw_parts(src_ptr, offsets[7] + 4),
+                    offsets[7],
+                );
+                let lo_arr: [u32; 4] = [lane0, lane1, lane2, lane3];
+                let hi_arr: [u32; 4] = [lane4, lane5, lane6, lane7];
+                let lo: uint32x4_t = vld1q_u32(lo_arr.as_ptr());
+                let hi: uint32x4_t = vld1q_u32(hi_arr.as_ptr());
+                let lo_shifted =
+                    vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(lo), shifts_lo));
+                let hi_shifted =
+                    vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(hi), shifts_hi));
+                vst1q_u32(out_ptr.add(blk * 8), vandq_u32(lo_shifted, mask_v));
+                vst1q_u32(out_ptr.add(blk * 8 + 4), vandq_u32(hi_shifted, mask_v));
+                src_ptr = src_ptr.add($block_bytes);
+            }
+            out.set_len(out_start_len + full_blocks * 8);
+        }
+    };
+}
+
+// Per-width tables: offsets are start_byte_per_lane; shifts are
+// -bit_off_per_lane (negative for vshlq_s32 right-shift).
+neon_wide_u32_kernel!(
+    unpack_indices_into_neon_bw22,
+    unpack_neon_bw22_unchecked,
+    22,
+    [0, 2, 5, 8, 11, 13, 16, 19],
+    [0, -6, -4, -2, 0, -6, -4, -2],
+    0x3F_FFFF,
+    22
+);
+neon_wide_u32_kernel!(
+    unpack_indices_into_neon_bw23,
+    unpack_neon_bw23_unchecked,
+    23,
+    [0, 2, 5, 8, 11, 14, 17, 20],
+    [0, -7, -6, -5, -4, -3, -2, -1],
+    0x7F_FFFF,
+    23
+);
+neon_wide_u32_kernel!(
+    unpack_indices_into_neon_bw24,
+    unpack_neon_bw24_unchecked,
+    24,
+    [0, 3, 6, 9, 12, 15, 18, 21],
+    [0, 0, 0, 0, 0, 0, 0, 0],
+    0xFF_FFFF,
+    24
+);
+neon_wide_u32_kernel!(
+    unpack_indices_into_neon_bw25,
+    unpack_neon_bw25_unchecked,
+    25,
+    [0, 3, 6, 9, 12, 15, 18, 21],
+    [0, -1, -2, -3, -4, -5, -6, -7],
+    0x1FF_FFFF,
+    25
+);
+
+// ---- bw=26..31: u64 staging ----------------------------------------
+//
+// A 26-bit value at bit_off=7 spans 5 source bytes (33 bits). u32 can't
+// hold it; we gather 8 bytes per lane into a u64 staging buffer, do
+// the shift + mask in 64-bit lanes, then narrow back to u32 on store.
+
+macro_rules! neon_wide_u64_kernel {
+    ($pubfn:ident, $unchecked:ident, $bw:literal, $offsets:expr, $shifts:expr, $mask:literal, $block_bytes:literal) => {
+        pub fn $pubfn(packed: &[u8], num_values: usize, out: &mut Vec<u32>) -> Result<()> {
+            if num_values == 0 {
+                return Ok(());
+            }
+            let required_bytes = (num_values * $bw).div_ceil(8);
+            if packed.len() < required_bytes {
+                return Err(CodecError::Decompress(format!(
+                    concat!("neon bw", stringify!($bw), ": packed has {} bytes, need {}"),
+                    packed.len(),
+                    required_bytes
+                )));
+            }
+            out.reserve(num_values);
+            let full_blocks = num_values / 8;
+            let offsets: [usize; 8] = $offsets;
+            let max_read_per_block = offsets[7] + 8;
+            let safe_full_blocks = if full_blocks == 0 {
+                0
+            } else if packed.len() >= $block_bytes * (full_blocks - 1) + max_read_per_block {
+                full_blocks
+            } else {
+                full_blocks - 1
+            };
+            unsafe {
+                $unchecked(packed, safe_full_blocks, out);
+            }
+            let processed = safe_full_blocks * 8;
+            let remaining = num_values - processed;
+            if remaining > 0 {
+                scalar_bw_n(&packed[processed * $bw / 8..], remaining, $bw, out);
+            }
+            Ok(())
+        }
+
+        #[inline]
+        #[target_feature(enable = "neon")]
+        unsafe fn $unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+            use std::arch::aarch64::*;
+            let offsets: [usize; 8] = $offsets;
+            let shifts: [i64; 8] = $shifts;
+            let mask_v: uint64x2_t = vdupq_n_u64($mask as u64);
+            let shifts_0: int64x2_t = vld1q_s64(shifts[0..2].as_ptr());
+            let shifts_1: int64x2_t = vld1q_s64(shifts[2..4].as_ptr());
+            let shifts_2: int64x2_t = vld1q_s64(shifts[4..6].as_ptr());
+            let shifts_3: int64x2_t = vld1q_s64(shifts[6..8].as_ptr());
+
+            let mut src_ptr = packed.as_ptr();
+            let out_start_len = out.len();
+            let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+            for blk in 0..full_blocks {
+                let region = std::slice::from_raw_parts(src_ptr, offsets[7] + 8);
+                let mut staging = [0u64; 8];
+                for lane in 0..8 {
+                    staging[lane] = read_u64_le_at(region, offsets[lane]);
+                }
+                let v0: uint64x2_t = vld1q_u64(staging[0..2].as_ptr());
+                let v1: uint64x2_t = vld1q_u64(staging[2..4].as_ptr());
+                let v2: uint64x2_t = vld1q_u64(staging[4..6].as_ptr());
+                let v3: uint64x2_t = vld1q_u64(staging[6..8].as_ptr());
+                let s0 = vreinterpretq_u64_s64(vshlq_s64(vreinterpretq_s64_u64(v0), shifts_0));
+                let s1 = vreinterpretq_u64_s64(vshlq_s64(vreinterpretq_s64_u64(v1), shifts_1));
+                let s2 = vreinterpretq_u64_s64(vshlq_s64(vreinterpretq_s64_u64(v2), shifts_2));
+                let s3 = vreinterpretq_u64_s64(vshlq_s64(vreinterpretq_s64_u64(v3), shifts_3));
+                let m0 = vandq_u64(s0, mask_v);
+                let m1 = vandq_u64(s1, mask_v);
+                let m2 = vandq_u64(s2, mask_v);
+                let m3 = vandq_u64(s3, mask_v);
+                // Narrow each pair of u64 lanes to u32 and write 8 outputs.
+                vst1q_u64(staging[0..2].as_mut_ptr(), m0);
+                vst1q_u64(staging[2..4].as_mut_ptr(), m1);
+                vst1q_u64(staging[4..6].as_mut_ptr(), m2);
+                vst1q_u64(staging[6..8].as_mut_ptr(), m3);
+                for lane in 0..8 {
+                    *out_ptr.add(blk * 8 + lane) = staging[lane] as u32;
+                }
+                src_ptr = src_ptr.add($block_bytes);
+            }
+            out.set_len(out_start_len + full_blocks * 8);
+        }
+    };
+}
+
+neon_wide_u64_kernel!(
+    unpack_indices_into_neon_bw26,
+    unpack_neon_bw26_unchecked,
+    26,
+    [0, 3, 6, 9, 13, 16, 19, 22],
+    [0, -2, -4, -6, 0, -2, -4, -6],
+    0x3FF_FFFF,
+    26
+);
+neon_wide_u64_kernel!(
+    unpack_indices_into_neon_bw27,
+    unpack_neon_bw27_unchecked,
+    27,
+    [0, 3, 6, 10, 13, 16, 20, 23],
+    [0, -3, -6, -1, -4, -7, -2, -5],
+    0x7FF_FFFF,
+    27
+);
+neon_wide_u64_kernel!(
+    unpack_indices_into_neon_bw28,
+    unpack_neon_bw28_unchecked,
+    28,
+    [0, 3, 7, 10, 14, 17, 21, 24],
+    [0, -4, 0, -4, 0, -4, 0, -4],
+    0xFFF_FFFF,
+    28
+);
+neon_wide_u64_kernel!(
+    unpack_indices_into_neon_bw29,
+    unpack_neon_bw29_unchecked,
+    29,
+    [0, 3, 7, 10, 14, 18, 21, 25],
+    [0, -5, -2, -7, -4, -1, -6, -3],
+    0x1FFF_FFFF,
+    29
+);
+neon_wide_u64_kernel!(
+    unpack_indices_into_neon_bw30,
+    unpack_neon_bw30_unchecked,
+    30,
+    [0, 3, 7, 11, 15, 18, 22, 26],
+    [0, -6, -4, -2, 0, -6, -4, -2],
+    0x3FFF_FFFF,
+    30
+);
+neon_wide_u64_kernel!(
+    unpack_indices_into_neon_bw31,
+    unpack_neon_bw31_unchecked,
+    31,
+    [0, 3, 7, 11, 15, 19, 23, 27],
+    [0, -7, -6, -5, -4, -3, -2, -1],
+    0x7FFF_FFFF,
+    31
+);
+
+// ---- bw=32: byte-aligned trivial copy ------------------------------
+
+pub fn unpack_indices_into_neon_bw32(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = num_values * 4;
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "neon bw32: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 8;
+    // Each block reads exactly 32 bytes, no over-read.
+    unsafe {
+        unpack_neon_bw32_unchecked(packed, full_blocks, out);
+    }
+    let processed = full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 4..], remaining, 32, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn unpack_neon_bw32_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::aarch64::*;
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+    for blk in 0..full_blocks {
+        // Two 16-byte loads = 8 u32 values, byte-aligned.
+        let v0 = vld1q_u32(src_ptr as *const u32);
+        let v1 = vld1q_u32(src_ptr.add(16) as *const u32);
+        vst1q_u32(out_ptr.add(blk * 8), v0);
+        vst1q_u32(out_ptr.add(blk * 8 + 4), v1);
+        src_ptr = src_ptr.add(32);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}

@@ -3737,3 +3737,311 @@ unsafe fn unpack_avx2_bw19_unchecked(packed: &[u8], full_blocks: usize, out: &mu
     }
     out.set_len(out_start_len + full_blocks * 8);
 }
+
+// ============================================================
+// bw=22..32: wide-bit-width raw-indices AVX2 kernels. Mirror of the
+// NEON wide-bw kernels — scalar gather per lane into a staging buffer
+// (u32 for bw=22..25, u64 for bw=26..31, byte-aligned u32 for bw=32),
+// SIMD shift + mask, store.
+// ============================================================
+
+#[inline]
+fn read_u32_le_at_avx2(packed: &[u8], off: usize) -> u32 {
+    let b0 = packed[off] as u32;
+    let b1 = packed[off + 1] as u32;
+    let b2 = packed[off + 2] as u32;
+    let b3 = packed[off + 3] as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+#[inline]
+fn read_u64_le_at_avx2(packed: &[u8], off: usize) -> u64 {
+    let mut acc: u64 = 0;
+    for i in 0..8 {
+        acc |= (packed[off + i] as u64) << (i * 8);
+    }
+    acc
+}
+
+macro_rules! avx2_wide_u32_kernel {
+    ($pubfn:ident, $unchecked:ident, $bw:literal, $offsets:expr, $shifts:expr, $mask:literal, $block_bytes:literal) => {
+        pub fn $pubfn(packed: &[u8], num_values: usize, out: &mut Vec<u32>) -> Result<()> {
+            if num_values == 0 {
+                return Ok(());
+            }
+            let required_bytes = (num_values * $bw).div_ceil(8);
+            if packed.len() < required_bytes {
+                return Err(CodecError::Decompress(format!(
+                    concat!("avx2 bw", stringify!($bw), ": packed has {} bytes, need {}"),
+                    packed.len(),
+                    required_bytes
+                )));
+            }
+            out.reserve(num_values);
+            let full_blocks = num_values / 8;
+            let offsets: [usize; 8] = $offsets;
+            let max_read_per_block = offsets[7] + 4;
+            let safe_full_blocks = if full_blocks == 0 {
+                0
+            } else if packed.len() >= $block_bytes * (full_blocks - 1) + max_read_per_block {
+                full_blocks
+            } else {
+                full_blocks - 1
+            };
+            unsafe {
+                $unchecked(packed, safe_full_blocks, out);
+            }
+            let processed = safe_full_blocks * 8;
+            let remaining = num_values - processed;
+            if remaining > 0 {
+                scalar_bw_n(&packed[processed * $bw / 8..], remaining, $bw, out);
+            }
+            Ok(())
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn $unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+            use std::arch::x86_64::*;
+            let offsets: [usize; 8] = $offsets;
+            let shifts_arr: [u32; 8] = $shifts;
+            let mask_v: __m256i = _mm256_set1_epi32($mask as i32);
+            let shifts_v: __m256i = _mm256_loadu_si256(shifts_arr.as_ptr() as *const __m256i);
+
+            let mut src_ptr = packed.as_ptr();
+            let out_start_len = out.len();
+            let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+            for blk in 0..full_blocks {
+                let region = std::slice::from_raw_parts(src_ptr, offsets[7] + 4);
+                let mut staging = [0u32; 8];
+                for lane in 0..8 {
+                    staging[lane] = read_u32_le_at_avx2(region, offsets[lane]);
+                }
+                let v: __m256i = _mm256_loadu_si256(staging.as_ptr() as *const __m256i);
+                let shifted: __m256i = _mm256_srlv_epi32(v, shifts_v);
+                let masked: __m256i = _mm256_and_si256(shifted, mask_v);
+                _mm256_storeu_si256(out_ptr.add(blk * 8) as *mut __m256i, masked);
+                src_ptr = src_ptr.add($block_bytes);
+            }
+            out.set_len(out_start_len + full_blocks * 8);
+        }
+    };
+}
+
+avx2_wide_u32_kernel!(
+    unpack_indices_into_avx2_bw22,
+    unpack_avx2_bw22_unchecked,
+    22,
+    [0, 2, 5, 8, 11, 13, 16, 19],
+    [0, 6, 4, 2, 0, 6, 4, 2],
+    0x3F_FFFF,
+    22
+);
+avx2_wide_u32_kernel!(
+    unpack_indices_into_avx2_bw23,
+    unpack_avx2_bw23_unchecked,
+    23,
+    [0, 2, 5, 8, 11, 14, 17, 20],
+    [0, 7, 6, 5, 4, 3, 2, 1],
+    0x7F_FFFF,
+    23
+);
+avx2_wide_u32_kernel!(
+    unpack_indices_into_avx2_bw24,
+    unpack_avx2_bw24_unchecked,
+    24,
+    [0, 3, 6, 9, 12, 15, 18, 21],
+    [0, 0, 0, 0, 0, 0, 0, 0],
+    0xFF_FFFF,
+    24
+);
+avx2_wide_u32_kernel!(
+    unpack_indices_into_avx2_bw25,
+    unpack_avx2_bw25_unchecked,
+    25,
+    [0, 3, 6, 9, 12, 15, 18, 21],
+    [0, 1, 2, 3, 4, 5, 6, 7],
+    0x1FF_FFFF,
+    25
+);
+
+// ---- bw=26..31: u64 staging + 64-bit-lane SIMD ---------------------
+
+macro_rules! avx2_wide_u64_kernel {
+    ($pubfn:ident, $unchecked:ident, $bw:literal, $offsets:expr, $shifts:expr, $mask:literal, $block_bytes:literal) => {
+        pub fn $pubfn(packed: &[u8], num_values: usize, out: &mut Vec<u32>) -> Result<()> {
+            if num_values == 0 {
+                return Ok(());
+            }
+            let required_bytes = (num_values * $bw).div_ceil(8);
+            if packed.len() < required_bytes {
+                return Err(CodecError::Decompress(format!(
+                    concat!("avx2 bw", stringify!($bw), ": packed has {} bytes, need {}"),
+                    packed.len(),
+                    required_bytes
+                )));
+            }
+            out.reserve(num_values);
+            let full_blocks = num_values / 8;
+            let offsets: [usize; 8] = $offsets;
+            let max_read_per_block = offsets[7] + 8;
+            let safe_full_blocks = if full_blocks == 0 {
+                0
+            } else if packed.len() >= $block_bytes * (full_blocks - 1) + max_read_per_block {
+                full_blocks
+            } else {
+                full_blocks - 1
+            };
+            unsafe {
+                $unchecked(packed, safe_full_blocks, out);
+            }
+            let processed = safe_full_blocks * 8;
+            let remaining = num_values - processed;
+            if remaining > 0 {
+                scalar_bw_n(&packed[processed * $bw / 8..], remaining, $bw, out);
+            }
+            Ok(())
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn $unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+            use std::arch::x86_64::*;
+            let offsets: [usize; 8] = $offsets;
+            let shifts_arr: [u64; 8] = $shifts;
+            let mask_v: __m256i = _mm256_set1_epi64x($mask as i64);
+            let shifts_lo: __m256i =
+                _mm256_loadu_si256(shifts_arr[0..4].as_ptr() as *const __m256i);
+            let shifts_hi: __m256i =
+                _mm256_loadu_si256(shifts_arr[4..8].as_ptr() as *const __m256i);
+
+            let mut src_ptr = packed.as_ptr();
+            let out_start_len = out.len();
+            let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+            for blk in 0..full_blocks {
+                let region = std::slice::from_raw_parts(src_ptr, offsets[7] + 8);
+                let mut staging = [0u64; 8];
+                for lane in 0..8 {
+                    staging[lane] = read_u64_le_at_avx2(region, offsets[lane]);
+                }
+                let v_lo: __m256i = _mm256_loadu_si256(staging[0..4].as_ptr() as *const __m256i);
+                let v_hi: __m256i = _mm256_loadu_si256(staging[4..8].as_ptr() as *const __m256i);
+                let s_lo: __m256i = _mm256_srlv_epi64(v_lo, shifts_lo);
+                let s_hi: __m256i = _mm256_srlv_epi64(v_hi, shifts_hi);
+                let m_lo: __m256i = _mm256_and_si256(s_lo, mask_v);
+                let m_hi: __m256i = _mm256_and_si256(s_hi, mask_v);
+                // Narrow to u32: store as u64 then extract low 32 bits.
+                _mm256_storeu_si256(staging[0..4].as_mut_ptr() as *mut __m256i, m_lo);
+                _mm256_storeu_si256(staging[4..8].as_mut_ptr() as *mut __m256i, m_hi);
+                for lane in 0..8 {
+                    *out_ptr.add(blk * 8 + lane) = staging[lane] as u32;
+                }
+                src_ptr = src_ptr.add($block_bytes);
+            }
+            out.set_len(out_start_len + full_blocks * 8);
+        }
+    };
+}
+
+avx2_wide_u64_kernel!(
+    unpack_indices_into_avx2_bw26,
+    unpack_avx2_bw26_unchecked,
+    26,
+    [0, 3, 6, 9, 13, 16, 19, 22],
+    [0, 2, 4, 6, 0, 2, 4, 6],
+    0x3FF_FFFF,
+    26
+);
+avx2_wide_u64_kernel!(
+    unpack_indices_into_avx2_bw27,
+    unpack_avx2_bw27_unchecked,
+    27,
+    [0, 3, 6, 10, 13, 16, 20, 23],
+    [0, 3, 6, 1, 4, 7, 2, 5],
+    0x7FF_FFFF,
+    27
+);
+avx2_wide_u64_kernel!(
+    unpack_indices_into_avx2_bw28,
+    unpack_avx2_bw28_unchecked,
+    28,
+    [0, 3, 7, 10, 14, 17, 21, 24],
+    [0, 4, 0, 4, 0, 4, 0, 4],
+    0xFFF_FFFF,
+    28
+);
+avx2_wide_u64_kernel!(
+    unpack_indices_into_avx2_bw29,
+    unpack_avx2_bw29_unchecked,
+    29,
+    [0, 3, 7, 10, 14, 18, 21, 25],
+    [0, 5, 2, 7, 4, 1, 6, 3],
+    0x1FFF_FFFF,
+    29
+);
+avx2_wide_u64_kernel!(
+    unpack_indices_into_avx2_bw30,
+    unpack_avx2_bw30_unchecked,
+    30,
+    [0, 3, 7, 11, 15, 18, 22, 26],
+    [0, 6, 4, 2, 0, 6, 4, 2],
+    0x3FFF_FFFF,
+    30
+);
+avx2_wide_u64_kernel!(
+    unpack_indices_into_avx2_bw31,
+    unpack_avx2_bw31_unchecked,
+    31,
+    [0, 3, 7, 11, 15, 19, 23, 27],
+    [0, 7, 6, 5, 4, 3, 2, 1],
+    0x7FFF_FFFF,
+    31
+);
+
+// ---- bw=32: byte-aligned trivial copy ------------------------------
+
+pub fn unpack_indices_into_avx2_bw32(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = num_values * 4;
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw32: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 8;
+    unsafe {
+        unpack_avx2_bw32_unchecked(packed, full_blocks, out);
+    }
+    let processed = full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 4..], remaining, 32, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw32_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+    for blk in 0..full_blocks {
+        // One 256-bit load = 8 u32 values, byte-aligned.
+        let v: __m256i = _mm256_loadu_si256(src_ptr as *const __m256i);
+        _mm256_storeu_si256(out_ptr.add(blk * 8) as *mut __m256i, v);
+        src_ptr = src_ptr.add(32);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}

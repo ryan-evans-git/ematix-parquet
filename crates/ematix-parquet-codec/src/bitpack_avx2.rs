@@ -3382,3 +3382,358 @@ unsafe fn unpack_avx2_bw7_unchecked(packed: &[u8], full_blocks: usize, out: &mut
     }
     out.set_len(out_start_len + full_blocks * 8);
 }
+
+// ---- bw=9: raw-indices AVX2 ----------------------------------------
+
+pub fn unpack_indices_into_avx2_bw9(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 9).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw9: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if packed.len() < 16 {
+        0
+    } else {
+        ((packed.len() - 7) / 9).min(full_blocks)
+    };
+
+    unsafe {
+        unpack_avx2_bw9_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 9 / 8..], remaining, 9, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw9_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6);
+    let shuffle_hi: __m128i = _mm_setr_epi8(4, 5, 6, 7, 5, 6, 7, 8, 6, 7, 8, 9, 7, 8, 9, 10);
+    let shifts_lo: __m128i = _mm_setr_epi32(0, 1, 2, 3);
+    let shifts_hi: __m128i = _mm_setr_epi32(4, 5, 6, 7);
+    let mask: __m128i = _mm_set1_epi32(0x1FF);
+
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    for blk in 0..full_blocks {
+        let v0: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let lo_b: __m128i = _mm_shuffle_epi8(v0, shuffle_lo);
+        let hi_b: __m128i = _mm_shuffle_epi8(v0, shuffle_hi);
+        let lo_shifted: __m128i = _mm_srlv_epi32(lo_b, shifts_lo);
+        let hi_shifted: __m128i = _mm_srlv_epi32(hi_b, shifts_hi);
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8) as *mut __m128i,
+            _mm_and_si128(lo_shifted, mask),
+        );
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8 + 4) as *mut __m128i,
+            _mm_and_si128(hi_shifted, mask),
+        );
+        src_ptr = src_ptr.add(9);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}
+
+// ---- bw=10: raw-indices AVX2 ---------------------------------------
+
+pub fn unpack_indices_into_avx2_bw10(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 10).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw10: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if packed.len() < 16 {
+        0
+    } else {
+        ((packed.len() - 6) / 10).min(full_blocks)
+    };
+
+    unsafe {
+        unpack_avx2_bw10_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 10 / 8..], remaining, 10, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw10_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6);
+    let shuffle_hi: __m128i = _mm_setr_epi8(5, 6, 7, 8, 6, 7, 8, 9, 7, 8, 9, 10, 8, 9, 10, 11);
+    let shifts: __m128i = _mm_setr_epi32(0, 2, 4, 6);
+    let mask: __m128i = _mm_set1_epi32(0x3FF);
+
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    for blk in 0..full_blocks {
+        let v0: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let lo_b: __m128i = _mm_shuffle_epi8(v0, shuffle_lo);
+        let hi_b: __m128i = _mm_shuffle_epi8(v0, shuffle_hi);
+        let lo_shifted: __m128i = _mm_srlv_epi32(lo_b, shifts);
+        let hi_shifted: __m128i = _mm_srlv_epi32(hi_b, shifts);
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8) as *mut __m128i,
+            _mm_and_si128(lo_shifted, mask),
+        );
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8 + 4) as *mut __m128i,
+            _mm_and_si128(hi_shifted, mask),
+        );
+        src_ptr = src_ptr.add(10);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}
+
+// ---- bw=11: raw-indices AVX2 ---------------------------------------
+
+pub fn unpack_indices_into_avx2_bw11(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 11).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw11: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if packed.len() < 16 {
+        0
+    } else {
+        ((packed.len() - 5) / 11).min(full_blocks)
+    };
+
+    unsafe {
+        unpack_avx2_bw11_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 11 / 8..], remaining, 11, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw11_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 4, 5, 6, 7);
+    let shuffle_hi: __m128i = _mm_setr_epi8(5, 6, 7, 8, 6, 7, 8, 9, 8, 9, 10, 11, 9, 10, 11, 12);
+    let shifts_lo: __m128i = _mm_setr_epi32(0, 3, 6, 1);
+    let shifts_hi: __m128i = _mm_setr_epi32(4, 7, 2, 5);
+    let mask: __m128i = _mm_set1_epi32(0x7FF);
+
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    for blk in 0..full_blocks {
+        let v0: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let lo_b: __m128i = _mm_shuffle_epi8(v0, shuffle_lo);
+        let hi_b: __m128i = _mm_shuffle_epi8(v0, shuffle_hi);
+        let lo_shifted: __m128i = _mm_srlv_epi32(lo_b, shifts_lo);
+        let hi_shifted: __m128i = _mm_srlv_epi32(hi_b, shifts_hi);
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8) as *mut __m128i,
+            _mm_and_si128(lo_shifted, mask),
+        );
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8 + 4) as *mut __m128i,
+            _mm_and_si128(hi_shifted, mask),
+        );
+        src_ptr = src_ptr.add(11);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}
+
+// ---- bw=13: raw-indices AVX2 ---------------------------------------
+
+pub fn unpack_indices_into_avx2_bw13(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 13).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw13: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if packed.len() < 16 {
+        0
+    } else {
+        ((packed.len() - 3) / 13).min(full_blocks)
+    };
+
+    unsafe {
+        unpack_avx2_bw13_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 13 / 8..], remaining, 13, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw13_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 1, 2, 3, 4, 3, 4, 5, 6, 4, 5, 6, 7);
+    let shuffle_hi: __m128i =
+        _mm_setr_epi8(6, 7, 8, 9, 8, 9, 10, 11, 9, 10, 11, 12, 11, 12, 13, 14);
+    let shifts_lo: __m128i = _mm_setr_epi32(0, 5, 2, 7);
+    let shifts_hi: __m128i = _mm_setr_epi32(4, 1, 6, 3);
+    let mask: __m128i = _mm_set1_epi32(0x1FFF);
+
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    for blk in 0..full_blocks {
+        let v0: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let lo_b: __m128i = _mm_shuffle_epi8(v0, shuffle_lo);
+        let hi_b: __m128i = _mm_shuffle_epi8(v0, shuffle_hi);
+        let lo_shifted: __m128i = _mm_srlv_epi32(lo_b, shifts_lo);
+        let hi_shifted: __m128i = _mm_srlv_epi32(hi_b, shifts_hi);
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8) as *mut __m128i,
+            _mm_and_si128(lo_shifted, mask),
+        );
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8 + 4) as *mut __m128i,
+            _mm_and_si128(hi_shifted, mask),
+        );
+        src_ptr = src_ptr.add(13);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}
+
+// ---- bw=19: raw-indices AVX2 ---------------------------------------
+
+pub fn unpack_indices_into_avx2_bw19(
+    packed: &[u8],
+    num_values: usize,
+    out: &mut Vec<u32>,
+) -> Result<()> {
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 19).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw19: packed has {} bytes, need {required_bytes}",
+            packed.len()
+        )));
+    }
+    out.reserve(num_values);
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 19 * (full_blocks - 1) + 25 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    unsafe {
+        unpack_avx2_bw19_unchecked(packed, safe_full_blocks, out);
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        scalar_bw_n(&packed[processed * 19 / 8..], remaining, 19, out);
+    }
+    Ok(())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_avx2_bw19_unchecked(packed: &[u8], full_blocks: usize, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    // Lo lanes from v0 = packed[0..16]: start bytes [0, 2, 4, 7].
+    let shuffle_lo: __m128i = _mm_setr_epi8(0, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 7, 8, 9, 10);
+    // Hi lanes from v1 = packed[9..25]: start bytes within v1 [0, 2, 5, 7].
+    let shuffle_hi: __m128i = _mm_setr_epi8(0, 1, 2, 3, 2, 3, 4, 5, 5, 6, 7, 8, 7, 8, 9, 10);
+    let shifts_lo: __m128i = _mm_setr_epi32(0, 3, 6, 1);
+    let shifts_hi: __m128i = _mm_setr_epi32(4, 7, 2, 5);
+    let mask: __m128i = _mm_set1_epi32(0x7_FFFF);
+
+    let mut src_ptr = packed.as_ptr();
+    let out_start_len = out.len();
+    let out_ptr = out.as_mut_ptr().add(out_start_len);
+
+    for blk in 0..full_blocks {
+        let v0: __m128i = _mm_loadu_si128(src_ptr as *const __m128i);
+        let v1: __m128i = _mm_loadu_si128(src_ptr.add(9) as *const __m128i);
+        let lo_b: __m128i = _mm_shuffle_epi8(v0, shuffle_lo);
+        let hi_b: __m128i = _mm_shuffle_epi8(v1, shuffle_hi);
+        let lo_shifted: __m128i = _mm_srlv_epi32(lo_b, shifts_lo);
+        let hi_shifted: __m128i = _mm_srlv_epi32(hi_b, shifts_hi);
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8) as *mut __m128i,
+            _mm_and_si128(lo_shifted, mask),
+        );
+        _mm_storeu_si128(
+            out_ptr.add(blk * 8 + 4) as *mut __m128i,
+            _mm_and_si128(hi_shifted, mask),
+        );
+        src_ptr = src_ptr.add(19);
+    }
+    out.set_len(out_start_len + full_blocks * 8);
+}

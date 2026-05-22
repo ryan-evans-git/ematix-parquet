@@ -214,8 +214,7 @@ pub fn read_column_byte_array_masked_into(
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
-                let page_n = info.num_values;
+                let page_n = data_page_num_values(&hdr)?;
                 let matched_in_page = popcount_mask_range(mask, row_cursor, row_cursor + page_n);
                 if matched_in_page == 0 {
                     row_cursor += page_n;
@@ -224,6 +223,7 @@ pub fn read_column_byte_array_masked_into(
                     }
                     continue;
                 }
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode_byte_array_into(
@@ -313,8 +313,7 @@ pub fn read_column_byte_array_offsets_masked_into(
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
-                let page_n = info.num_values;
+                let page_n = data_page_num_values(&hdr)?;
                 let matched_in_page = popcount_mask_range(mask, row_cursor, row_cursor + page_n);
                 if matched_in_page == 0 {
                     row_cursor += page_n;
@@ -323,6 +322,7 @@ pub fn read_column_byte_array_offsets_masked_into(
                     }
                     continue;
                 }
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode_byte_array_offsets_into(
@@ -1935,9 +1935,12 @@ fn decode_chunk_row_masked_into<T: Copy>(
                 dict = plain_full_decode(&decomp)?;
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
-                let page_n = info.num_values;
-                // Per-page popcount: if zero, skip decode entirely.
+                // Read num_values from the page header WITHOUT
+                // decompressing the body. If the mask has zero set bits
+                // in this page's row range, skip the Snappy decompress
+                // entirely — that's the bulk of per-page cost when
+                // the filtering column already pruned this region.
+                let page_n = data_page_num_values(&hdr)?;
                 let matched_in_page = popcount_mask_range(mask, row_cursor, row_cursor + page_n);
                 if matched_in_page == 0 {
                     row_cursor += page_n;
@@ -1946,6 +1949,7 @@ fn decode_chunk_row_masked_into<T: Copy>(
                     }
                     continue;
                 }
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode(info.values, page_n, mask, row_cursor, out)?;
@@ -1980,6 +1984,22 @@ fn decode_chunk_row_masked_into<T: Copy>(
         }
     }
     Ok(())
+}
+
+/// Read the data page's row count from the header. Works for V1 and
+/// V2 data pages without touching the compressed body — lets callers
+/// decide whether to decompress based on a per-page mask popcount.
+#[inline]
+fn data_page_num_values(hdr: &PageHeader<'_>) -> Result<usize> {
+    if let Some(ref dph) = hdr.data_page_header {
+        Ok(dph.num_values as usize)
+    } else if let Some(ref dph) = hdr.data_page_header_v2 {
+        Ok(dph.num_values as usize)
+    } else {
+        Err(CodecError::InvalidInput(
+            "data page missing both V1 and V2 header".into(),
+        ))
+    }
 }
 
 /// Count set bits in `bitmap[start_bit..end_bit]`. Used by per-page

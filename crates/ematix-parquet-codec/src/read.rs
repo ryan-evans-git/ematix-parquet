@@ -24,8 +24,8 @@ use ematix_parquet_format::types::{CompressionCodec, Encoding, PageType};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
 use crate::compression::{
-    decompress_brotli_into, decompress_gzip_into, decompress_lz4_raw_into, decompress_snappy_into,
-    decompress_zstd_into,
+    decompress_brotli_into_capped, decompress_gzip_into_capped, decompress_lz4_raw_into_sized,
+    decompress_snappy_into, decompress_zstd_into_capped,
 };
 use crate::dict::{decode_rle_dictionary_into, gather_dict_at_bitmap_into};
 use crate::error::{CodecError, Result};
@@ -209,13 +209,12 @@ pub fn read_column_byte_array_masked_into(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 let slices = decode_plain_byte_array(&decomp)?;
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
-                let page_n = info.num_values;
+                let page_n = data_page_num_values(&hdr)?;
                 let matched_in_page = popcount_mask_range(mask, row_cursor, row_cursor + page_n);
                 if matched_in_page == 0 {
                     row_cursor += page_n;
@@ -224,6 +223,7 @@ pub fn read_column_byte_array_masked_into(
                     }
                     continue;
                 }
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode_byte_array_into(
@@ -308,13 +308,12 @@ pub fn read_column_byte_array_offsets_masked_into(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 let slices = decode_plain_byte_array(&decomp)?;
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
-                let page_n = info.num_values;
+                let page_n = data_page_num_values(&hdr)?;
                 let matched_in_page = popcount_mask_range(mask, row_cursor, row_cursor + page_n);
                 if matched_in_page == 0 {
                     row_cursor += page_n;
@@ -323,6 +322,7 @@ pub fn read_column_byte_array_offsets_masked_into(
                     }
                     continue;
                 }
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode_byte_array_offsets_into(
@@ -437,7 +437,7 @@ pub fn read_column_byte_array_into(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 let slices = decode_plain_byte_array(&decomp)?;
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
@@ -558,7 +558,7 @@ pub fn read_column_byte_array_dict_preserved_into(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 let slices = decode_plain_byte_array(&decomp)?;
                 let total_dict_bytes: usize = slices.iter().map(|s| s.len()).sum();
                 dict_bytes.reserve(total_dict_bytes);
@@ -709,7 +709,7 @@ pub fn read_column_byte_array_dict_preserved_u8_into(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 let slices = decode_plain_byte_array(&decomp)?;
                 if slices.len() > 256 {
                     return Err(CodecError::InvalidInput(format!(
@@ -839,7 +839,7 @@ where
         match hdr.page_type {
             PageType::DictionaryPage => {
                 let mut decomp = Vec::new();
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 dict_decoded = Some(decode_dict_plain(&decomp)?);
             }
             PageType::DataPage | PageType::DataPageV2 => {
@@ -1061,7 +1061,7 @@ where
         match hdr.page_type {
             PageType::DictionaryPage => {
                 let mut decomp = Vec::new();
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 let slices = decode_plain_byte_array(&decomp)?;
                 let total_dict_bytes: usize = slices.iter().map(|s| s.len()).sum();
                 dict_bytes.reserve(total_dict_bytes);
@@ -1313,7 +1313,7 @@ pub fn read_column_byte_array_offsets_into(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 // Flatten the dict slices into our own bytes+offsets.
                 let slices = decode_plain_byte_array(&decomp)?;
                 let total_dict_bytes: usize = slices.iter().map(|s| s.len()).sum();
@@ -1502,7 +1502,7 @@ pub fn read_column_flba_into(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 let slices = decode_plain_fixed_len_byte_array(&decomp, type_length)?;
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
@@ -1700,7 +1700,7 @@ fn decode_chunk_masked_into<T: Copy>(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 dict = decode_plain(&decomp)?;
             }
             PageType::DataPage | PageType::DataPageV2 => {
@@ -1767,9 +1767,10 @@ fn data_page_view<'a>(
     chunk_codec: CompressionCodec,
     decomp: &'a mut Vec<u8>,
 ) -> Result<DataPageInfo<'a>> {
+    let uncompressed_size = page_uncompressed_size(hdr)?;
     if let Some(ref dph) = hdr.data_page_header {
         // ---- DataPageV1: whole body is one compressed unit ----
-        decompress_into(chunk_codec, body, decomp)?;
+        decompress_into(chunk_codec, body, uncompressed_size, decomp)?;
         Ok(DataPageInfo {
             num_values: dph.num_values as usize,
             encoding: dph.encoding,
@@ -1788,8 +1789,12 @@ fn data_page_view<'a>(
             )));
         }
         let value_bytes = &body[prefix..];
+        // V2 page header's uncompressed_page_size covers the whole page
+        // including rep+def prefixes; subtract them to get the values'
+        // expected uncompressed length.
+        let values_uncompressed = uncompressed_size.saturating_sub(prefix);
         let values: &[u8] = if dph.is_compressed && chunk_codec != CompressionCodec::Uncompressed {
-            decompress_into(chunk_codec, value_bytes, decomp)?;
+            decompress_into(chunk_codec, value_bytes, values_uncompressed, decomp)?;
             decomp.as_slice()
         } else {
             value_bytes
@@ -1850,7 +1855,7 @@ fn decode_chunk_into<T: Copy>(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 dict = decode_plain(&decomp)?;
             }
             PageType::DataPage | PageType::DataPageV2 => {
@@ -1926,13 +1931,16 @@ fn decode_chunk_row_masked_into<T: Copy>(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_codec)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 dict = plain_full_decode(&decomp)?;
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
-                let page_n = info.num_values;
-                // Per-page popcount: if zero, skip decode entirely.
+                // Read num_values from the page header WITHOUT
+                // decompressing the body. If the mask has zero set bits
+                // in this page's row range, skip the Snappy decompress
+                // entirely — that's the bulk of per-page cost when
+                // the filtering column already pruned this region.
+                let page_n = data_page_num_values(&hdr)?;
                 let matched_in_page = popcount_mask_range(mask, row_cursor, row_cursor + page_n);
                 if matched_in_page == 0 {
                     row_cursor += page_n;
@@ -1941,6 +1949,7 @@ fn decode_chunk_row_masked_into<T: Copy>(
                     }
                     continue;
                 }
+                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode(info.values, page_n, mask, row_cursor, out)?;
@@ -1975,6 +1984,22 @@ fn decode_chunk_row_masked_into<T: Copy>(
         }
     }
     Ok(())
+}
+
+/// Read the data page's row count from the header. Works for V1 and
+/// V2 data pages without touching the compressed body — lets callers
+/// decide whether to decompress based on a per-page mask popcount.
+#[inline]
+fn data_page_num_values(hdr: &PageHeader<'_>) -> Result<usize> {
+    if let Some(ref dph) = hdr.data_page_header {
+        Ok(dph.num_values as usize)
+    } else if let Some(ref dph) = hdr.data_page_header_v2 {
+        Ok(dph.num_values as usize)
+    } else {
+        Err(CodecError::InvalidInput(
+            "data page missing both V1 and V2 header".into(),
+        ))
+    }
 }
 
 /// Count set bits in `bitmap[start_bit..end_bit]`. Used by per-page
@@ -2034,7 +2059,17 @@ fn read_chunk_raw(
     Ok((bytes, cm.num_values as usize, cm.codec))
 }
 
-fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> Result<()> {
+/// Codec dispatch. `uncompressed_size` is `PageHeader.uncompressed_page_size`
+/// (for V2 data pages, excluding the rep+def prefix). LZ4_RAW *requires*
+/// this — the format has no embedded length. ZSTD/Gzip/Brotli use it to
+/// pre-reserve `out` and to cap decompression as a DoS guard. Snappy
+/// has its own embedded length and ignores it.
+fn decompress_into(
+    codec: CompressionCodec,
+    body: &[u8],
+    uncompressed_size: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     match codec {
         CompressionCodec::Uncompressed => {
             out.clear();
@@ -2042,14 +2077,27 @@ fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> R
             Ok(())
         }
         CompressionCodec::Snappy => decompress_snappy_into(body, out),
-        CompressionCodec::Zstd => decompress_zstd_into(body, out),
-        CompressionCodec::Gzip => decompress_gzip_into(body, out),
-        CompressionCodec::Brotli => decompress_brotli_into(body, out),
-        CompressionCodec::Lz4Raw => decompress_lz4_raw_into(body, out),
+        CompressionCodec::Zstd => decompress_zstd_into_capped(body, uncompressed_size, out),
+        CompressionCodec::Gzip => decompress_gzip_into_capped(body, uncompressed_size, out),
+        CompressionCodec::Brotli => decompress_brotli_into_capped(body, uncompressed_size, out),
+        CompressionCodec::Lz4Raw => decompress_lz4_raw_into_sized(body, uncompressed_size, out),
         other => Err(CodecError::Unsupported(format!(
             "compression codec not yet wired in façade: {other:?}"
         ))),
     }
+}
+
+/// Convert `PageHeader.uncompressed_page_size` (i32) to a usize length,
+/// rejecting negative or absurd values.
+#[inline]
+fn page_uncompressed_size(hdr: &PageHeader<'_>) -> Result<usize> {
+    let n = hdr.uncompressed_page_size;
+    if n < 0 {
+        return Err(CodecError::InvalidInput(format!(
+            "page header uncompressed_page_size is negative ({n})"
+        )));
+    }
+    Ok(n as usize)
 }
 
 fn io_to_codec(e: ematix_parquet_io::IoError) -> CodecError {
@@ -2117,7 +2165,12 @@ impl<T: Copy, F: Fn(&[u8]) -> Result<Vec<T>>> ColumnBatchIter<T, F> {
 
             match hdr.page_type {
                 PageType::DictionaryPage => {
-                    decompress_into(self.codec, body, &mut self.decomp)?;
+                    decompress_into(
+                        self.codec,
+                        body,
+                        page_uncompressed_size(&hdr)?,
+                        &mut self.decomp,
+                    )?;
                     self.dict = (self.decode_plain)(&self.decomp)?;
                     // Loop to find a data page.
                     walker = PageWalker::new(&self.chunk_bytes[self.walker_pos..]);
@@ -2314,7 +2367,12 @@ impl ColumnByteArrayBatchIter {
 
             match hdr.page_type {
                 PageType::DictionaryPage => {
-                    decompress_into(self.codec, body, &mut self.decomp)?;
+                    decompress_into(
+                        self.codec,
+                        body,
+                        page_uncompressed_size(&hdr)?,
+                        &mut self.decomp,
+                    )?;
                     let slices = decode_plain_byte_array(&self.decomp)?;
                     self.dict = slices.into_iter().map(|s| s.to_vec()).collect();
                     walker = PageWalker::new(&self.chunk_bytes[self.walker_pos..]);

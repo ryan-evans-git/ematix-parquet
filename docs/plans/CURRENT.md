@@ -1196,6 +1196,89 @@ max-value-boundary at bw=32), and dispatcher routing per width.
 
 ---
 
+## v0.14.0 — compression hygiene + cross-column page-skip
+
+Two correctness and one perf-hygiene fix landed on top of v0.13.0,
+all in the codec / read façade. No SIMD or write-path changes.
+
+### Correctness: LZ4_RAW decompression
+
+`decompress_lz4_raw_into` previously called `lz4_flex::block::decompress`
+with `compressed.len() * 255` as the worst-case output cap, then
+re-copied the result into the caller's buffer via `extend_from_slice`.
+Per parquet page that was a ~190 MB scratch allocation **plus** a
+full copy. On a Q06-shape SF=10 lineitem reëncoded with LZ4_RAW we
+measured a 45× regression vs Snappy (3109 ms vs 70 ms) entirely from
+the allocation pattern.
+
+Fix:
+- `decompress_lz4_raw_into_sized(body, uncompressed_size, out)` —
+  pre-sizes `out` from the page header's declared length and decodes
+  in place via `lz4_flex::block::decompress_into`. No scratch, no
+  copy.
+- `decompress_lz4_raw_into(body, out)` (the size-less variant) keeps
+  working: it now walks the LZ4 block tags once to compute the
+  output length before allocating, then takes the same `_into` path.
+
+Bench: Q06 SF=10 LZ4_RAW path closed from 3109 ms → 57.88 ms (now
+beats Polars 62 ms by 6.7%, Snappy by 18%).
+
+### Hardening: DoS caps on ZSTD / Gzip / Brotli
+
+Previously these called `read_to_end(out)` on a `Read` adapter with
+no upper bound. A malicious 1 KB compressed page could expand to
+many GB and OOM a worker.
+
+Three new variants (`decompress_zstd_into_capped`,
+`decompress_gzip_into_capped`, `decompress_brotli_into_capped`) take
+the declared uncompressed size, pre-`reserve` the buffer, and error
+out if the decompressed stream exceeds declared + 64 bytes (the slack
+covers honest-writer off-by-one).
+
+The sync read-façade `decompress_into` dispatch now plumbs
+`uncompressed_page_size` through every call site (~33 in the codec,
+8 in the async façade). LZ4_RAW becomes the sized variant; ZSTD /
+Gzip / Brotli become the capped variants. Snappy keeps its own
+embedded-length path.
+
+### Dead-code removal
+
+`decompress_snappy_fast_into` (~210 LOC of hand-rolled unsafe with a
+latent `copy_back_ref` bug, never dispatched in production, and a
+4-5 GB/s microbench claim that didn't hold on real Q06 data — was
+17% *slower* than the snap crate) retires. The companion test file
+and `bench_snappy` example are deleted.
+
+### Tests
+
+Codec unit tests go from 8 → 27. New cases for Brotli / Gzip /
+LZ4_RAW cover round-trip, empty-input, garbage-input, and
+capped-rejects-oversize.
+
+### Perf: cross-column page-skip (sync read.rs)
+
+`decode_chunk_row_masked_into`, `read_column_byte_array_masked_into`,
+and the dict-preserved offsets variant previously decompressed every
+data page before checking the row mask's popcount for that page's
+range. Move the popcount check (via a new `data_page_num_values(hdr)`
+helper that reads num_values from the page header, no decompress)
+*before* `data_page_view`. Pages with zero mask bits in their row
+range skip the Snappy / ZSTD / LZ4 decompress entirely.
+
+Wall-time at Q06 SF=10 selectivity is unchanged (every page has at
+least some matches at ~1% × ~32K rows/page), but per-thread CPU
+time for `extprice masked decode` drops 35%. The lever fires harder
+on sparser-filter workloads and partitioned data.
+
+### Net diff
+
+~120 fewer LOC across the codec (dead-code removal outweighs the new
+sized/capped variants and the page-skip refactor).
+
+**Released as v0.14.0.**
+
+---
+
 ## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot

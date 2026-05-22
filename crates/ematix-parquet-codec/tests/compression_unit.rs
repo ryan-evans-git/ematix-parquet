@@ -3,9 +3,9 @@
 use ematix_parquet_codec::compression::{
     compress_brotli, compress_gzip, compress_lz4_raw, compress_snappy, compress_zstd,
     decompress_brotli, decompress_brotli_into, decompress_brotli_into_capped, decompress_gzip,
-    decompress_gzip_into, decompress_gzip_into_capped, decompress_lz4_raw,
-    decompress_lz4_raw_into, decompress_lz4_raw_into_sized, decompress_snappy,
-    decompress_snappy_into, decompress_zstd, decompress_zstd_into, decompress_zstd_into_capped,
+    decompress_gzip_into, decompress_gzip_into_capped, decompress_lz4_raw, decompress_lz4_raw_into,
+    decompress_lz4_raw_into_sized, decompress_snappy, decompress_snappy_into, decompress_zstd,
+    decompress_zstd_into, decompress_zstd_into_capped,
 };
 
 fn snappy_compress(input: &[u8]) -> Vec<u8> {
@@ -258,8 +258,8 @@ fn decompress_lz4_raw_into_sized_errors_on_wrong_size() {
     let compressed = compress_lz4_raw(&original).unwrap();
     let mut buf = Vec::new();
     // Too-small declared size — should error.
-    let err =
-        decompress_lz4_raw_into_sized(&compressed, 16, &mut buf).expect_err("too-small should error");
+    let err = decompress_lz4_raw_into_sized(&compressed, 16, &mut buf)
+        .expect_err("too-small should error");
     assert!(format!("{err:?}").contains("lz4"), "{err:?}");
 }
 

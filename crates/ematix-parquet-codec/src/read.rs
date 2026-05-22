@@ -2080,9 +2080,7 @@ fn decompress_into(
         CompressionCodec::Zstd => decompress_zstd_into_capped(body, uncompressed_size, out),
         CompressionCodec::Gzip => decompress_gzip_into_capped(body, uncompressed_size, out),
         CompressionCodec::Brotli => decompress_brotli_into_capped(body, uncompressed_size, out),
-        CompressionCodec::Lz4Raw => {
-            decompress_lz4_raw_into_sized(body, uncompressed_size, out)
-        }
+        CompressionCodec::Lz4Raw => decompress_lz4_raw_into_sized(body, uncompressed_size, out),
         other => Err(CodecError::Unsupported(format!(
             "compression codec not yet wired in façade: {other:?}"
         ))),
@@ -2167,7 +2165,12 @@ impl<T: Copy, F: Fn(&[u8]) -> Result<Vec<T>>> ColumnBatchIter<T, F> {
 
             match hdr.page_type {
                 PageType::DictionaryPage => {
-                    decompress_into(self.codec, body, page_uncompressed_size(&hdr)?, &mut self.decomp)?;
+                    decompress_into(
+                        self.codec,
+                        body,
+                        page_uncompressed_size(&hdr)?,
+                        &mut self.decomp,
+                    )?;
                     self.dict = (self.decode_plain)(&self.decomp)?;
                     // Loop to find a data page.
                     walker = PageWalker::new(&self.chunk_bytes[self.walker_pos..]);
@@ -2364,7 +2367,12 @@ impl ColumnByteArrayBatchIter {
 
             match hdr.page_type {
                 PageType::DictionaryPage => {
-                    decompress_into(self.codec, body, page_uncompressed_size(&hdr)?, &mut self.decomp)?;
+                    decompress_into(
+                        self.codec,
+                        body,
+                        page_uncompressed_size(&hdr)?,
+                        &mut self.decomp,
+                    )?;
                     let slices = decode_plain_byte_array(&self.decomp)?;
                     self.dict = slices.into_iter().map(|s| s.to_vec()).collect();
                     walker = PageWalker::new(&self.chunk_bytes[self.walker_pos..]);

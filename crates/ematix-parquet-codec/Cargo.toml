@@ -118,13 +118,6 @@ path = "examples/bench_unpack.rs"
 name = "probe_bitwidths"
 path = "examples/probe_bitwidths.rs"
 
-# Snappy microbench: hand-rolled vs snap crate across random,
-# back-reference-heavy, and parquet-shaped inputs.
-# Run: cargo run --release --example bench_snappy
-[[example]]
-name = "bench_snappy"
-path = "examples/bench_snappy.rs"
-
 # Π.10c Q14 façade-level late-materialization bench.
 # Times baseline (4× full decode + filter) vs late-mat (mask-then-
 # decode via read_column_*_masked_into) on TPC-H lineitem Q14.

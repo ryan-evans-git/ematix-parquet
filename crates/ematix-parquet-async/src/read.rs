@@ -9,8 +9,8 @@
 
 use bytes::Bytes;
 use ematix_parquet_codec::compression::{
-    decompress_brotli_into, decompress_gzip_into, decompress_lz4_raw_into, decompress_snappy_into,
-    decompress_zstd_into,
+    decompress_brotli_into_capped, decompress_gzip_into_capped, decompress_lz4_raw_into_sized,
+    decompress_snappy_into, decompress_zstd_into_capped,
 };
 use ematix_parquet_codec::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_into};
 use ematix_parquet_codec::plain::{
@@ -124,7 +124,7 @@ pub async fn read_column_byte_array_async_into(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_async)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 let slices = decode_plain_byte_array(&decomp).map_err(codec_to_async)?;
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
@@ -213,7 +213,7 @@ pub async fn read_column_byte_array_offsets_async_into(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_async)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 let slices = decode_plain_byte_array(&decomp).map_err(codec_to_async)?;
                 let total: usize = slices.iter().map(|s| s.len()).sum();
                 dict_bytes.clear();
@@ -359,7 +359,7 @@ fn decode_chunk_into<T: Copy>(
     while let Some((hdr, body)) = walker.next_page().map_err(io_to_async)? {
         match hdr.page_type {
             PageType::DictionaryPage => {
-                decompress_into(codec, body, &mut decomp)?;
+                decompress_into(codec, body, page_uncompressed_size(&hdr)?, &mut decomp)?;
                 dict = decode_plain(&decomp).map_err(codec_to_async)?;
             }
             PageType::DataPage | PageType::DataPageV2 => {
@@ -411,8 +411,9 @@ fn data_page_view<'a>(
     chunk_codec: CompressionCodec,
     decomp: &'a mut Vec<u8>,
 ) -> Result<DataPageInfo<'a>> {
+    let uncompressed_size = page_uncompressed_size(hdr)?;
     if let Some(ref dph) = hdr.data_page_header {
-        decompress_into(chunk_codec, body, decomp)?;
+        decompress_into(chunk_codec, body, uncompressed_size, decomp)?;
         Ok(DataPageInfo {
             num_values: dph.num_values as usize,
             encoding: dph.encoding,
@@ -430,8 +431,9 @@ fn data_page_view<'a>(
             )));
         }
         let value_bytes = &body[prefix..];
+        let values_uncompressed = uncompressed_size.saturating_sub(prefix);
         let values: &[u8] = if dph.is_compressed && chunk_codec != CompressionCodec::Uncompressed {
-            decompress_into(chunk_codec, value_bytes, decomp)?;
+            decompress_into(chunk_codec, value_bytes, values_uncompressed, decomp)?;
             decomp.as_slice()
         } else {
             value_bytes
@@ -448,7 +450,14 @@ fn data_page_view<'a>(
     }
 }
 
-fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> Result<()> {
+/// Codec dispatch. See sync `read.rs::decompress_into` for the
+/// rationale on threading `uncompressed_size` through.
+fn decompress_into(
+    codec: CompressionCodec,
+    body: &[u8],
+    uncompressed_size: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     match codec {
         CompressionCodec::Uncompressed => {
             out.clear();
@@ -456,14 +465,33 @@ fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> R
             Ok(())
         }
         CompressionCodec::Snappy => decompress_snappy_into(body, out).map_err(codec_to_async),
-        CompressionCodec::Zstd => decompress_zstd_into(body, out).map_err(codec_to_async),
-        CompressionCodec::Gzip => decompress_gzip_into(body, out).map_err(codec_to_async),
-        CompressionCodec::Brotli => decompress_brotli_into(body, out).map_err(codec_to_async),
-        CompressionCodec::Lz4Raw => decompress_lz4_raw_into(body, out).map_err(codec_to_async),
+        CompressionCodec::Zstd => {
+            decompress_zstd_into_capped(body, uncompressed_size, out).map_err(codec_to_async)
+        }
+        CompressionCodec::Gzip => {
+            decompress_gzip_into_capped(body, uncompressed_size, out).map_err(codec_to_async)
+        }
+        CompressionCodec::Brotli => {
+            decompress_brotli_into_capped(body, uncompressed_size, out).map_err(codec_to_async)
+        }
+        CompressionCodec::Lz4Raw => {
+            decompress_lz4_raw_into_sized(body, uncompressed_size, out).map_err(codec_to_async)
+        }
         other => Err(AsyncError::Format(format!(
             "compression codec not yet wired in async façade: {other:?}"
         ))),
     }
+}
+
+#[inline]
+fn page_uncompressed_size(hdr: &PageHeader<'_>) -> Result<usize> {
+    let n = hdr.uncompressed_page_size;
+    if n < 0 {
+        return Err(AsyncError::Format(format!(
+            "page header uncompressed_page_size is negative ({n})"
+        )));
+    }
+    Ok(n as usize)
 }
 
 fn io_to_async(e: ematix_parquet_io::IoError) -> AsyncError {

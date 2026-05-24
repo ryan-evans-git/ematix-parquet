@@ -1,28 +1,21 @@
-//! Sidecar-index reader. Π.17b ships **sorted INT64** lookups; Π.18+
-//! widens to the other physical types and to range queries on top of
-//! the same data structures.
+//! Sidecar-index reader. Π.17b shipped sorted INT64; Π.18 widens to
+//! INT32 + BYTE_ARRAY and adds range queries (`lookup_range`,
+//! `read_column_*_where_range`).
 //!
-//! `ParquetIndex::open` parses the sidecar parquet's footer
-//! `KeyValueMetadata`, verifies the embedded fingerprint against the
-//! source, and **eagerly** decodes all index entries into memory. This
-//! is the simplest correct implementation for MVP: sidecars built from
-//! TPC-H-shaped sources are tens-of-MB at most, so the eager-load cost
-//! is well under a millisecond. The Iceberg-layer work (Π.21+) will
-//! introduce per-manifest summaries that prune which sidecars even
-//! need opening, so eager-load-per-sidecar stays scalable in the
-//! dataset case too.
+//! `ParquetIndex::open` parses the sidecar's footer `KeyValueMetadata`,
+//! verifies the embedded fingerprint against the source, and **eagerly**
+//! decodes the index row groups into memory. Lookups are pure-CPU
+//! after open. Eager-load is the simplest correct shape for MVP;
+//! sidecars are tens of MB at most, sub-millisecond to load. The
+//! Iceberg layer (Π.21+) introduces per-manifest summaries that prune
+//! which sidecars even need opening — eager-per-sidecar stays
+//! scalable in the dataset case.
 //!
-//! `lookup_eq` is `log(n)` via binary search on the sorted value
-//! column, plus linear scan over duplicates of the same key (a
-//! low-cardinality column with many rows-per-key has long duplicate
-//! runs, but they're tight — same value, three small ints per row).
-//!
-//! `read_column_i64_where_eq` is the convenience that ties the lookup
-//! into the existing `read_column_i64_masked_into` path: it groups
-//! hits by row group, assembles a chunk-wide bitmap from per-page
-//! rowsets, and lets the codec's existing zero-popcount-skip
-//! machinery drop pages whose mask is empty.
+//! Equality (`lookup_eq`) is `log(n)` binary search + linear scan
+//! over duplicates. Range (`lookup_range`) is the same binary search
+//! at `lo` followed by a forward walk until `value > hi`.
 
+use std::ops::RangeInclusive;
 use std::path::Path;
 
 use ematix_parquet_io::ParquetFile;
@@ -35,16 +28,50 @@ use crate::index::types::{IndexHit, Key};
 use crate::index::PhysicalType;
 use crate::read::{read_column_byte_array, read_column_i32, read_column_i64};
 
-/// One loaded index, kept fully in memory. The four parallel vectors
-/// are aligned by row: row `i` of the underlying sidecar parquet
-/// becomes `(values[i], target_rgs[i], target_pages[i], rowsets[i])`.
+// ============================================================
+// Loaded indexes — one variant per physical type.
+// ============================================================
+//
+// Each variant carries four parallel vectors (values + target_rg +
+// target_page + rowset). Per-row alignment is the load-bearing
+// invariant; constructors verify the four lengths match before
+// returning.
+
 #[derive(Debug)]
-struct LoadedSortedI64 {
-    entry: IndexEntry,
+struct LoadedTypedI64 {
     values: Vec<i64>,
     target_rgs: Vec<i32>,
     target_pages: Vec<i32>,
     rowsets: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct LoadedTypedI32 {
+    values: Vec<i32>,
+    target_rgs: Vec<i32>,
+    target_pages: Vec<i32>,
+    rowsets: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct LoadedTypedBytes {
+    values: Vec<Vec<u8>>,
+    target_rgs: Vec<i32>,
+    target_pages: Vec<i32>,
+    rowsets: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+enum LoadedSorted {
+    I64(LoadedTypedI64),
+    I32(LoadedTypedI32),
+    Bytes(LoadedTypedBytes),
+}
+
+#[derive(Debug)]
+struct LoadedIndex {
+    entry: IndexEntry,
+    data: LoadedSorted,
 }
 
 /// Parsed sidecar parquet. Owns the manifest and the in-memory index
@@ -52,18 +79,15 @@ struct LoadedSortedI64 {
 #[derive(Debug)]
 pub struct ParquetIndex {
     manifest: IndexManifest,
-    indexes: Vec<LoadedSortedI64>,
+    indexes: Vec<LoadedIndex>,
 }
 
 impl ParquetIndex {
     /// Open `idx_path`, parse and validate the manifest against
-    /// `source`, eagerly load every index row group. Errors fast on:
-    /// - missing or malformed manifest (`ManifestError`)
-    /// - manifest version other than `v1`
-    /// - source-fingerprint mismatch (sidecar built against a
-    ///   different state of the source file)
-    /// - schema shape on the sidecar that doesn't match what a
-    ///   sorted-i64 index emits
+    /// `source`, eagerly load every sorted index row group. Errors
+    /// fast on missing/malformed manifest, version mismatch,
+    /// fingerprint mismatch, or a sidecar shape that doesn't match
+    /// what a sorted-index builder emits.
     pub fn open<P: AsRef<Path>>(idx_path: P, source: &ParquetFile) -> Result<Self> {
         let idx_file = ParquetFile::open(idx_path.as_ref())
             .map_err(|e| CodecError::InvalidInput(format!("open sidecar: {e}")))?;
@@ -100,54 +124,82 @@ impl ParquetIndex {
         }
 
         // ---- 3. Eagerly load each index ---------------------------
-        let mut indexes: Vec<LoadedSortedI64> = Vec::with_capacity(manifest.indexes.len());
+        let mut indexes: Vec<LoadedIndex> = Vec::with_capacity(manifest.indexes.len());
         for entry in &manifest.indexes {
             match &entry.kind {
-                IndexKind::Sorted {
-                    physical_type: PhysicalType::Int64,
-                    ..
-                } => {
+                IndexKind::Sorted { physical_type, .. } => {
                     let rg = entry.sidecar_row_group as usize;
-                    // Schema check: column 0 = value (INT64), 1 = target_rg (INT32),
-                    // 2 = target_page (INT32), 3 = target_rowset (BYTE_ARRAY).
-                    // If the column count or types disagree the typed-read
-                    // calls below will error.
-                    let values = read_column_i64(&idx_file, rg, 0)?;
-                    let target_rgs = read_column_i32(&idx_file, rg, 1)?;
-                    let target_pages = read_column_i32(&idx_file, rg, 2)?;
-                    let target_rowsets_borrowed = read_column_byte_array(&idx_file, rg, 3)?;
-                    let target_rowsets: Vec<Vec<u8>> =
-                        target_rowsets_borrowed.into_iter().collect();
-
-                    // Sanity: all four columns share length.
-                    let n = values.len();
-                    if target_rgs.len() != n || target_pages.len() != n || target_rowsets.len() != n
-                    {
-                        return Err(CodecError::InvalidInput(format!(
-                            "index `{}` row group {} has mismatched column lengths \
-                             (value={}, rg={}, page={}, rowset={})",
-                            entry.name,
-                            rg,
-                            n,
-                            target_rgs.len(),
-                            target_pages.len(),
-                            target_rowsets.len()
-                        )));
-                    }
-                    indexes.push(LoadedSortedI64 {
+                    let data = match physical_type {
+                        PhysicalType::Int64 => {
+                            let values = read_column_i64(&idx_file, rg, 0)?;
+                            let target_rgs = read_column_i32(&idx_file, rg, 1)?;
+                            let target_pages = read_column_i32(&idx_file, rg, 2)?;
+                            let rowsets = read_column_byte_array(&idx_file, rg, 3)?;
+                            check_aligned(
+                                &entry.name,
+                                rg,
+                                values.len(),
+                                &target_rgs,
+                                &target_pages,
+                                &rowsets,
+                            )?;
+                            LoadedSorted::I64(LoadedTypedI64 {
+                                values,
+                                target_rgs,
+                                target_pages,
+                                rowsets,
+                            })
+                        }
+                        PhysicalType::Int32 => {
+                            let values = read_column_i32(&idx_file, rg, 0)?;
+                            let target_rgs = read_column_i32(&idx_file, rg, 1)?;
+                            let target_pages = read_column_i32(&idx_file, rg, 2)?;
+                            let rowsets = read_column_byte_array(&idx_file, rg, 3)?;
+                            check_aligned(
+                                &entry.name,
+                                rg,
+                                values.len(),
+                                &target_rgs,
+                                &target_pages,
+                                &rowsets,
+                            )?;
+                            LoadedSorted::I32(LoadedTypedI32 {
+                                values,
+                                target_rgs,
+                                target_pages,
+                                rowsets,
+                            })
+                        }
+                        PhysicalType::ByteArray => {
+                            let values = read_column_byte_array(&idx_file, rg, 0)?;
+                            let target_rgs = read_column_i32(&idx_file, rg, 1)?;
+                            let target_pages = read_column_i32(&idx_file, rg, 2)?;
+                            let rowsets = read_column_byte_array(&idx_file, rg, 3)?;
+                            check_aligned(
+                                &entry.name,
+                                rg,
+                                values.len(),
+                                &target_rgs,
+                                &target_pages,
+                                &rowsets,
+                            )?;
+                            LoadedSorted::Bytes(LoadedTypedBytes {
+                                values,
+                                target_rgs,
+                                target_pages,
+                                rowsets,
+                            })
+                        }
+                    };
+                    indexes.push(LoadedIndex {
                         entry: entry.clone(),
-                        values,
-                        target_rgs,
-                        target_pages,
-                        rowsets: target_rowsets,
+                        data,
                     });
                 }
-                // Other kinds are reserved for Π.18+ and not yet
-                // populated by any builder. Defensive: skip rather
-                // than error so a future sidecar with mixed kinds
-                // doesn't break older readers (the lookup-by-name
-                // path will then fail loud on requests for that
-                // index).
+                // Other kinds reserved for Π.19+ (BloomPage,
+                // CompositePrefix, Inverted). Skipping is forward-compat
+                // friendly — a request for one of them through
+                // `lookup_eq` will fail loud at lookup time.
                 _ => continue,
             }
         }
@@ -155,42 +207,23 @@ impl ParquetIndex {
         Ok(Self { manifest, indexes })
     }
 
-    /// Borrow the parsed manifest. Useful for tooling that wants to
-    /// inspect the sidecar (which indexes exist, what columns, etc.).
+    /// Borrow the parsed manifest. Useful for tooling.
     pub fn manifest(&self) -> &IndexManifest {
         &self.manifest
     }
 
-    /// Equality lookup. Returns every (rg, page, rowset-within-page)
-    /// triple in the source file that has at least one row matching
-    /// `key`.
-    ///
-    /// Empty result = no rows match. The reader does NOT verify that
-    /// the hit pages still contain those rows — the fingerprint
-    /// check at `open` time is the authoritative guard against source
-    /// drift.
+    // ============================================================
+    // lookup_eq
+    // ============================================================
+
+    /// Equality lookup. Returns every `(rg, page, rowset)` triple in
+    /// the source file with at least one row matching `key`. Empty
+    /// vec = no rows match. The fingerprint check at `open` is the
+    /// authoritative guard against source drift; the reader does not
+    /// re-verify on each lookup.
     pub fn lookup_eq(&self, index_name: &str, key: &Key<'_>) -> Result<Vec<IndexHit>> {
-        let idx = self
-            .indexes
-            .iter()
-            .find(|i| i.entry.name == index_name)
-            .ok_or_else(|| {
-                CodecError::InvalidInput(format!(
-                    "sidecar has no index named `{index_name}` (have: {:?})",
-                    self.indexes
-                        .iter()
-                        .map(|i| &i.entry.name)
-                        .collect::<Vec<_>>()
-                ))
-            })?;
-        let pt = match &idx.entry.kind {
-            IndexKind::Sorted { physical_type, .. } => *physical_type,
-            _ => {
-                return Err(CodecError::InvalidInput(format!(
-                    "index `{index_name}` is not a sorted index"
-                )))
-            }
-        };
+        let idx = self.find_index(index_name)?;
+        let pt = sorted_physical_type(&idx.entry)?;
         if !key.matches_physical_type(pt) {
             return Err(CodecError::InvalidInput(format!(
                 "lookup_eq: key variant `{}` does not match index `{}` physical type {:?}",
@@ -199,62 +232,78 @@ impl ParquetIndex {
                 pt,
             )));
         }
-        let target = match key {
-            Key::I64(v) => *v,
-            other => {
-                return Err(CodecError::InvalidInput(format!(
-                    "Π.17b only supports Key::I64; got {}",
-                    other.variant_name()
-                )))
-            }
-        };
-
-        // Sorted values → binary search for ANY index whose value
-        // == target, then linear-scan both directions to cover
-        // duplicates.
-        let idx_pos = match idx.values.binary_search(&target) {
-            Ok(i) => i,
-            Err(_) => return Ok(Vec::new()),
-        };
-        // Walk backwards to the first duplicate.
-        let mut start = idx_pos;
-        while start > 0 && idx.values[start - 1] == target {
-            start -= 1;
+        match (&idx.data, key) {
+            (LoadedSorted::I64(d), Key::I64(v)) => Ok(eq_hits_i64(d, *v)),
+            (LoadedSorted::I32(d), Key::I32(v)) => Ok(eq_hits_i32(d, *v)),
+            (LoadedSorted::Bytes(d), Key::Bytes(v)) => Ok(eq_hits_bytes(d, v)),
+            _ => Err(CodecError::InvalidInput(format!(
+                "lookup_eq: key/index type mismatch on `{index_name}`"
+            ))),
         }
-        // Walk forwards to the last duplicate.
-        let mut end = idx_pos + 1;
-        while end < idx.values.len() && idx.values[end] == target {
-            end += 1;
-        }
-
-        let mut hits = Vec::with_capacity(end - start);
-        for i in start..end {
-            hits.push(IndexHit {
-                row_group: idx.target_rgs[i] as u32,
-                page: idx.target_pages[i] as u32,
-                rowset: idx.rowsets[i].clone(),
-            });
-        }
-        Ok(hits)
     }
 
-    /// Convenience: index the named INT64 column for `key`, then
-    /// decode `target_column` (any physical type the codec can read
-    /// via `read_column_i64_masked_into` — this entry point is
-    /// specialized to INT64 target columns in Π.17b; sibling entries
-    /// for other target types arrive in Π.18+).
+    // ============================================================
+    // lookup_range
+    // ============================================================
+
+    /// Inclusive range lookup. Returns every `(rg, page, rowset)`
+    /// triple whose `value` is in `[lo, hi]`. Empty vec = no rows in
+    /// range. Inverted ranges (`lo > hi`) return empty.
     ///
-    /// Internally:
-    /// 1. `lookup_eq` → `Vec<IndexHit>`.
-    /// 2. Group hits by `row_group`.
-    /// 3. For each row group, derive page boundaries on the *indexed*
-    ///    column (via [`walk_data_pages`]) and OR each hit's
-    ///    page-relative rowset into a chunk-wide bitmap at the page's
-    ///    `first_row` offset.
-    /// 4. Call `read_column_i64_masked_into(source, rg, target_column, &bitmap, &mut out)`.
-    ///    Pages whose bitmap range has zero popcount get skipped
-    ///    before decompression — the v0.14.0 cross-column page-skip
-    ///    lever fires automatically.
+    /// The `Key` variants of `lo` and `hi` must match each other AND
+    /// the index's physical type. The bytes slice in `Key::Bytes` is
+    /// compared lex-ASC (matches `Vec<u8>` default `Ord` and the
+    /// Parquet BYTE_ARRAY sort).
+    pub fn lookup_range(
+        &self,
+        index_name: &str,
+        lo: &Key<'_>,
+        hi: &Key<'_>,
+    ) -> Result<Vec<IndexHit>> {
+        let idx = self.find_index(index_name)?;
+        let pt = sorted_physical_type(&idx.entry)?;
+        if !lo.matches_physical_type(pt) || !hi.matches_physical_type(pt) {
+            return Err(CodecError::InvalidInput(format!(
+                "lookup_range: key variants ({}, {}) do not match index `{}` physical type {:?}",
+                lo.variant_name(),
+                hi.variant_name(),
+                index_name,
+                pt,
+            )));
+        }
+        match (&idx.data, lo, hi) {
+            (LoadedSorted::I64(d), Key::I64(a), Key::I64(b)) => {
+                if a > b {
+                    return Ok(Vec::new());
+                }
+                Ok(range_hits_i64(d, *a..=*b))
+            }
+            (LoadedSorted::I32(d), Key::I32(a), Key::I32(b)) => {
+                if a > b {
+                    return Ok(Vec::new());
+                }
+                Ok(range_hits_i32(d, *a..=*b))
+            }
+            (LoadedSorted::Bytes(d), Key::Bytes(a), Key::Bytes(b)) => {
+                if a > b {
+                    return Ok(Vec::new());
+                }
+                Ok(range_hits_bytes(d, a, b))
+            }
+            _ => Err(CodecError::InvalidInput(format!(
+                "lookup_range: key/index type mismatch on `{index_name}`"
+            ))),
+        }
+    }
+
+    // ============================================================
+    // Convenience: read_column_*_where_*
+    // ============================================================
+
+    /// Indexed equality + masked decode for an `INT64` target
+    /// column. See type-level [`Self`] docs for the algorithm; the
+    /// short version is: `lookup_eq` → group hits by row group →
+    /// assemble chunk-wide bitmap → `read_column_i64_masked_into`.
     pub fn read_column_i64_where_eq(
         &self,
         source: &ParquetFile,
@@ -262,15 +311,177 @@ impl ParquetIndex {
         key: i64,
         target_column: usize,
     ) -> Result<Vec<i64>> {
-        // Resolve the indexed column ordinal by name. (Builder writes
-        // the leaf name; resolver walks the source's schema.)
-        let idx = self
-            .indexes
+        let hits = self.lookup_eq(index_name, &Key::I64(key))?;
+        self.materialize_i64(source, index_name, &hits, target_column)
+    }
+
+    /// Indexed range + masked decode for an `INT64` target column.
+    pub fn read_column_i64_where_range(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        lo: i64,
+        hi: i64,
+        target_column: usize,
+    ) -> Result<Vec<i64>> {
+        let hits = self.lookup_range(index_name, &Key::I64(lo), &Key::I64(hi))?;
+        self.materialize_i64(source, index_name, &hits, target_column)
+    }
+
+    /// Indexed equality + masked decode for an `INT32` target column.
+    pub fn read_column_i32_where_eq(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key: i32,
+        target_column: usize,
+    ) -> Result<Vec<i32>> {
+        let hits = self.lookup_eq(index_name, &Key::I32(key))?;
+        self.materialize_i32(source, index_name, &hits, target_column)
+    }
+
+    /// Indexed range + masked decode for an `INT32` target column.
+    pub fn read_column_i32_where_range(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        lo: i32,
+        hi: i32,
+        target_column: usize,
+    ) -> Result<Vec<i32>> {
+        let hits = self.lookup_range(index_name, &Key::I32(lo), &Key::I32(hi))?;
+        self.materialize_i32(source, index_name, &hits, target_column)
+    }
+
+    /// Indexed equality + masked decode for a `BYTE_ARRAY` target
+    /// column. The lookup key is compared byte-wise (lex).
+    pub fn read_column_byte_array_where_eq(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key: &[u8],
+        target_column: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let hits = self.lookup_eq(index_name, &Key::Bytes(key))?;
+        self.materialize_byte_array(source, index_name, &hits, target_column)
+    }
+
+    /// Indexed range + masked decode for a `BYTE_ARRAY` target column.
+    pub fn read_column_byte_array_where_range(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        lo: &[u8],
+        hi: &[u8],
+        target_column: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let hits = self.lookup_range(index_name, &Key::Bytes(lo), &Key::Bytes(hi))?;
+        self.materialize_byte_array(source, index_name, &hits, target_column)
+    }
+
+    // ============================================================
+    // Internal helpers
+    // ============================================================
+
+    fn find_index(&self, name: &str) -> Result<&LoadedIndex> {
+        self.indexes
             .iter()
-            .find(|i| i.entry.name == index_name)
+            .find(|i| i.entry.name == name)
             .ok_or_else(|| {
-                CodecError::InvalidInput(format!("sidecar has no index named `{index_name}`"))
-            })?;
+                CodecError::InvalidInput(format!(
+                    "sidecar has no index named `{name}` (have: {:?})",
+                    self.indexes
+                        .iter()
+                        .map(|i| &i.entry.name)
+                        .collect::<Vec<_>>()
+                ))
+            })
+    }
+
+    fn materialize_i64(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        hits: &[IndexHit],
+        target_column: usize,
+    ) -> Result<Vec<i64>> {
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bitmaps = self.assemble_bitmaps(source, index_name, hits)?;
+        let mut out: Vec<i64> = Vec::new();
+        for (rg, bitmap) in bitmaps {
+            crate::read::read_column_i64_masked_into(
+                source,
+                rg as usize,
+                target_column,
+                &bitmap,
+                &mut out,
+            )?;
+        }
+        Ok(out)
+    }
+
+    fn materialize_i32(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        hits: &[IndexHit],
+        target_column: usize,
+    ) -> Result<Vec<i32>> {
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bitmaps = self.assemble_bitmaps(source, index_name, hits)?;
+        let mut out: Vec<i32> = Vec::new();
+        for (rg, bitmap) in bitmaps {
+            crate::read::read_column_i32_masked_into(
+                source,
+                rg as usize,
+                target_column,
+                &bitmap,
+                &mut out,
+            )?;
+        }
+        Ok(out)
+    }
+
+    fn materialize_byte_array(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        hits: &[IndexHit],
+        target_column: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bitmaps = self.assemble_bitmaps(source, index_name, hits)?;
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for (rg, bitmap) in bitmaps {
+            crate::read::read_column_byte_array_masked_into(
+                source,
+                rg as usize,
+                target_column,
+                &bitmap,
+                &mut out,
+            )?;
+        }
+        Ok(out)
+    }
+
+    /// Given a list of `IndexHit`s, group them by source row group
+    /// and assemble a chunk-wide row bitmap per group. The bitmap is
+    /// sized to the row group's `num_rows`; bits are placed using
+    /// the *indexed* column's page boundaries (since rowsets are
+    /// page-relative to the indexed column).
+    fn assemble_bitmaps(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        hits: &[IndexHit],
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        let idx = self.find_index(index_name)?;
         let source_col_name = match &idx.entry.kind {
             IndexKind::Sorted { source_column, .. } => source_column.as_str(),
             _ => {
@@ -281,23 +492,16 @@ impl ParquetIndex {
         };
         let source_col_idx = resolve_leaf_by_name(source, source_col_name)?;
 
-        // Run the lookup.
-        let hits = self.lookup_eq(index_name, &Key::I64(key))?;
-        if hits.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Group hits by row group.
         let md = source
             .metadata()
             .map_err(|e| CodecError::InvalidInput(format!("source metadata: {e}")))?;
         let mut by_rg: std::collections::BTreeMap<u32, Vec<&IndexHit>> =
             std::collections::BTreeMap::new();
-        for h in &hits {
+        for h in hits {
             by_rg.entry(h.row_group).or_default().push(h);
         }
 
-        let mut out: Vec<i64> = Vec::new();
+        let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(by_rg.len());
         for (rg, rg_hits) in by_rg {
             let rg_meta = md.row_groups.get(rg as usize).ok_or_else(|| {
                 CodecError::InvalidInput(format!(
@@ -307,15 +511,12 @@ impl ParquetIndex {
             let n_rows = rg_meta.num_rows as usize;
             let mut bitmap = vec![0u8; n_rows.div_ceil(8)];
 
-            // Walk the indexed column's pages for this RG to learn
-            // first_row per page.
             let mut first_row_by_page: Vec<usize> = Vec::new();
             walk_data_pages(source, rg as usize, source_col_idx, |layout| {
                 first_row_by_page.push(layout.first_row);
                 Ok(())
             })?;
 
-            // OR each per-page rowset into the chunk-wide bitmap.
             for hit in rg_hits {
                 let first_row = *first_row_by_page.get(hit.page as usize).ok_or_else(|| {
                     CodecError::InvalidInput(format!(
@@ -335,38 +536,146 @@ impl ParquetIndex {
                     }
                 }
             }
-
-            // Pull matching rows via the existing masked-decode path.
-            // Zero-popcount pages are skipped before decompression by
-            // `decode_chunk_row_masked_into`.
-            crate::read::read_column_i64_masked_into(
-                source,
-                rg as usize,
-                target_column,
-                &bitmap,
-                &mut out,
-            )?;
+            out.push((rg, bitmap));
         }
         Ok(out)
     }
 }
 
-/// Map a `ManifestError` into a `CodecError` for uniform error
-/// surfacing at the public API.
+// ============================================================
+// Per-type lookup helpers — binary-search + duplicate-walk.
+// ============================================================
+
+fn eq_hits_i64(d: &LoadedTypedI64, target: i64) -> Vec<IndexHit> {
+    let pos = match d.values.binary_search(&target) {
+        Ok(i) => i,
+        Err(_) => return Vec::new(),
+    };
+    let mut start = pos;
+    while start > 0 && d.values[start - 1] == target {
+        start -= 1;
+    }
+    let mut end = pos + 1;
+    while end < d.values.len() && d.values[end] == target {
+        end += 1;
+    }
+    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+}
+
+fn eq_hits_i32(d: &LoadedTypedI32, target: i32) -> Vec<IndexHit> {
+    let pos = match d.values.binary_search(&target) {
+        Ok(i) => i,
+        Err(_) => return Vec::new(),
+    };
+    let mut start = pos;
+    while start > 0 && d.values[start - 1] == target {
+        start -= 1;
+    }
+    let mut end = pos + 1;
+    while end < d.values.len() && d.values[end] == target {
+        end += 1;
+    }
+    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+}
+
+fn eq_hits_bytes(d: &LoadedTypedBytes, target: &[u8]) -> Vec<IndexHit> {
+    let pos = match d.values.binary_search_by(|v| v.as_slice().cmp(target)) {
+        Ok(i) => i,
+        Err(_) => return Vec::new(),
+    };
+    let mut start = pos;
+    while start > 0 && d.values[start - 1].as_slice() == target {
+        start -= 1;
+    }
+    let mut end = pos + 1;
+    while end < d.values.len() && d.values[end].as_slice() == target {
+        end += 1;
+    }
+    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+}
+
+fn range_hits_i64(d: &LoadedTypedI64, range: RangeInclusive<i64>) -> Vec<IndexHit> {
+    let (lo, hi) = (*range.start(), *range.end());
+    // First index with value >= lo.
+    let start = d.values.partition_point(|v| *v < lo);
+    // First index with value > hi.
+    let end = d.values.partition_point(|v| *v <= hi);
+    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+}
+
+fn range_hits_i32(d: &LoadedTypedI32, range: RangeInclusive<i32>) -> Vec<IndexHit> {
+    let (lo, hi) = (*range.start(), *range.end());
+    let start = d.values.partition_point(|v| *v < lo);
+    let end = d.values.partition_point(|v| *v <= hi);
+    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+}
+
+fn range_hits_bytes(d: &LoadedTypedBytes, lo: &[u8], hi: &[u8]) -> Vec<IndexHit> {
+    let start = d.values.partition_point(|v| v.as_slice() < lo);
+    let end = d.values.partition_point(|v| v.as_slice() <= hi);
+    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+}
+
+fn collect_hits(
+    target_rgs: &[i32],
+    target_pages: &[i32],
+    rowsets: &[Vec<u8>],
+    start: usize,
+    end: usize,
+) -> Vec<IndexHit> {
+    let mut out = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end {
+        out.push(IndexHit {
+            row_group: target_rgs[i] as u32,
+            page: target_pages[i] as u32,
+            rowset: rowsets[i].clone(),
+        });
+    }
+    out
+}
+
+// ============================================================
+// Sanity helpers.
+// ============================================================
+
+fn check_aligned(
+    name: &str,
+    rg: usize,
+    n_values: usize,
+    target_rgs: &[i32],
+    target_pages: &[i32],
+    rowsets: &[Vec<u8>],
+) -> Result<()> {
+    if target_rgs.len() != n_values || target_pages.len() != n_values || rowsets.len() != n_values {
+        return Err(CodecError::InvalidInput(format!(
+            "index `{name}` row group {rg} has mismatched column lengths \
+             (value={n_values}, rg={}, page={}, rowset={})",
+            target_rgs.len(),
+            target_pages.len(),
+            rowsets.len(),
+        )));
+    }
+    Ok(())
+}
+
+fn sorted_physical_type(entry: &IndexEntry) -> Result<PhysicalType> {
+    match &entry.kind {
+        IndexKind::Sorted { physical_type, .. } => Ok(*physical_type),
+        _ => Err(CodecError::InvalidInput(format!(
+            "index `{}` is not a sorted index",
+            entry.name
+        ))),
+    }
+}
+
 fn codec_err(e: ManifestError) -> CodecError {
     CodecError::InvalidInput(format!("{e}"))
 }
 
-/// Walk the source file's depth-first schema list and return the
-/// leaf-column ordinal whose name matches `name`. Only flat REQUIRED
-/// schemas are supported in Π.17b (every TPC-H reference shape);
-/// nested-column path lookup arrives with Π.20+.
 fn resolve_leaf_by_name(source: &ParquetFile, name: &str) -> Result<usize> {
     let md = source
         .metadata()
         .map_err(|e| CodecError::InvalidInput(format!("source metadata: {e}")))?;
-    // schema[0] is the root group; subsequent entries are the leaves
-    // in depth-first order for a flat schema. Match by name.
     for (i, se) in md.schema.iter().enumerate().skip(1) {
         if se.name == name.as_bytes() {
             return Ok(i - 1);

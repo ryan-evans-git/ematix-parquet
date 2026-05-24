@@ -73,12 +73,26 @@ struct LoadedBloomPage {
     blooms: Vec<Vec<u8>>,
 }
 
+/// One loaded composite (INT64, INT64) leading-prefix index. Five
+/// parallel vectors: `(value_a, value_b)` is the sort key,
+/// `(target_rg, target_page, rowset)` carries the page-relative hit
+/// (anchored to `source_columns[0]`'s page layout).
+#[derive(Debug)]
+struct LoadedTypedCompositeI64I64 {
+    values_a: Vec<i64>,
+    values_b: Vec<i64>,
+    target_rgs: Vec<i32>,
+    target_pages: Vec<i32>,
+    rowsets: Vec<Vec<u8>>,
+}
+
 #[derive(Debug)]
 enum LoadedIndexData {
     SortedI64(LoadedTypedI64),
     SortedI32(LoadedTypedI32),
     SortedBytes(LoadedTypedBytes),
     BloomPage(LoadedBloomPage),
+    CompositePrefixI64I64(LoadedTypedCompositeI64I64),
 }
 
 #[derive(Debug)]
@@ -209,6 +223,57 @@ impl ParquetIndex {
                         data,
                     });
                 }
+                IndexKind::CompositePrefix {
+                    source_columns,
+                    physical_types,
+                } => {
+                    // MVP: only (INT64, INT64) is supported.
+                    if source_columns.len() != 2
+                        || physical_types.len() != 2
+                        || physical_types[0] != PhysicalType::Int64
+                        || physical_types[1] != PhysicalType::Int64
+                    {
+                        return Err(CodecError::InvalidInput(format!(
+                            "composite-prefix index `{}`: MVP supports exactly (INT64, INT64); got types {:?}",
+                            entry.name, physical_types
+                        )));
+                    }
+                    let rg = entry.sidecar_row_group as usize;
+                    // Schema: value_a INT64, value_b INT64, target_rg INT32, target_page INT32, target_rowset BYTE_ARRAY.
+                    let values_a = read_column_i64(&idx_file, rg, 0)?;
+                    let values_b = read_column_i64(&idx_file, rg, 1)?;
+                    let target_rgs = read_column_i32(&idx_file, rg, 2)?;
+                    let target_pages = read_column_i32(&idx_file, rg, 3)?;
+                    let rowsets = read_column_byte_array(&idx_file, rg, 4)?;
+                    let n = values_a.len();
+                    if values_b.len() != n
+                        || target_rgs.len() != n
+                        || target_pages.len() != n
+                        || rowsets.len() != n
+                    {
+                        return Err(CodecError::InvalidInput(format!(
+                            "composite-prefix index `{}` row group {} has mismatched column lengths \
+                             (a={}, b={}, rg={}, page={}, rowset={})",
+                            entry.name,
+                            rg,
+                            n,
+                            values_b.len(),
+                            target_rgs.len(),
+                            target_pages.len(),
+                            rowsets.len()
+                        )));
+                    }
+                    indexes.push(LoadedIndex {
+                        entry: entry.clone(),
+                        data: LoadedIndexData::CompositePrefixI64I64(LoadedTypedCompositeI64I64 {
+                            values_a,
+                            values_b,
+                            target_rgs,
+                            target_pages,
+                            rowsets,
+                        }),
+                    });
+                }
                 IndexKind::BloomPage { .. } => {
                     let rg = entry.sidecar_row_group as usize;
                     // Schema: source_rg INT32, source_page INT32, bloom_block BYTE_ARRAY.
@@ -332,6 +397,101 @@ impl ParquetIndex {
                 "lookup_range: key/index type mismatch on `{index_name}`"
             ))),
         }
+    }
+
+    // ============================================================
+    // Composite leading-prefix lookups
+    // ============================================================
+
+    /// Exact 2-tuple equality on a composite `(INT64, INT64)` index.
+    /// Returns every `(rg, page, rowset)` triple containing rows
+    /// where `(value_a, value_b) == (key_a, key_b)`.
+    ///
+    /// Anchored to `source_columns[0]`'s page layout — see
+    /// [`crate::index::IndexBuilder::write_sorted_composite_prefix_i64_i64`].
+    pub fn lookup_composite_eq(
+        &self,
+        index_name: &str,
+        key_a: &Key<'_>,
+        key_b: &Key<'_>,
+    ) -> Result<Vec<IndexHit>> {
+        let idx = self.find_index(index_name)?;
+        let d = match &idx.data {
+            LoadedIndexData::CompositePrefixI64I64(d) => d,
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
+                    "lookup_composite_eq: index `{index_name}` is not a (INT64, INT64) composite-prefix index"
+                )))
+            }
+        };
+        let (a, b) = match (key_a, key_b) {
+            (Key::I64(a), Key::I64(b)) => (*a, *b),
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
+                    "lookup_composite_eq: key variants `{}`+`{}` do not match (INT64, INT64)",
+                    key_a.variant_name(),
+                    key_b.variant_name()
+                )))
+            }
+        };
+        Ok(composite_eq_hits(d, a, b))
+    }
+
+    /// Leading-prefix equality on a composite `(INT64, INT64)`
+    /// index: returns every hit whose `value_a == key_a`, regardless
+    /// of `value_b`. The trailing dimension is left free — useful
+    /// for "WHERE col_a = X AND col_b IN [...]"-shaped predicates
+    /// where the IN-list is too big to lookup point-wise.
+    pub fn lookup_composite_prefix(
+        &self,
+        index_name: &str,
+        key_a: &Key<'_>,
+    ) -> Result<Vec<IndexHit>> {
+        let idx = self.find_index(index_name)?;
+        let d = match &idx.data {
+            LoadedIndexData::CompositePrefixI64I64(d) => d,
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
+                    "lookup_composite_prefix: index `{index_name}` is not a (INT64, INT64) composite-prefix index"
+                )))
+            }
+        };
+        let a = match key_a {
+            Key::I64(a) => *a,
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
+                    "lookup_composite_prefix: key variant `{}` does not match INT64",
+                    key_a.variant_name()
+                )))
+            }
+        };
+        Ok(composite_prefix_hits(d, a))
+    }
+
+    /// `INT64` exact 2-tuple composite + masked decode. Equivalent
+    /// to: `lookup_composite_eq → assemble per-rg bitmap → read_column_i64_masked_into`.
+    pub fn read_column_i64_where_composite_eq(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key_a: i64,
+        key_b: i64,
+        target_column: usize,
+    ) -> Result<Vec<i64>> {
+        let hits = self.lookup_composite_eq(index_name, &Key::I64(key_a), &Key::I64(key_b))?;
+        self.materialize_i64_composite(source, index_name, &hits, target_column)
+    }
+
+    /// `INT64` leading-prefix composite + masked decode.
+    pub fn read_column_i64_where_composite_prefix(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key_a: i64,
+        target_column: usize,
+    ) -> Result<Vec<i64>> {
+        let hits = self.lookup_composite_prefix(index_name, &Key::I64(key_a))?;
+        self.materialize_i64_composite(source, index_name, &hits, target_column)
     }
 
     // ============================================================
@@ -595,6 +755,21 @@ impl ParquetIndex {
         Ok(out)
     }
 
+    /// Composite-index sibling of [`Self::materialize_i64`]. Same
+    /// body — `assemble_bitmaps` already dispatches on Sorted vs
+    /// CompositePrefix to find the indexed column — but exposed as a
+    /// separately-named helper so future composite-specific
+    /// optimizations don't have to retrofit the sorted-only path.
+    fn materialize_i64_composite(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        hits: &[IndexHit],
+        target_column: usize,
+    ) -> Result<Vec<i64>> {
+        self.materialize_i64(source, index_name, hits, target_column)
+    }
+
     fn materialize_i32(
         &self,
         source: &ParquetFile,
@@ -648,6 +823,11 @@ impl ParquetIndex {
     /// sized to the row group's `num_rows`; bits are placed using
     /// the *indexed* column's page boundaries (since rowsets are
     /// page-relative to the indexed column).
+    ///
+    /// Works for both Sorted and CompositePrefix index kinds — the
+    /// "indexed column" for a composite is `source_columns[0]` (the
+    /// leading sort key, which is the column whose page layout
+    /// rowsets are anchored to by the builder).
     fn assemble_bitmaps(
         &self,
         source: &ParquetFile,
@@ -657,9 +837,16 @@ impl ParquetIndex {
         let idx = self.find_index(index_name)?;
         let source_col_name = match &idx.entry.kind {
             IndexKind::Sorted { source_column, .. } => source_column.as_str(),
+            IndexKind::CompositePrefix { source_columns, .. } => {
+                source_columns.first().map(String::as_str).ok_or_else(|| {
+                    CodecError::InvalidInput(format!(
+                        "composite index `{index_name}` has empty source_columns"
+                    ))
+                })?
+            }
             _ => {
                 return Err(CodecError::InvalidInput(format!(
-                    "index `{index_name}` is not a sorted index"
+                    "index `{index_name}` does not produce IndexHits"
                 )))
             }
         };
@@ -787,6 +974,52 @@ fn range_hits_bytes(d: &LoadedTypedBytes, lo: &[u8], hi: &[u8]) -> Vec<IndexHit>
     let start = d.values.partition_point(|v| v.as_slice() < lo);
     let end = d.values.partition_point(|v| v.as_slice() <= hi);
     collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+}
+
+fn composite_eq_hits(d: &LoadedTypedCompositeI64I64, a: i64, b: i64) -> Vec<IndexHit> {
+    // Two-step binary search:
+    //   1. Find the run where values_a == a (partition by `< a` and `<= a`).
+    //   2. Within that run, find the row where values_b == b.
+    // Both runs are tiny once values_a is pinned, so a linear scan
+    // for the second step is fine and avoids a second sorted-by-b
+    // contract requirement.
+    let a_start = d.values_a.partition_point(|v| *v < a);
+    let a_end = d.values_a.partition_point(|v| *v <= a);
+    if a_start == a_end {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // Within the a-run, the rows are sorted by (a, b, rg, page).
+    // Since values_a is constant, sort within the run is by (b, rg, page).
+    // Use binary search on b for efficiency.
+    let b_slice = &d.values_b[a_start..a_end];
+    let b_start_local = b_slice.partition_point(|v| *v < b);
+    let b_end_local = b_slice.partition_point(|v| *v <= b);
+    if b_start_local == b_end_local {
+        return out;
+    }
+    for i in (a_start + b_start_local)..(a_start + b_end_local) {
+        out.push(IndexHit {
+            row_group: d.target_rgs[i] as u32,
+            page: d.target_pages[i] as u32,
+            rowset: d.rowsets[i].clone(),
+        });
+    }
+    out
+}
+
+fn composite_prefix_hits(d: &LoadedTypedCompositeI64I64, a: i64) -> Vec<IndexHit> {
+    let start = d.values_a.partition_point(|v| *v < a);
+    let end = d.values_a.partition_point(|v| *v <= a);
+    let mut out = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end {
+        out.push(IndexHit {
+            row_group: d.target_rgs[i] as u32,
+            page: d.target_pages[i] as u32,
+            rowset: d.rowsets[i].clone(),
+        });
+    }
+    out
 }
 
 fn collect_hits(

@@ -24,8 +24,8 @@
 //! regions ahead of the (possibly compressed) values, with the lengths
 //! stored on the page header itself. Not handled here yet.
 
-use ematix_parquet_format::types::FieldRepetitionType;
 use ematix_parquet_format::metadata::SchemaElement;
+use ematix_parquet_format::types::FieldRepetitionType;
 
 use crate::error::{CodecError, Result};
 use crate::rle::decode_rle_bit_packed;
@@ -158,10 +158,7 @@ pub fn skip_v1_level_prefixes(
 /// - `Repeated` field: `max_rep_level += 1` AND `max_def_level += 1`.
 ///
 /// Returns an error if `leaf_index` is past the number of leaves.
-pub fn compute_max_levels(
-    schema: &[SchemaElement<'_>],
-    leaf_index: usize,
-) -> Result<(u16, u16)> {
+pub fn compute_max_levels(schema: &[SchemaElement<'_>], leaf_index: usize) -> Result<(u16, u16)> {
     if schema.is_empty() {
         return Err(CodecError::InvalidInput("empty schema".into()));
     }

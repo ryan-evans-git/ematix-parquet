@@ -100,9 +100,8 @@ fn main() {
             let _ = time_read(&bytes, n);
         }
         // Timed
-        let mut samples: Vec<std::time::Duration> = (0..timed_runs)
-            .map(|_| time_read(&bytes, n))
-            .collect();
+        let mut samples: Vec<std::time::Duration> =
+            (0..timed_runs).map(|_| time_read(&bytes, n)).collect();
         samples.sort();
         let median = samples[timed_runs / 2];
         let ns_per_value = median.as_nanos() as f64 / n as f64;

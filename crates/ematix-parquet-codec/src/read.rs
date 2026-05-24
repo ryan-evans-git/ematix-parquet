@@ -224,7 +224,8 @@ pub fn read_column_byte_array_masked_into(
                     }
                     continue;
                 }
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode_byte_array_into(
@@ -324,7 +325,8 @@ pub fn read_column_byte_array_offsets_masked_into(
                     }
                     continue;
                 }
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode_byte_array_offsets_into(
@@ -445,7 +447,8 @@ pub fn read_column_byte_array_into(
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         let slices = decode_plain_byte_array(info.values)?;
@@ -583,7 +586,8 @@ pub fn read_column_byte_array_dict_preserved_into(
                         "dict-preserved read: data page before dictionary (column has no DictionaryPage)".into(),
                     ));
                 }
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
                         // Append directly into the caller-provided
@@ -741,7 +745,8 @@ pub fn read_column_byte_array_dict_preserved_u8_into(
                         "dict-preserved u8 read: data page before dictionary (column has no DictionaryPage)".into(),
                     ));
                 }
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
                         // `decode_rle_dictionary_indices_u8_into` enforces
@@ -856,7 +861,8 @@ where
                     ));
                 }
                 let mut owned = Vec::new();
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut owned)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut owned)?;
                 match info.encoding {
                     Encoding::RleDictionary | Encoding::PlainDictionary => {}
                     Encoding::Plain => {
@@ -1090,7 +1096,8 @@ where
                     ));
                 }
                 let mut owned = Vec::new();
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut owned)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut owned)?;
                 match info.encoding {
                     Encoding::RleDictionary | Encoding::PlainDictionary => {}
                     Encoding::Plain => {
@@ -1338,7 +1345,8 @@ pub fn read_column_byte_array_offsets_into(
                 }
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         // PLAIN body: u32_le length + bytes, repeated.
@@ -1516,7 +1524,8 @@ pub fn read_column_flba_into(
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         let slices = decode_plain_fixed_len_byte_array(info.values, type_length)?;
@@ -1721,7 +1730,8 @@ fn decode_chunk_masked_into<T: Copy>(
                 if !keep {
                     continue;
                 }
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         out.extend(decode_plain(info.values)?);
@@ -1889,7 +1899,8 @@ fn decode_chunk_into<T: Copy>(
                 dict = decode_plain(&decomp)?;
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         out.extend(decode_plain(info.values)?);
@@ -1980,7 +1991,8 @@ fn decode_chunk_row_masked_into<T: Copy>(
                     }
                     continue;
                 }
-                let info = data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode(info.values, page_n, mask, row_cursor, out)?;

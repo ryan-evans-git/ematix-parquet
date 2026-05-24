@@ -207,6 +207,12 @@ pub struct WriteOptions<'a> {
     /// RG slice; `None` skips bloom for that column. Length must
     /// equal columns.len().
     pub bloom_fpps: Option<&'a [Option<f64>]>,
+    /// Footer-level `KeyValueMetadata` entries (Parquet spec field 5
+    /// of `FileMetaData`). Each tuple is `(key, value)`. Used by the
+    /// sidecar-index builder to embed an `IndexManifest` JSON under
+    /// `ematix_index_manifest_v1`; equally usable by any caller that
+    /// wants to tag the file (created-by-version, schema URI, etc.).
+    pub kv_metadata: Option<&'a [(&'a str, &'a str)]>,
 }
 
 impl Default for WriteOptions<'_> {
@@ -218,6 +224,7 @@ impl Default for WriteOptions<'_> {
             codec_per_column: None,
             dict_per_column: None,
             bloom_fpps: None,
+            kv_metadata: None,
         }
     }
 }
@@ -427,6 +434,7 @@ pub fn write_table_with_options<W: Write>(
         options.bloom_fpps,
         options.dict_per_column,
         options.codec_per_column,
+        options.kv_metadata,
     )
 }
 
@@ -468,6 +476,7 @@ fn write_table_inner_full<W: Write>(
         bloom_fpps,
         dict_per_column,
         None,
+        None,
     )
 }
 
@@ -481,6 +490,7 @@ fn write_table_inner_full_v2<W: Write>(
     bloom_fpps: Option<&[Option<f64>]>,
     dict_per_column: Option<&[bool]>,
     codec_per_column: Option<&[CompressionCodec]>,
+    kv_metadata: Option<&[(&str, &str)]>,
 ) -> Result<()> {
     if columns.is_empty() {
         return Err(CodecError::InvalidInput(
@@ -842,12 +852,21 @@ fn write_table_inner_full_v2<W: Write>(
         });
     }
 
+    let kv_vec: Option<Vec<ematix_parquet_format::metadata::KeyValue<'_>>> =
+        kv_metadata.map(|kvs| {
+            kvs.iter()
+                .map(|(k, v)| ematix_parquet_format::metadata::KeyValue {
+                    key: k.as_bytes(),
+                    value: Some(v.as_bytes()),
+                })
+                .collect()
+        });
     let md = FileMetaData {
         version: 1,
         schema,
         num_rows: total_rows as i64,
         row_groups,
-        key_value_metadata: None,
+        key_value_metadata: kv_vec,
         created_by: Some(b"ematix-parquet 0.0.1"),
         column_orders: None,
         encryption_algorithm: None,

@@ -19,7 +19,7 @@ use crate::compact_writer::Writer;
 use crate::metadata::{
     AesGcmCtrV1, AesGcmV1, ColumnChunk, ColumnCryptoMetaData, ColumnMetaData, DataPageHeader,
     DataPageHeaderV2, DictionaryPageHeader, EncryptionAlgorithm, EncryptionWithColumnKey,
-    FileCryptoMetaData, FileMetaData, PageHeader, RowGroup, SchemaElement, Statistics,
+    FileCryptoMetaData, FileMetaData, KeyValue, PageHeader, RowGroup, SchemaElement, Statistics,
 };
 
 /// Encode a `PageHeader` into the compact-protocol wire form. Returns
@@ -255,9 +255,14 @@ fn encode_file_metadata(w: &mut Writer, md: &FileMetaData<'_>) {
 
     let mut prev: i16 = 4;
 
-    // 5: key_value_metadata — not yet on the write path.
-    if md.key_value_metadata.is_some() {
-        panic!("FileMetaData.key_value_metadata write not yet implemented");
+    // 5: key_value_metadata (list<KeyValue>, optional)
+    if let Some(ref kvs) = md.key_value_metadata {
+        w.write_field_header(5, FieldType::List, prev);
+        w.write_list_header(kvs.len(), FieldType::Struct);
+        for kv in kvs {
+            encode_key_value(w, kv);
+        }
+        prev = 5;
     }
 
     // 6: created_by (binary, optional)
@@ -286,6 +291,26 @@ fn encode_file_metadata(w: &mut Writer, md: &FileMetaData<'_>) {
         prev = 9;
     }
 
+    let _ = prev;
+    w.write_field_stop();
+}
+
+/// Encode one `KeyValue` (footer KV metadata) entry. Thrift shape:
+///   1: key   (binary/string, required)
+///   2: value (binary/string, optional)
+/// We treat both as raw bytes via `write_binary` — Parquet's wire
+/// format makes no distinction at the compact-protocol layer.
+fn encode_key_value(w: &mut Writer, kv: &KeyValue<'_>) {
+    // 1: key (required)
+    w.write_field_header(1, FieldType::Binary, 0);
+    w.write_binary(kv.key);
+    let mut prev: i16 = 1;
+    // 2: value (optional)
+    if let Some(v) = kv.value {
+        w.write_field_header(2, FieldType::Binary, prev);
+        w.write_binary(v);
+        prev = 2;
+    }
     let _ = prev;
     w.write_field_stop();
 }

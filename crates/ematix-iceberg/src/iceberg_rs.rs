@@ -211,6 +211,102 @@ pub fn summary_for(
     }
 }
 
+// ============================================================
+// Sidecar URI resolution + pruned-file candidates (Π.22a)
+// ============================================================
+
+/// Join a sidecar path against the data file's directory, producing
+/// the URI a sidecar reader would open.
+///
+/// Rules (in order):
+/// 1. If `relative` already names an absolute URI (contains `"://"`)
+///    or starts with `/`, it is returned unchanged. Producers that
+///    write absolute sidecar paths get back exactly what they wrote.
+/// 2. Otherwise the prefix of `data_file_uri` up to (and excluding)
+///    the final `/` is joined with `relative`. Works uniformly for
+///    `s3://bucket/dir/file.parquet`, `file:///abs/file.parquet`,
+///    and `/abs/file.parquet`.
+/// 3. If `data_file_uri` has no `/` at all, `relative` is returned
+///    unchanged (no directory to anchor to).
+///
+/// Resolution is purely textual — no canonicalization, no `..`
+/// support, no scheme-aware normalization. The producer side is
+/// responsible for writing sane relative paths; the consumer side
+/// gets a 1-line transformation.
+pub fn resolve_sidecar_uri(data_file_uri: &str, relative: &str) -> String {
+    if relative.starts_with('/') || relative.contains("://") {
+        return relative.to_string();
+    }
+    match data_file_uri.rfind('/') {
+        Some(idx) => {
+            let mut out = String::with_capacity(idx + 1 + relative.len());
+            out.push_str(&data_file_uri[..idx]);
+            out.push('/');
+            out.push_str(relative);
+            out
+        }
+        None => relative.to_string(),
+    }
+}
+
+/// A [`DataFile`] that survived pruning, bundled with its ematix
+/// extension and the resolved URI of the per-file sidecar.
+///
+/// This is the unit of work a query executor iterates over: each
+/// candidate is one file to open with [`ematix_parquet_codec`]'s
+/// `ParquetFile::open(<file_path>)` followed by
+/// `ParquetIndex::open(<sidecar_uri>, &source)`, then a sidecar
+/// lookup against the chosen index.
+///
+/// Owned (not borrowed) because the producer-side pipeline often
+/// consumes its input `Vec<DataFile>` to produce candidates and
+/// then hands them off to async I/O — borrows would tangle
+/// lifetimes with the iceberg manifest walker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunedDataFile {
+    /// Original Iceberg manifest entry; carries `file_path` (URI),
+    /// `record_count`, partition tuple, etc.
+    pub data_file: DataFile,
+    /// Decoded ematix extension. Always present — files without
+    /// our extension don't become `PrunedDataFile`s (see
+    /// [`pair_with_extensions`]).
+    pub extension: EmatixDataFileExtension,
+    /// Fully resolved sidecar URI (output of [`resolve_sidecar_uri`]).
+    /// Pre-computed so the executor doesn't repeat the resolution per
+    /// query against the same candidate set.
+    pub sidecar_uri: String,
+}
+
+/// Pair each [`DataFile`] with its ematix extension and the resolved
+/// sidecar URI, **dropping files that lack our extension**. The
+/// "drop on missing extension" choice is the only place in this
+/// crate that's not conservative — the contract is "candidates are
+/// files we can plan against", and we can't plan against a file
+/// with no sidecar pointer.
+///
+/// Callers that want to keep "no extension" files (e.g. for a
+/// fallback full-scan path) should use [`prune_data_files_eq`] /
+/// [`prune_data_files_range`] directly and pair manually.
+///
+/// Errors only when an extension *is* present but malformed —
+/// `Ok(None)` from [`extract_extension`] is normal and silently
+/// drops the file.
+pub fn pair_with_extensions(files: Vec<DataFile>) -> Result<Vec<PrunedDataFile>> {
+    let mut out = Vec::with_capacity(files.len());
+    for df in files {
+        let Some(ext) = extract_extension(&df)? else {
+            continue;
+        };
+        let sidecar_uri = resolve_sidecar_uri(df.file_path(), &ext.sidecar_relative_path);
+        out.push(PrunedDataFile {
+            data_file: df,
+            extension: ext,
+            sidecar_uri,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +587,151 @@ mod tests {
             Some(encode_key_metadata(&ext_with_i64_range("idx_y", 1, 99))),
         );
         assert!(summary_for(&f1, "idx_x").unwrap().is_none());
+    }
+
+    // ============================================================
+    // Π.22a: resolve_sidecar_uri + pair_with_extensions
+    // ============================================================
+
+    #[test]
+    fn resolve_sidecar_s3_uri() {
+        assert_eq!(
+            resolve_sidecar_uri("s3://bucket/dir/file.parquet", "file.parquet.idx"),
+            "s3://bucket/dir/file.parquet.idx"
+        );
+        assert_eq!(
+            resolve_sidecar_uri("s3://bucket/dir/file.parquet", "sub/file.idx"),
+            "s3://bucket/dir/sub/file.idx"
+        );
+    }
+
+    #[test]
+    fn resolve_sidecar_file_scheme_uri() {
+        assert_eq!(
+            resolve_sidecar_uri("file:///abs/dir/file.parquet", "file.parquet.idx"),
+            "file:///abs/dir/file.parquet.idx"
+        );
+    }
+
+    #[test]
+    fn resolve_sidecar_bare_absolute_path() {
+        assert_eq!(
+            resolve_sidecar_uri("/abs/dir/file.parquet", "file.parquet.idx"),
+            "/abs/dir/file.parquet.idx"
+        );
+    }
+
+    #[test]
+    fn resolve_sidecar_no_directory_in_data_path() {
+        // Bare filename input: nothing to anchor against, the relative
+        // path is returned as-is.
+        assert_eq!(
+            resolve_sidecar_uri("file.parquet", "file.parquet.idx"),
+            "file.parquet.idx"
+        );
+    }
+
+    #[test]
+    fn resolve_sidecar_absolute_relative_overrides_directory() {
+        // If the producer wrote an absolute path (leading slash) into
+        // the extension, honor it — don't anchor against the data
+        // file's directory.
+        assert_eq!(
+            resolve_sidecar_uri("s3://bucket/dir/file.parquet", "/other/path.idx"),
+            "/other/path.idx"
+        );
+    }
+
+    #[test]
+    fn resolve_sidecar_full_uri_relative_overrides_directory() {
+        // A relative path that itself contains a scheme is treated as
+        // absolute — useful for cross-bucket setups.
+        assert_eq!(
+            resolve_sidecar_uri("s3://bucket/dir/file.parquet", "s3://other-bucket/path.idx"),
+            "s3://other-bucket/path.idx"
+        );
+    }
+
+    #[test]
+    fn resolve_sidecar_root_directory() {
+        // Data file directly under root, sidecar relative.
+        assert_eq!(
+            resolve_sidecar_uri("/file.parquet", "sidecar.idx"),
+            "/sidecar.idx"
+        );
+    }
+
+    #[test]
+    fn pair_with_extensions_skips_files_without_extension() {
+        // Mixed input: 2 files with our extension, 1 without, 1 with
+        // foreign key_metadata. Only the 2 with extensions survive.
+        let f1 = make_data_file(
+            "s3://b/dir/f1.parquet",
+            Some(encode_key_metadata(&ext_with_i64_range("idx_x", 0, 99))),
+        );
+        let f2 = make_data_file("s3://b/dir/f2.parquet", None);
+        let f3 = make_data_file(
+            "s3://b/dir/f3.parquet",
+            Some(encode_key_metadata(&ext_with_i64_range("idx_x", 100, 199))),
+        );
+        let f4 = make_data_file(
+            "s3://b/dir/f4.parquet",
+            Some(b"foreign_bytes_no_magic".to_vec()),
+        );
+
+        let candidates = pair_with_extensions(vec![f1, f2, f3, f4]).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].data_file.file_path(), "s3://b/dir/f1.parquet");
+        assert_eq!(candidates[0].sidecar_uri, "s3://b/dir/idx_x.idx");
+        assert_eq!(candidates[1].data_file.file_path(), "s3://b/dir/f3.parquet");
+        assert_eq!(candidates[1].sidecar_uri, "s3://b/dir/idx_x.idx");
+    }
+
+    #[test]
+    fn pair_with_extensions_errors_on_malformed() {
+        // A magic-prefixed but malformed payload errors loudly rather
+        // than silently dropping the file (which would mask a bug).
+        let mut bad = KEY_METADATA_MAGIC.to_vec();
+        bad.extend_from_slice(b"not even close to JSON");
+        let f1 = make_data_file("s3://b/dir/f1.parquet", Some(bad));
+        let err = pair_with_extensions(vec![f1]).unwrap_err();
+        assert!(matches!(err, IcebergIndexError::Malformed(_)));
+    }
+
+    #[test]
+    fn pair_with_extensions_empty_input() {
+        let candidates = pair_with_extensions(vec![]).unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn pair_with_extensions_resolves_sidecar_at_root() {
+        // Data file at top of bucket — sidecar resolves to top of
+        // bucket too.
+        let ext = EmatixDataFileExtension {
+            sidecar_relative_path: "sidecar.idx".into(),
+            summaries: vec![],
+        };
+        let f1 = make_data_file("s3://bucket/file.parquet", Some(encode_key_metadata(&ext)));
+        let candidates = pair_with_extensions(vec![f1]).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].sidecar_uri, "s3://bucket/sidecar.idx");
+    }
+
+    #[test]
+    fn pair_with_extensions_respects_absolute_sidecar_path() {
+        // Producer wrote an absolute sidecar URI in the extension —
+        // pair honors it instead of anchoring to data_file's dir.
+        let ext = EmatixDataFileExtension {
+            sidecar_relative_path: "s3://other-bucket/sidecar.idx".into(),
+            summaries: vec![],
+        };
+        let f1 = make_data_file(
+            "s3://bucket/dir/file.parquet",
+            Some(encode_key_metadata(&ext)),
+        );
+        let candidates = pair_with_extensions(vec![f1]).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].sidecar_uri, "s3://other-bucket/sidecar.idx");
     }
 }

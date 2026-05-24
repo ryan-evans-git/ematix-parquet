@@ -72,6 +72,18 @@ jobs:
       - name: Run tests (parallel feature)
         run: cargo test --workspace --all-targets --features ematix-parquet-codec/parallel
 
+      # Iceberg feature (Π.21b) pulls iceberg-rust in; the
+      # `iceberg_rs` module wires our EmatixDataFileExtension onto
+      # real `iceberg::spec::DataFile.key_metadata`. Default builds
+      # stay light (no iceberg dep tree); we exercise the integration
+      # explicitly here so the prune helpers + extract/attach round-
+      # trips stay green.
+      - name: Build workspace (iceberg feature)
+        run: cargo build --workspace --all-targets --features ematix-iceberg/iceberg
+
+      - name: Run tests (iceberg feature)
+        run: cargo test --workspace --all-targets --features ematix-iceberg/iceberg
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

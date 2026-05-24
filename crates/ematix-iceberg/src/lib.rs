@@ -1,4 +1,4 @@
-//! Iceberg integration for ematix-parquet sidecar indexes (Π.21a).
+//! Iceberg integration for ematix-parquet sidecar indexes.
 //!
 //! ## What this crate is
 //!
@@ -12,12 +12,12 @@
 //! 2. **Locate the per-file sidecar** via a relative path stored in
 //!    the manifest entry alongside the data file itself.
 //!
-//! This crate carries **only the contract** — the on-wire JSON shape,
-//! the typed Rust struct, and the pruning predicate. Wiring into
-//! `iceberg-rust` (reading/writing real Iceberg manifests) lives in
-//! Π.21b. Once that lands the scaffolding here gets one more user:
-//! the `iceberg::spec::DataFile` builder fills in the extension JSON
-//! via the standard `key_metadata` or properties channel.
+//! By default the crate carries only the **contract** — the on-wire
+//! JSON shape, the typed Rust struct, and the pruning predicate. The
+//! `iceberg-rust` integration that reads/writes the JSON onto real
+//! [`iceberg::spec::DataFile`] entries lives behind the optional
+//! `iceberg` Cargo feature; default builds stay dep-light (no tokio /
+//! opendal / arrow pulled in transitively).
 //!
 //! ## Why this layer exists
 //!
@@ -47,6 +47,10 @@
 //!   blob: sidecar relative path + summaries vec), JSON encode/decode,
 //!   and the Iceberg property key constants ([`EMATIX_EXTENSION_KEY`]).
 //! - [`error`] — [`IcebergIndexError`], returned by JSON decode.
+//! - [`iceberg_rs`] *(feature `iceberg`)* — encode/decode the
+//!   extension into [`iceberg::spec::DataFile::key_metadata`], plus
+//!   file-level prune helpers ([`iceberg_rs::prune_data_files_eq`],
+//!   [`iceberg_rs::prune_data_files_range`]).
 //!
 //! ## Wire format (stable as of Π.21)
 //!
@@ -59,6 +63,9 @@
 pub mod error;
 pub mod extension;
 pub mod summary;
+
+#[cfg(feature = "iceberg")]
+pub mod iceberg_rs;
 
 pub use error::IcebergIndexError;
 pub use extension::{EmatixDataFileExtension, EMATIX_EXTENSION_KEY, EMATIX_EXTENSION_VERSION};

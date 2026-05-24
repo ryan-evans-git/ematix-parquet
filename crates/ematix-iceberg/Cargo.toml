@@ -2,7 +2,12 @@
 name = "ematix-iceberg"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Local rust-version override (workspace pins 1.80). The `iceberg`
+# feature pulls `iceberg = "0.6"` which itself pins MSRV to 1.85;
+# users opting into that feature need a newer toolchain. The contract
+# layer (default-features) keeps the workspace MSRV bound and stays
+# usable on 1.80.
+rust-version = "1.85"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -18,6 +23,16 @@ name = "ematix_iceberg"
 # crate also re-exports `PhysicalType` which we mirror onto our
 # `SummaryKey` discriminant.
 ematix-parquet-codec = { path = "../ematix-parquet-codec", version = "0.15" }
+# Iceberg-rust. Optional; gates the `iceberg_rs` module that wires the
+# extension JSON onto real `iceberg::spec::DataFile` entries. Pulls a
+# big dep tree (tokio, opendal, arrow) so default builds stay light.
+iceberg = { version = "0.6", optional = true }
 
 [lints]
 workspace = true
+
+[features]
+# Enable the `iceberg_rs` integration module — encode/decode of our
+# extension JSON into `DataFile.key_metadata`, plus prune-by-summary
+# helpers over Vec<DataFile>. Off by default.
+iceberg = ["dep:iceberg"]

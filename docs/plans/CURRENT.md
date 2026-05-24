@@ -1279,6 +1279,113 @@ sized/capped variants and the page-skip refactor).
 
 ---
 
+## v0.15.0 — V1 level-prefix correctness + portable predicate-bitmap autovec
+
+One correctness fix in the V1 page reader, one perf-hygiene rewrite
+of a scalar fallback kernel, and one negative-result benchmark
+landed on top of v0.14.0. No write-path, format, or async-façade
+changes — strictly the sync codec.
+
+### Correctness: V1 data-page rep + def level prefixes (#75)
+
+`data_page_view` previously assumed every V1 page body, after
+decompression, was the values bytes — passed straight to the
+dict-encoding / plain decoder. That works for REQUIRED non-nested
+columns (`max_rep_level = 0`, `max_def_level = 0`), but the parquet
+V1 wire format is `[rep_lev RLE][def_lev RLE][values]` whenever
+either level can be non-zero, with each level stream prefixed by a
+u32 LE byte length.
+
+The bug was latent because every TPC-H reference parquet file the
+codec had been exercised against was written with REQUIRED columns.
+It surfaced when re-encoding a TPC-H lineitem to LZ4_RAW via
+`DuckDB COPY ... (COMPRESSION 'lz4_raw')` — DuckDB writes those
+columns as Optional under that codec, which exposed
+`masked_decode_i32` to a wire-format EOF: the misaligned cursor
+tried to read a length-prefixed binary out of garbage bytes (the
+def-level RLE payload mistaken for the start of dict indices),
+triggering a 2-3 MB `Cursor::take(n)` against a body with only
+~1.5 MB remaining.
+
+Fix lands as two new functions in `levels.rs`:
+- `compute_max_levels(schema, leaf_index) -> (u16, u16)` walks the
+  depth-first schema list, accumulating one def-level per Optional
+  or Repeated ancestor and one rep-level per Repeated ancestor.
+- `skip_v1_level_prefixes(body, max_rep, max_def) -> usize`
+  returns the byte offset where the values section begins, without
+  materializing the level vectors. The hot path can't afford a 2
+  MB `Vec<u16>` of all-1s per page for a fully-non-null Optional
+  column.
+
+`data_page_view`, `read_chunk_raw`, `ColumnBatchIter`, and
+`ColumnByteArrayBatchIter` now thread `(max_rep_level,
+max_def_level)` through. For REQUIRED non-nested columns the body
+passes through unchanged via the `max_rep == 0 && max_def == 0`
+fast path — no behavioural or perf change on TPC-H REQUIRED-shape
+parquet (every existing reference file).
+
+Five new unit tests on `compute_max_levels` cover Required /
+Optional / Repeated single-leaf schemas plus an alternating-
+rep-type flat schema. All ~270 existing codec tests continue to
+pass.
+
+### Perf: portable predicate-bitmap pack autovec (#76)
+
+`fused_bitmap_chunk` (the dict-encoded predicate→bitmap kernel)
+dispatches to hand-rolled NEON for `bit_width ∈ {12,14,15,16,17,18}`
+on aarch64. Everything else — **all x86_64**, plus aarch64 widths
+outside that set — fell through to a scalar fallback that wrote
+one output byte at a time with a row-dependent shift:
+
+```rust
+out[out_start + row / 8] |= bit << (row % 8);
+```
+
+That shape is byte-granular read-modify-write; LLVM can't widen
+it. The autovec opportunity was lost.
+
+Rewrite the fallback in the same lane-parallel branchless shape
+that `pack_predicate_byte` in `bitpack_neon` already uses for the
+NEON fast paths: process 8 rows per output byte, 8 independent
+dict_mask loads, fold with the fixed `b0 | (b1<<1) | ... | (b7<<7)`
+chain. Pure Rust — no intrinsics, no `target_feature` — so it
+autovectorizes on whatever target LLVM has.
+
+Per-row bounds elision: `decode_rle_dictionary_predicate_bitmap`
+(the only caller of `fused_bitmap_chunk`) already enforces
+`dict_mask.len() >= 1 << bit_width`, and indices produced by
+`unpack_indices_into` are `bit_width`-bounded by construction
+(`idx < 2^bit_width ≤ dict_mask.len()`). The NEON kernels rely on
+this exact precondition; the splash-shaped fallback matches their
+contract. The `CodecError::DictIndexOutOfRange` error path at this
+specific site is unreachable on valid input and was removed (the
+error variant remains — it's still used by ~ten other dict paths).
+
+No change to the NEON intrinsic kernels; `bw ∈ {12,14,15,16,17,18}`
+on aarch64 still hits `decode_predicate_bitmap_neon_bwN`.
+
+### Perf-hygiene: bench_varint regression guard (#75)
+
+`examples/bench_varint.rs` documents the 0.70 ns/value baseline for
+1-byte `read_uvarint` decode (≈2.8 cycles on M-series). A
+profile-guided survey explored three plausibly-faster alternative
+implementations (`get_unchecked` + manual 10-step unroll) — every
+one regressed 1.3–3.4× because LLVM already elides the per-byte
+bounds check via inlining and CFG analysis. The bench stays as a
+regression guard against future "obvious" rewrites that look
+faster on paper but lose to the existing tight 5-instruction inner
+loop.
+
+### Net diff
+
+`levels.rs` (new helpers + tests) and `read.rs` (parameter
+threading): ~300 LOC. `dict.rs` splash rewrite: +53 / −10. One new
+example (`bench_varint.rs`): 119 LOC. No deletions.
+
+**Released as v0.15.0.**
+
+---
+
 ## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot

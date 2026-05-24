@@ -28,6 +28,12 @@ ematix-parquet-codec = { path = "../ematix-parquet-codec", version = "0.15" }
 # big dep tree (tokio, opendal, arrow) so default builds stay light.
 iceberg = { version = "0.6", optional = true }
 
+[dev-dependencies]
+# Async test runtime for `collect_data_files` etc. — the iceberg-rust
+# manifest accessors are all `async`. Dev-only; production callers
+# bring their own runtime.
+tokio = { version = "1", features = ["rt", "macros"] }
+
 [lints]
 workspace = true
 

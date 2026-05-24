@@ -1,11 +1,11 @@
-//! Error type for JSON decode + extension layout violations.
+//! Error type for JSON decode, extension layout violations, and
+//! (feature `iceberg`) async I/O against `iceberg-rust` manifests.
 
 use std::fmt;
 
 /// Anything that can go wrong reading an [`crate::EmatixDataFileExtension`]
-/// off an Iceberg `data_file` entry. Kept narrow — write-side errors
-/// (which live in the not-yet-written Π.21b iceberg-rust integration)
-/// will have their own type.
+/// off an Iceberg `data_file` entry, or (under the `iceberg` feature)
+/// walking the table's manifests.
 #[derive(Debug)]
 pub enum IcebergIndexError {
     /// JSON payload could not be parsed (truncated, malformed, wrong
@@ -17,6 +17,10 @@ pub enum IcebergIndexError {
     /// version on any breaking change; readers refuse unknown
     /// versions rather than guess.
     UnsupportedVersion(String),
+    /// An underlying `iceberg-rust` operation (manifest list / manifest
+    /// load) failed. Only produced under the `iceberg` feature.
+    #[cfg(feature = "iceberg")]
+    Iceberg(iceberg::Error),
 }
 
 impl fmt::Display for IcebergIndexError {
@@ -28,11 +32,28 @@ impl fmt::Display for IcebergIndexError {
                 "ematix iceberg extension version `{v}` not supported (this build expects `{}`)",
                 crate::EMATIX_EXTENSION_VERSION
             ),
+            #[cfg(feature = "iceberg")]
+            Self::Iceberg(e) => write!(f, "iceberg-rust error: {e}"),
         }
     }
 }
 
-impl std::error::Error for IcebergIndexError {}
+impl std::error::Error for IcebergIndexError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "iceberg")]
+            Self::Iceberg(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "iceberg")]
+impl From<iceberg::Error> for IcebergIndexError {
+    fn from(e: iceberg::Error) -> Self {
+        Self::Iceberg(e)
+    }
+}
 
 /// Convenience alias for fallible operations in this crate.
 pub type Result<T> = std::result::Result<T, IcebergIndexError>;

@@ -36,7 +36,8 @@
 //! Most workloads don't use PME and have `key_metadata = None` on
 //! every file; for those, this works today with no migration.
 
-use iceberg::spec::{DataFile, DataFileBuilder};
+use iceberg::spec::{DataContentType, DataFile, DataFileBuilder};
+use iceberg::table::Table;
 
 use crate::error::{IcebergIndexError, Result};
 use crate::extension::EmatixDataFileExtension;
@@ -305,6 +306,70 @@ pub fn pair_with_extensions(files: Vec<DataFile>) -> Result<Vec<PrunedDataFile>>
         });
     }
     Ok(out)
+}
+
+// ============================================================
+// Async manifest walker (Π.22b)
+// ============================================================
+
+/// Walk all data files in the table's **current snapshot**,
+/// returning them as a flat `Vec<DataFile>`.
+///
+/// This is the natural input to [`prune_data_files_eq`] /
+/// [`prune_data_files_range`] / [`pair_with_extensions`]: most
+/// query planners want one flat candidate set per query, not a
+/// nested manifest-by-manifest traversal.
+///
+/// **Snapshot scope.** Only the current snapshot is walked. Iceberg
+/// time-travel queries that target a non-current snapshot need to
+/// re-clone the [`Table`] with `with_metadata` pointing at that
+/// snapshot, then call this function — keeps the snapshot-selection
+/// concern outside the walker.
+///
+/// **Liveness.** Only entries with [`ManifestStatus::Added`] or
+/// [`Existing`] are kept (via [`ManifestEntry::is_alive`]); deletes
+/// are skipped. Only files with [`DataContentType::Data`] are
+/// returned — equality and position delete files are filtered out
+/// at this layer (handling them is the executor's job, not the
+/// planner's prune step).
+///
+/// **Empty tables.** Returns an empty `Vec` (not an error) when the
+/// table has no current snapshot — e.g. a newly created table
+/// before its first commit.
+///
+/// **I/O.** Each manifest file is loaded via the table's
+/// [`Table::file_io`] handle, which can point at the local FS, S3,
+/// GCS, or in-memory storage depending on how the catalog created
+/// it. Concurrent fetch is *not* done here; loads are serial. For
+/// large fan-outs, callers can wrap this in `try_join_all` over
+/// per-manifest tasks themselves.
+///
+/// [`ManifestStatus::Added`]: iceberg::spec::ManifestStatus::Added
+/// [`Existing`]: iceberg::spec::ManifestStatus::Existing
+/// [`ManifestEntry::is_alive`]: iceberg::spec::ManifestEntry::is_alive
+pub async fn collect_data_files(table: &Table) -> Result<Vec<DataFile>> {
+    let metadata = table.metadata();
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return Ok(Vec::new());
+    };
+    let file_io = table.file_io();
+    let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
+
+    let mut files = Vec::new();
+    for manifest_file in manifest_list.entries() {
+        let manifest = manifest_file.load_manifest(file_io).await?;
+        for entry in manifest.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            let df = entry.data_file();
+            if df.content_type() != DataContentType::Data {
+                continue;
+            }
+            files.push(df.clone());
+        }
+    }
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -733,5 +798,66 @@ mod tests {
         let candidates = pair_with_extensions(vec![f1]).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].sidecar_uri, "s3://other-bucket/sidecar.idx");
+    }
+
+    // ============================================================
+    // Π.22b: collect_data_files
+    // ============================================================
+    //
+    // The populated-table case wants a full Iceberg fixture
+    // (TableMetadata + written manifest_list + written manifest
+    // files) — that lives in the Π.22c oracle, which also exercises
+    // the end-to-end sidecar lookup. Here we only confirm the empty-
+    // snapshot branch (a freshly created table with no commits).
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use iceberg::io::FileIOBuilder;
+    use iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        TableMetadataBuilder, Type,
+    };
+    use iceberg::table::Table;
+    use iceberg::TableIdent;
+
+    /// Build a brand-new Iceberg `Table` over an in-memory FileIO,
+    /// with no current snapshot. Used to drive the empty-snapshot
+    /// branch of `collect_data_files`.
+    fn build_empty_in_memory_table() -> Table {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "v",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let metadata_built = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory:///table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        Table::builder()
+            .metadata(metadata_built.metadata)
+            .identifier(TableIdent::from_strs(["db", "t"]).unwrap())
+            .file_io(file_io)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn collect_returns_empty_for_table_without_snapshot() {
+        let table = build_empty_in_memory_table();
+        assert!(table.metadata().current_snapshot().is_none());
+        let files = collect_data_files(&table).await.unwrap();
+        assert!(files.is_empty());
     }
 }

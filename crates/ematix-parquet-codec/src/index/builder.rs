@@ -41,7 +41,9 @@ use ematix_parquet_io::ParquetFile;
 use crate::bloom::{optimal_num_blocks, parquet_xxh64, SplitBlockBloomFilterBuilder};
 use crate::error::{CodecError, Result};
 use crate::index::fingerprint::compute_source_fingerprint;
-use crate::index::manifest::{IndexEntry, IndexKind, IndexManifest, PhysicalType, MANIFEST_KEY};
+use crate::index::manifest::{
+    IndexEntry, IndexKind, IndexManifest, PhysicalType, Tokenizer, MANIFEST_KEY,
+};
 use crate::index::page_layout::{walk_data_pages, DataPageLayout};
 use crate::read::{read_column_byte_array, read_column_i32, read_column_i64};
 use crate::write::{write_table_with_options_to_path, ColumnData, WriteOptions};
@@ -804,6 +806,162 @@ impl<'a> IndexBuilder<'a> {
         let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
         let cols: &[(&str, ColumnData<'_>)] = &[
             ("value", ColumnData::ByteArray(&value_slices)),
+            ("target_rg", ColumnData::I32(&col_rg)),
+            ("target_page", ColumnData::I32(&col_page)),
+            ("target_rowset", ColumnData::ByteArray(&rowset_slices)),
+        ];
+        let opts = WriteOptions {
+            default_codec: CompressionCodec::Snappy,
+            kv_metadata: Some(&kvs),
+            ..WriteOptions::default()
+        };
+        write_table_with_options_to_path(out_path, cols, &opts)
+    }
+}
+
+impl<'a> IndexBuilder<'a> {
+    /// **Inverted text index** over a `BYTE_ARRAY` column. For every
+    /// row, the value is tokenized via `tokenizer`, deduped per row
+    /// (so a row containing "foo foo" sets the row's bit in the
+    /// `foo` token's bitmap once, not twice), and each `(token, rg,
+    /// page)` bucket accumulates the set of row positions in the
+    /// page where that token appears.
+    ///
+    /// Sidecar schema:
+    /// ```text
+    /// token:           BYTE_ARRAY  (sort key, lex-ASC)
+    /// target_rg:       INT32
+    /// target_page:     INT32
+    /// target_rowset:   BYTE_ARRAY  (packed bitmap, page-relative
+    ///                               to the indexed BYTE_ARRAY column)
+    /// ```
+    ///
+    /// The chosen `tokenizer` is recorded in the manifest under
+    /// [`IndexKind::Inverted::tokenizer`]; the reader applies the
+    /// same one to query terms before lookup.
+    ///
+    /// MVP v1: single-token-per-query lookup (one row's worth of
+    /// matches per `lookup_token` call). Multi-token AND/OR
+    /// composition lives in a higher-level engine layer or future
+    /// Π.20b.
+    pub fn write_inverted_byte_array<P: AsRef<Path>>(
+        &self,
+        out_path: P,
+        index_name: &str,
+        source_column: usize,
+        tokenizer: Tokenizer,
+    ) -> Result<()> {
+        let md = self
+            .source
+            .metadata()
+            .map_err(|e| CodecError::InvalidInput(format!("read parquet metadata: {e}")))?;
+        let leaf = leaf_or_err(&md.schema, source_column)?;
+        let leaf_type = leaf.column_type.ok_or_else(|| {
+            CodecError::InvalidInput(format!(
+                "schema element at leaf {source_column} has no physical type (group node?)"
+            ))
+        })?;
+        if leaf_type != ParquetType::ByteArray {
+            return Err(CodecError::InvalidInput(format!(
+                "write_inverted_byte_array: source column {source_column} is {leaf_type:?}, expected BYTE_ARRAY"
+            )));
+        }
+
+        // (token_bytes, source_rg, source_page) → Vec<row_within_page>
+        let mut buckets: HashMap<(Vec<u8>, u32, u32), Vec<u32>> = HashMap::new();
+        let mut page_sizes: HashMap<(u32, u32), u32> = HashMap::new();
+
+        for rg in 0..md.row_groups.len() {
+            let values = read_column_byte_array(self.source, rg, source_column)?;
+            let mut page_layouts: Vec<DataPageLayout> = Vec::new();
+            walk_data_pages(self.source, rg, source_column, |layout| {
+                page_layouts.push(layout);
+                Ok(())
+            })?;
+            let summed: usize = page_layouts.iter().map(|p| p.num_values).sum();
+            if summed != values.len() {
+                return Err(CodecError::InvalidInput(format!(
+                    "page-layout walk for rg={rg} col={source_column} summed to {summed} values, \
+                     but column decoded {}",
+                    values.len()
+                )));
+            }
+
+            for page in &page_layouts {
+                page_sizes.insert((rg as u32, page.page_idx), page.num_values as u32);
+                let base = page.first_row;
+                for r in 0..page.num_values {
+                    let row_value = &values[base + r];
+                    let toks = tokenizer.tokenize(row_value);
+                    // Dedupe tokens within this single row; we only
+                    // want one bit per (token, row) regardless of how
+                    // many times the token appears in the row.
+                    let mut seen: std::collections::HashSet<Vec<u8>> =
+                        std::collections::HashSet::with_capacity(toks.len());
+                    for t in toks {
+                        if seen.insert(t.clone()) {
+                            buckets
+                                .entry((t, rg as u32, page.page_idx))
+                                .or_default()
+                                .push(r as u32);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by (token, rg, page) — lex-ASC on the token bytes,
+        // matching `lookup_token`'s binary-search expectation.
+        let mut keys: Vec<(Vec<u8>, u32, u32)> = buckets.keys().cloned().collect();
+        keys.sort();
+
+        let n = keys.len();
+        let mut col_token_owned: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut col_rg: Vec<i32> = Vec::with_capacity(n);
+        let mut col_page: Vec<i32> = Vec::with_capacity(n);
+        let mut col_rowset_owned: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for (tok, rg, page) in keys {
+            let num_values = *page_sizes
+                .get(&(rg, page))
+                .expect("page_sizes entry exists for emitted bucket")
+                as usize;
+            let positions = buckets
+                .remove(&(tok.clone(), rg, page))
+                .expect("bucket exists for emitted key");
+            let bitmap_len = num_values.div_ceil(8);
+            let mut bitmap = vec![0u8; bitmap_len];
+            for rp in positions {
+                let rp = rp as usize;
+                debug_assert!(rp < num_values);
+                bitmap[rp / 8] |= 1 << (rp % 8);
+            }
+            col_token_owned.push(tok);
+            col_rg.push(rg as i32);
+            col_page.push(page as i32);
+            col_rowset_owned.push(bitmap);
+        }
+
+        let fp = compute_source_fingerprint(self.source)?;
+        let leaf_name = std::str::from_utf8(leaf.name).map_err(|_| {
+            CodecError::InvalidInput("schema element name is not valid UTF-8".into())
+        })?;
+        let manifest = IndexManifest {
+            source_fingerprint: fp,
+            indexes: vec![IndexEntry {
+                name: index_name.to_owned(),
+                kind: IndexKind::Inverted {
+                    source_column: leaf_name.to_owned(),
+                    tokenizer,
+                },
+                sidecar_row_group: 0,
+            }],
+        };
+        let manifest_json = manifest.to_json();
+        let kvs = [(MANIFEST_KEY, manifest_json.as_str())];
+        let token_slices: Vec<&[u8]> = col_token_owned.iter().map(|v| v.as_slice()).collect();
+        let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
+        let cols: &[(&str, ColumnData<'_>)] = &[
+            ("token", ColumnData::ByteArray(&token_slices)),
             ("target_rg", ColumnData::I32(&col_rg)),
             ("target_page", ColumnData::I32(&col_page)),
             ("target_rowset", ColumnData::ByteArray(&rowset_slices)),

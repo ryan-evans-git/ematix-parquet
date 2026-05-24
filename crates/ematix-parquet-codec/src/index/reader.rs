@@ -86,6 +86,18 @@ struct LoadedTypedCompositeI64I64 {
     rowsets: Vec<Vec<u8>>,
 }
 
+/// One loaded inverted (text) index. Same shape as a sorted-bytes
+/// index but `tokens` are *post-tokenizer* byte sequences rather
+/// than original column values; multiple rows of the indexed
+/// column can contribute to the same token's bucket.
+#[derive(Debug)]
+struct LoadedTypedInverted {
+    tokens: Vec<Vec<u8>>,
+    target_rgs: Vec<i32>,
+    target_pages: Vec<i32>,
+    rowsets: Vec<Vec<u8>>,
+}
+
 #[derive(Debug)]
 enum LoadedIndexData {
     SortedI64(LoadedTypedI64),
@@ -93,6 +105,7 @@ enum LoadedIndexData {
     SortedBytes(LoadedTypedBytes),
     BloomPage(LoadedBloomPage),
     CompositePrefixI64I64(LoadedTypedCompositeI64I64),
+    Inverted(LoadedTypedInverted),
 }
 
 #[derive(Debug)]
@@ -274,6 +287,36 @@ impl ParquetIndex {
                         }),
                     });
                 }
+                IndexKind::Inverted { .. } => {
+                    let rg = entry.sidecar_row_group as usize;
+                    // Schema: token BYTE_ARRAY, target_rg INT32, target_page INT32, target_rowset BYTE_ARRAY.
+                    let tokens = read_column_byte_array(&idx_file, rg, 0)?;
+                    let target_rgs = read_column_i32(&idx_file, rg, 1)?;
+                    let target_pages = read_column_i32(&idx_file, rg, 2)?;
+                    let rowsets = read_column_byte_array(&idx_file, rg, 3)?;
+                    let n = tokens.len();
+                    if target_rgs.len() != n || target_pages.len() != n || rowsets.len() != n {
+                        return Err(CodecError::InvalidInput(format!(
+                            "inverted index `{}` row group {} has mismatched column lengths \
+                             (tokens={}, rg={}, page={}, rowset={})",
+                            entry.name,
+                            rg,
+                            n,
+                            target_rgs.len(),
+                            target_pages.len(),
+                            rowsets.len()
+                        )));
+                    }
+                    indexes.push(LoadedIndex {
+                        entry: entry.clone(),
+                        data: LoadedIndexData::Inverted(LoadedTypedInverted {
+                            tokens,
+                            target_rgs,
+                            target_pages,
+                            rowsets,
+                        }),
+                    });
+                }
                 IndexKind::BloomPage { .. } => {
                     let rg = entry.sidecar_row_group as usize;
                     // Schema: source_rg INT32, source_page INT32, bloom_block BYTE_ARRAY.
@@ -300,10 +343,6 @@ impl ParquetIndex {
                         }),
                     });
                 }
-                // CompositePrefix + Inverted reserved for Π.19b / Π.20.
-                // Skipping is forward-compat friendly — a lookup
-                // request for one of them will fail loud by name.
-                _ => continue,
             }
         }
 
@@ -492,6 +531,69 @@ impl ParquetIndex {
     ) -> Result<Vec<i64>> {
         let hits = self.lookup_composite_prefix(index_name, &Key::I64(key_a))?;
         self.materialize_i64_composite(source, index_name, &hits, target_column)
+    }
+
+    // ============================================================
+    // Inverted (text) lookups
+    // ============================================================
+
+    /// Look up rows containing `normalized_token` in an inverted
+    /// index. **Caller must pre-normalize** the token to match the
+    /// builder's tokenizer — pass the tokenizer's output as-is, not
+    /// raw user input. For the higher-level path that applies the
+    /// manifest's tokenizer to a query string, use
+    /// [`Self::read_column_byte_array_where_token`].
+    ///
+    /// Returns `IndexHit`s pointing at pages/rowsets of the indexed
+    /// `BYTE_ARRAY` source column. Empty vec = the token is not in
+    /// the index (i.e. it appeared in no row, or never made it past
+    /// the build-time tokenizer).
+    pub fn lookup_token(&self, index_name: &str, normalized_token: &[u8]) -> Result<Vec<IndexHit>> {
+        let idx = self.find_index(index_name)?;
+        let d = match &idx.data {
+            LoadedIndexData::Inverted(d) => d,
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
+                    "lookup_token: index `{index_name}` is not an inverted index"
+                )))
+            }
+        };
+        Ok(inverted_eq_hits(d, normalized_token))
+    }
+
+    /// Read the indexed `BYTE_ARRAY` target column for every row
+    /// containing `query` (after applying the manifest's tokenizer
+    /// to normalize the query).
+    ///
+    /// The tokenizer is expected to produce **exactly one token**
+    /// from `query` for an unambiguous lookup. Passing a multi-word
+    /// query like `b"the quick fox"` errors with
+    /// `query produced N tokens (expected 1)` — multi-token AND/OR
+    /// composition is a higher-level engine concern.
+    pub fn read_column_byte_array_where_token(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        query: &[u8],
+        target_column: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let idx = self.find_index(index_name)?;
+        let tokenizer = match &idx.entry.kind {
+            IndexKind::Inverted { tokenizer, .. } => *tokenizer,
+            _ => return Err(CodecError::InvalidInput(format!(
+                "read_column_byte_array_where_token: index `{index_name}` is not an inverted index"
+            ))),
+        };
+        let toks = tokenizer.tokenize(query);
+        if toks.len() != 1 {
+            return Err(CodecError::InvalidInput(format!(
+                "read_column_byte_array_where_token: query produced {} tokens (expected 1; multi-token \
+                 composition is a higher-level concern)",
+                toks.len()
+            )));
+        }
+        let hits = self.lookup_token(index_name, &toks[0])?;
+        self.materialize_byte_array(source, index_name, &hits, target_column)
     }
 
     // ============================================================
@@ -844,6 +946,7 @@ impl ParquetIndex {
                     ))
                 })?
             }
+            IndexKind::Inverted { source_column, .. } => source_column.as_str(),
             _ => {
                 return Err(CodecError::InvalidInput(format!(
                     "index `{index_name}` does not produce IndexHits"
@@ -1006,6 +1109,25 @@ fn composite_eq_hits(d: &LoadedTypedCompositeI64I64, a: i64, b: i64) -> Vec<Inde
         });
     }
     out
+}
+
+fn inverted_eq_hits(d: &LoadedTypedInverted, token: &[u8]) -> Vec<IndexHit> {
+    // `tokens` is sorted lex-ASC; binary search finds any row with
+    // the target token, then linear scan covers duplicates of the
+    // same token across pages.
+    let pos = match d.tokens.binary_search_by(|t| t.as_slice().cmp(token)) {
+        Ok(i) => i,
+        Err(_) => return Vec::new(),
+    };
+    let mut start = pos;
+    while start > 0 && d.tokens[start - 1].as_slice() == token {
+        start -= 1;
+    }
+    let mut end = pos + 1;
+    while end < d.tokens.len() && d.tokens[end].as_slice() == token {
+        end += 1;
+    }
+    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
 }
 
 fn composite_prefix_hits(d: &LoadedTypedCompositeI64I64, a: i64) -> Vec<IndexHit> {

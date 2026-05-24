@@ -142,6 +142,110 @@ pub enum Tokenizer {
     WhitespaceLowercaseV1,
 }
 
+impl Tokenizer {
+    /// Apply this tokenizer to `value`, returning the produced
+    /// tokens in source order. Tokens are owned `Vec<u8>` because
+    /// most non-trivial tokenizers transform bytes (lowercasing,
+    /// stemming, …) and can't borrow.
+    ///
+    /// Builder calls this for every source row and dedupes per row
+    /// before bucketing. Reader calls this on the query string to
+    /// normalize it the same way before [`crate::index::ParquetIndex::lookup_token`].
+    /// Same tokenizer in → same tokens out, or the index is
+    /// corrupt by construction.
+    pub fn tokenize(self, value: &[u8]) -> Vec<Vec<u8>> {
+        match self {
+            Self::WhitespaceLowercaseV1 => whitespace_lowercase_v1(value),
+        }
+    }
+}
+
+/// Split `value` on ASCII whitespace, drop empties, lowercase each
+/// token via [`u8::to_ascii_lowercase`]. No Unicode normalization,
+/// no stemming, no stop-words. Deliberately tiny — the v1 token
+/// shape that bigger English-language tokenizers can fall back to.
+fn whitespace_lowercase_v1(value: &[u8]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    for &b in value {
+        if b.is_ascii_whitespace() {
+            if !buf.is_empty() {
+                out.push(std::mem::take(&mut buf));
+            }
+        } else {
+            buf.push(b.to_ascii_lowercase());
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tokenizer_tests {
+    use super::*;
+
+    #[test]
+    fn whitespace_lowercase_v1_basic() {
+        let toks = Tokenizer::WhitespaceLowercaseV1.tokenize(b"Hello World");
+        assert_eq!(toks, vec![b"hello".to_vec(), b"world".to_vec()]);
+    }
+
+    #[test]
+    fn whitespace_lowercase_v1_collapses_runs_of_whitespace() {
+        let toks = Tokenizer::WhitespaceLowercaseV1.tokenize(b"  foo  \t\n  bar  ");
+        assert_eq!(toks, vec![b"foo".to_vec(), b"bar".to_vec()]);
+    }
+
+    #[test]
+    fn whitespace_lowercase_v1_preserves_inner_punctuation() {
+        // No stemming, no punctuation stripping in v1 — that lives
+        // in a future v2.
+        let toks = Tokenizer::WhitespaceLowercaseV1.tokenize(b"don't u.s.a.");
+        assert_eq!(toks, vec![b"don't".to_vec(), b"u.s.a.".to_vec()]);
+    }
+
+    #[test]
+    fn whitespace_lowercase_v1_empty_input() {
+        let toks = Tokenizer::WhitespaceLowercaseV1.tokenize(b"");
+        assert!(toks.is_empty());
+    }
+
+    #[test]
+    fn whitespace_lowercase_v1_only_whitespace() {
+        let toks = Tokenizer::WhitespaceLowercaseV1.tokenize(b"   \t  \n ");
+        assert!(toks.is_empty());
+    }
+
+    #[test]
+    fn whitespace_lowercase_v1_unicode_bytes_passed_through_unchanged() {
+        // ASCII-only lowercasing — non-ASCII bytes (everything ≥ 0x80,
+        // i.e. every byte of a multi-byte UTF-8 codepoint) survive
+        // verbatim. "Über" begins with `Ü` which is `0xC3 0x9C` in
+        // UTF-8 — neither byte is ASCII, so no fold happens.
+        let toks = Tokenizer::WhitespaceLowercaseV1.tokenize("Über café".as_bytes());
+        assert_eq!(toks.len(), 2);
+        // Input "Über" stays bit-identical: the Ü's two bytes are
+        // both non-ASCII (0xC3 0x9C), and the trailing `ber` is
+        // already lowercase ASCII.
+        assert_eq!(toks[0], "Über".as_bytes().to_vec());
+        // "café" similarly survives — every byte is either lowercase
+        // ASCII or part of a multi-byte codepoint.
+        assert_eq!(toks[1], "café".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn whitespace_lowercase_v1_mixed_case_ascii_only_folds() {
+        // Pure ASCII confirms the lowercasing is doing work.
+        let toks = Tokenizer::WhitespaceLowercaseV1.tokenize(b"HELLO World FoO");
+        assert_eq!(
+            toks,
+            vec![b"hello".to_vec(), b"world".to_vec(), b"foo".to_vec()]
+        );
+    }
+}
+
 // ============================================================
 // Errors
 // ============================================================

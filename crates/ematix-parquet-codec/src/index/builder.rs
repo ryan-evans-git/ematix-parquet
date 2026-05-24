@@ -42,7 +42,7 @@ use crate::error::{CodecError, Result};
 use crate::index::fingerprint::compute_source_fingerprint;
 use crate::index::manifest::{IndexEntry, IndexKind, IndexManifest, PhysicalType, MANIFEST_KEY};
 use crate::index::page_layout::{walk_data_pages, DataPageLayout};
-use crate::read::read_column_i64;
+use crate::read::{read_column_byte_array, read_column_i32, read_column_i64};
 use crate::write::{write_table_with_options_to_path, ColumnData, WriteOptions};
 
 /// Builder for the sorted-i64 sidecar. Multi-index sidecars come
@@ -220,6 +220,264 @@ impl<'a> IndexBuilder<'a> {
             // dense-or-sparse-but-compressible. Per-column codec
             // selection lands later; one codec for the whole file is
             // fine for MVP.
+            default_codec: CompressionCodec::Snappy,
+            kv_metadata: Some(&kvs),
+            ..WriteOptions::default()
+        };
+        write_table_with_options_to_path(out_path, cols, &opts)
+    }
+
+    /// Mirror of [`Self::write_sorted_i64`] over `INT32`. Same
+    /// per-page bucket + sort + pack pipeline; the only differences
+    /// are the source-column type check and the schema of the
+    /// emitted `value` column.
+    pub fn write_sorted_i32<P: AsRef<Path>>(
+        &self,
+        out_path: P,
+        index_name: &str,
+        source_column: usize,
+    ) -> Result<()> {
+        let md = self
+            .source
+            .metadata()
+            .map_err(|e| CodecError::InvalidInput(format!("read parquet metadata: {e}")))?;
+        let leaf_schema_idx = source_column
+            .checked_add(1)
+            .ok_or_else(|| CodecError::InvalidInput("source_column index overflow".into()))?;
+        let leaf = md.schema.get(leaf_schema_idx).ok_or_else(|| {
+            CodecError::InvalidInput(format!(
+                "source_column {source_column} out of range in flat schema"
+            ))
+        })?;
+        let leaf_type = leaf.column_type.ok_or_else(|| {
+            CodecError::InvalidInput(format!(
+                "schema element at leaf {source_column} has no physical type (group node?)"
+            ))
+        })?;
+        if leaf_type != ParquetType::Int32 {
+            return Err(CodecError::InvalidInput(format!(
+                "write_sorted_i32: source column {source_column} is {leaf_type:?}, expected INT32"
+            )));
+        }
+
+        let mut buckets: HashMap<(i32, u32, u32), Vec<u32>> = HashMap::new();
+        let mut page_sizes: HashMap<(u32, u32), u32> = HashMap::new();
+
+        for rg in 0..md.row_groups.len() {
+            let values = read_column_i32(self.source, rg, source_column)?;
+            let mut absolute_offsets: Vec<DataPageLayout> = Vec::new();
+            walk_data_pages(self.source, rg, source_column, |layout| {
+                absolute_offsets.push(layout);
+                Ok(())
+            })?;
+            let summed: usize = absolute_offsets.iter().map(|p| p.num_values).sum();
+            if summed != values.len() {
+                return Err(CodecError::InvalidInput(format!(
+                    "page-layout walk for rg={rg} col={source_column} summed to {summed} values, \
+                     but column decoded {}",
+                    values.len()
+                )));
+            }
+            for page in &absolute_offsets {
+                page_sizes.insert((rg as u32, page.page_idx), page.num_values as u32);
+                let base = page.first_row;
+                for r in 0..page.num_values {
+                    let v = values[base + r];
+                    buckets
+                        .entry((v, rg as u32, page.page_idx))
+                        .or_default()
+                        .push(r as u32);
+                }
+            }
+        }
+
+        let mut keys: Vec<(i32, u32, u32)> = buckets.keys().copied().collect();
+        keys.sort_unstable();
+
+        let n_rows = keys.len();
+        let mut col_value: Vec<i32> = Vec::with_capacity(n_rows);
+        let mut col_rg: Vec<i32> = Vec::with_capacity(n_rows);
+        let mut col_page: Vec<i32> = Vec::with_capacity(n_rows);
+        let mut col_rowset_owned: Vec<Vec<u8>> = Vec::with_capacity(n_rows);
+
+        for (v, rg, page) in keys {
+            let num_values = *page_sizes
+                .get(&(rg, page))
+                .expect("page_sizes entry exists for emitted bucket")
+                as usize;
+            let positions = buckets
+                .remove(&(v, rg, page))
+                .expect("bucket exists for emitted key");
+            let bitmap_len = num_values.div_ceil(8);
+            let mut bitmap = vec![0u8; bitmap_len];
+            for r in positions {
+                let r = r as usize;
+                debug_assert!(r < num_values, "row_within_page out of range");
+                bitmap[r / 8] |= 1 << (r % 8);
+            }
+            col_value.push(v);
+            col_rg.push(rg as i32);
+            col_page.push(page as i32);
+            col_rowset_owned.push(bitmap);
+        }
+
+        let fp = compute_source_fingerprint(self.source)?;
+        let leaf_name = std::str::from_utf8(leaf.name).map_err(|_| {
+            CodecError::InvalidInput("schema element name is not valid UTF-8".into())
+        })?;
+        let manifest = IndexManifest {
+            source_fingerprint: fp,
+            indexes: vec![IndexEntry {
+                name: index_name.to_owned(),
+                kind: IndexKind::Sorted {
+                    source_column: leaf_name.to_owned(),
+                    physical_type: PhysicalType::Int32,
+                },
+                sidecar_row_group: 0,
+            }],
+        };
+        let manifest_json = manifest.to_json();
+        let kvs = [(MANIFEST_KEY, manifest_json.as_str())];
+        let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
+        let cols: &[(&str, ColumnData<'_>)] = &[
+            ("value", ColumnData::I32(&col_value)),
+            ("target_rg", ColumnData::I32(&col_rg)),
+            ("target_page", ColumnData::I32(&col_page)),
+            ("target_rowset", ColumnData::ByteArray(&rowset_slices)),
+        ];
+        let opts = WriteOptions {
+            default_codec: CompressionCodec::Snappy,
+            kv_metadata: Some(&kvs),
+            ..WriteOptions::default()
+        };
+        write_table_with_options_to_path(out_path, cols, &opts)
+    }
+
+    /// Mirror of [`Self::write_sorted_i64`] over `BYTE_ARRAY`. The
+    /// bucket key carries owned `Vec<u8>` values; sort is lex-ASC
+    /// (Rust `Vec<u8>` default `Ord` matches Parquet unsigned-lex,
+    /// the spec's BYTE_ARRAY sort order).
+    pub fn write_sorted_byte_array<P: AsRef<Path>>(
+        &self,
+        out_path: P,
+        index_name: &str,
+        source_column: usize,
+    ) -> Result<()> {
+        let md = self
+            .source
+            .metadata()
+            .map_err(|e| CodecError::InvalidInput(format!("read parquet metadata: {e}")))?;
+        let leaf_schema_idx = source_column
+            .checked_add(1)
+            .ok_or_else(|| CodecError::InvalidInput("source_column index overflow".into()))?;
+        let leaf = md.schema.get(leaf_schema_idx).ok_or_else(|| {
+            CodecError::InvalidInput(format!(
+                "source_column {source_column} out of range in flat schema"
+            ))
+        })?;
+        let leaf_type = leaf.column_type.ok_or_else(|| {
+            CodecError::InvalidInput(format!(
+                "schema element at leaf {source_column} has no physical type (group node?)"
+            ))
+        })?;
+        if leaf_type != ParquetType::ByteArray {
+            return Err(CodecError::InvalidInput(format!(
+                "write_sorted_byte_array: source column {source_column} is {leaf_type:?}, expected BYTE_ARRAY"
+            )));
+        }
+
+        let mut buckets: HashMap<(Vec<u8>, u32, u32), Vec<u32>> = HashMap::new();
+        let mut page_sizes: HashMap<(u32, u32), u32> = HashMap::new();
+
+        for rg in 0..md.row_groups.len() {
+            let values = read_column_byte_array(self.source, rg, source_column)?;
+            let mut absolute_offsets: Vec<DataPageLayout> = Vec::new();
+            walk_data_pages(self.source, rg, source_column, |layout| {
+                absolute_offsets.push(layout);
+                Ok(())
+            })?;
+            let summed: usize = absolute_offsets.iter().map(|p| p.num_values).sum();
+            if summed != values.len() {
+                return Err(CodecError::InvalidInput(format!(
+                    "page-layout walk for rg={rg} col={source_column} summed to {summed} values, \
+                     but column decoded {}",
+                    values.len()
+                )));
+            }
+            for page in &absolute_offsets {
+                page_sizes.insert((rg as u32, page.page_idx), page.num_values as u32);
+                let base = page.first_row;
+                for r in 0..page.num_values {
+                    let v = values[base + r].clone();
+                    buckets
+                        .entry((v, rg as u32, page.page_idx))
+                        .or_default()
+                        .push(r as u32);
+                }
+            }
+        }
+
+        // Sort by (value, rg, page) — lex-ASC on the bytes, matching
+        // Parquet's BYTE_ARRAY sort. Rust's default Ord on Vec<u8>
+        // is byte-wise unsigned-lex, so this is correct out of the
+        // box.
+        let mut keys: Vec<(Vec<u8>, u32, u32)> = buckets.keys().cloned().collect();
+        keys.sort();
+
+        let n_rows = keys.len();
+        let mut col_value_owned: Vec<Vec<u8>> = Vec::with_capacity(n_rows);
+        let mut col_rg: Vec<i32> = Vec::with_capacity(n_rows);
+        let mut col_page: Vec<i32> = Vec::with_capacity(n_rows);
+        let mut col_rowset_owned: Vec<Vec<u8>> = Vec::with_capacity(n_rows);
+
+        for (v, rg, page) in keys {
+            let num_values = *page_sizes
+                .get(&(rg, page))
+                .expect("page_sizes entry exists for emitted bucket")
+                as usize;
+            let positions = buckets
+                .remove(&(v.clone(), rg, page))
+                .expect("bucket exists for emitted key");
+            let bitmap_len = num_values.div_ceil(8);
+            let mut bitmap = vec![0u8; bitmap_len];
+            for r in positions {
+                let r = r as usize;
+                debug_assert!(r < num_values, "row_within_page out of range");
+                bitmap[r / 8] |= 1 << (r % 8);
+            }
+            col_value_owned.push(v);
+            col_rg.push(rg as i32);
+            col_page.push(page as i32);
+            col_rowset_owned.push(bitmap);
+        }
+
+        let fp = compute_source_fingerprint(self.source)?;
+        let leaf_name = std::str::from_utf8(leaf.name).map_err(|_| {
+            CodecError::InvalidInput("schema element name is not valid UTF-8".into())
+        })?;
+        let manifest = IndexManifest {
+            source_fingerprint: fp,
+            indexes: vec![IndexEntry {
+                name: index_name.to_owned(),
+                kind: IndexKind::Sorted {
+                    source_column: leaf_name.to_owned(),
+                    physical_type: PhysicalType::ByteArray,
+                },
+                sidecar_row_group: 0,
+            }],
+        };
+        let manifest_json = manifest.to_json();
+        let kvs = [(MANIFEST_KEY, manifest_json.as_str())];
+
+        let value_slices: Vec<&[u8]> = col_value_owned.iter().map(|v| v.as_slice()).collect();
+        let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
+        let cols: &[(&str, ColumnData<'_>)] = &[
+            ("value", ColumnData::ByteArray(&value_slices)),
+            ("target_rg", ColumnData::I32(&col_rg)),
+            ("target_page", ColumnData::I32(&col_page)),
+            ("target_rowset", ColumnData::ByteArray(&rowset_slices)),
+        ];
+        let opts = WriteOptions {
             default_codec: CompressionCodec::Snappy,
             kv_metadata: Some(&kvs),
             ..WriteOptions::default()

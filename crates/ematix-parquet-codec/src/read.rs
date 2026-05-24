@@ -189,7 +189,8 @@ pub fn read_column_byte_array_masked_into(
     mask: &[u8],
     out: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
 
     let required_mask_bytes = total_values.div_ceil(8);
     if mask.len() < required_mask_bytes {
@@ -223,7 +224,8 @@ pub fn read_column_byte_array_masked_into(
                     }
                     continue;
                 }
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode_byte_array_into(
@@ -283,7 +285,8 @@ pub fn read_column_byte_array_offsets_masked_into(
     out_bytes: &mut Vec<u8>,
     out_offsets: &mut Vec<u32>,
 ) -> Result<()> {
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
 
     let required_mask_bytes = total_values.div_ceil(8);
     if mask.len() < required_mask_bytes {
@@ -322,7 +325,8 @@ pub fn read_column_byte_array_offsets_masked_into(
                     }
                     continue;
                 }
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode_byte_array_offsets_into(
@@ -427,7 +431,8 @@ pub fn read_column_byte_array_into(
     out: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
     out.clear();
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
 
@@ -442,7 +447,8 @@ pub fn read_column_byte_array_into(
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         let slices = decode_plain_byte_array(info.values)?;
@@ -547,7 +553,8 @@ pub fn read_column_byte_array_dict_preserved_into(
     dict_offsets.clear();
     indices.clear();
 
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
 
@@ -579,7 +586,8 @@ pub fn read_column_byte_array_dict_preserved_into(
                         "dict-preserved read: data page before dictionary (column has no DictionaryPage)".into(),
                     ));
                 }
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
                         // Append directly into the caller-provided
@@ -698,7 +706,8 @@ pub fn read_column_byte_array_dict_preserved_u8_into(
     dict_offsets.clear();
     indices.clear();
 
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
 
@@ -736,7 +745,8 @@ pub fn read_column_byte_array_dict_preserved_u8_into(
                         "dict-preserved u8 read: data page before dictionary (column has no DictionaryPage)".into(),
                     ));
                 }
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::RleDictionary | Encoding::PlainDictionary => {
                         // `decode_rle_dictionary_indices_u8_into` enforces
@@ -828,7 +838,8 @@ fn pull_dict_chunk<T, F>(
 where
     F: Fn(&[u8]) -> Result<Vec<T>>,
 {
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut dict_decoded: Option<Vec<T>> = None;
     let mut pages: Vec<(usize, Vec<u8>)> = Vec::new();
@@ -850,7 +861,8 @@ where
                     ));
                 }
                 let mut owned = Vec::new();
-                let info = data_page_view(&hdr, body, codec, &mut owned)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut owned)?;
                 match info.encoding {
                     Encoding::RleDictionary | Encoding::PlainDictionary => {}
                     Encoding::Plain => {
@@ -1047,7 +1059,8 @@ where
     use crate::dict::{decode_rle_dictionary_indices, decode_rle_dictionary_predicate_bitmap};
 
     // ---- Pull the chunk: dict bytes/offsets + every decompressed page body ----
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
 
     let mut dict_bytes: Vec<u8> = Vec::new();
@@ -1083,7 +1096,8 @@ where
                     ));
                 }
                 let mut owned = Vec::new();
-                let info = data_page_view(&hdr, body, codec, &mut owned)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut owned)?;
                 match info.encoding {
                     Encoding::RleDictionary | Encoding::PlainDictionary => {}
                     Encoding::Plain => {
@@ -1298,7 +1312,8 @@ pub fn read_column_byte_array_offsets_into(
     out_bytes.clear();
     out_offsets.clear();
 
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
 
@@ -1330,7 +1345,8 @@ pub fn read_column_byte_array_offsets_into(
                 }
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         // PLAIN body: u32_le length + bytes, repeated.
@@ -1488,7 +1504,8 @@ pub fn read_column_flba_into(
     out: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
     out.clear();
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     let type_length = type_length_for(file, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
@@ -1507,7 +1524,8 @@ pub fn read_column_flba_into(
                 dict = slices.into_iter().map(|s| s.to_vec()).collect();
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         let slices = decode_plain_fixed_len_byte_array(info.values, type_length)?;
@@ -1688,7 +1706,8 @@ fn decode_chunk_masked_into<T: Copy>(
     decode_plain: impl Fn(&[u8]) -> Result<Vec<T>>,
 ) -> Result<()> {
     out.clear();
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
 
@@ -1711,7 +1730,8 @@ fn decode_chunk_masked_into<T: Copy>(
                 if !keep {
                     continue;
                 }
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         out.extend(decode_plain(info.values)?);
@@ -1765,16 +1785,35 @@ fn data_page_view<'a>(
     hdr: &'a PageHeader<'a>,
     body: &'a [u8],
     chunk_codec: CompressionCodec,
+    max_rep_level: u16,
+    max_def_level: u16,
     decomp: &'a mut Vec<u8>,
 ) -> Result<DataPageInfo<'a>> {
     let uncompressed_size = page_uncompressed_size(hdr)?;
     if let Some(ref dph) = hdr.data_page_header {
         // ---- DataPageV1: whole body is one compressed unit ----
         decompress_into(chunk_codec, body, uncompressed_size, decomp)?;
+        // Q06.c2 (2026-05-24): for non-REQUIRED columns the
+        // decompressed body begins with `[rep_lev RLE][def_lev RLE]`
+        // (each prefixed by a u32 LE byte length). Skip the prefix
+        // bytes without materializing the levels — this hot path
+        // can't afford a 2 MB Vec<u16> allocation per page just to
+        // discard it. For REQUIRED non-nested columns (the common
+        // TPC-H case) this is a no-op.
+        let values_slice: &[u8] = if max_rep_level == 0 && max_def_level == 0 {
+            decomp.as_slice()
+        } else {
+            let off = crate::levels::skip_v1_level_prefixes(
+                decomp.as_slice(),
+                max_rep_level,
+                max_def_level,
+            )?;
+            &decomp[off..]
+        };
         Ok(DataPageInfo {
             num_values: dph.num_values as usize,
             encoding: dph.encoding,
-            values: decomp.as_slice(),
+            values: values_slice,
         })
     } else if let Some(ref dph) = hdr.data_page_header_v2 {
         // ---- DataPageV2: rep + def prefixes are uncompressed ----
@@ -1845,7 +1884,8 @@ fn decode_chunk_into<T: Copy>(
     decode_plain: impl Fn(&[u8]) -> Result<Vec<T>>,
 ) -> Result<()> {
     out.clear();
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     let mut walker = PageWalker::new(&chunk_bytes);
     let mut decomp: Vec<u8> = Vec::new();
 
@@ -1859,7 +1899,8 @@ fn decode_chunk_into<T: Copy>(
                 dict = decode_plain(&decomp)?;
             }
             PageType::DataPage | PageType::DataPageV2 => {
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         out.extend(decode_plain(info.values)?);
@@ -1911,7 +1952,8 @@ fn decode_chunk_row_masked_into<T: Copy>(
     plain_full_decode: impl Fn(&[u8]) -> Result<Vec<T>>,
     plain_sparse_decode: impl Fn(&[u8], usize, &[u8], usize, &mut Vec<T>) -> Result<()>,
 ) -> Result<()> {
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
 
     let required_mask_bytes = total_values.div_ceil(8);
     if mask.len() < required_mask_bytes {
@@ -1949,7 +1991,8 @@ fn decode_chunk_row_masked_into<T: Copy>(
                     }
                     continue;
                 }
-                let info = data_page_view(&hdr, body, codec, &mut decomp)?;
+                let info =
+                    data_page_view(&hdr, body, codec, max_rep_level, max_def_level, &mut decomp)?;
                 match info.encoding {
                     Encoding::Plain => {
                         plain_sparse_decode(info.values, page_n, mask, row_cursor, out)?;
@@ -2032,11 +2075,16 @@ fn popcount_mask_range(bitmap: &[u8], start_bit: usize, end_bit: usize) -> usize
 
 /// Pull the raw column-chunk bytes (compressed pages, dictionary
 /// page first if present) plus the total value count and codec.
+/// Q06.c2 (2026-05-24): added `max_rep_level` and `max_def_level`
+/// alongside the existing return tuple. They're computed from the file
+/// schema and threaded into `data_page_view` so V1 data pages of
+/// non-REQUIRED columns correctly strip the rep + def level prefixes
+/// from the decompressed body.
 fn read_chunk_raw(
     file: &ParquetFile,
     row_group: usize,
     column: usize,
-) -> Result<(Vec<u8>, usize, CompressionCodec)> {
+) -> Result<(Vec<u8>, usize, CompressionCodec, u16, u16)> {
     let md = file.metadata().map_err(io_to_codec)?;
     let rg = md
         .row_groups
@@ -2056,7 +2104,8 @@ fn read_chunk_raw(
         .unwrap_or(cm.data_page_offset) as u64;
     let length = cm.total_compressed_size as u64;
     let bytes = file.read_range(start, length).map_err(io_to_codec)?;
-    Ok((bytes, cm.num_values as usize, cm.codec))
+    let (max_rep, max_def) = crate::levels::compute_max_levels(&md.schema, column)?;
+    Ok((bytes, cm.num_values as usize, cm.codec, max_rep, max_def))
 }
 
 /// Codec dispatch. `uncompressed_size` is `PageHeader.uncompressed_page_size`
@@ -2131,6 +2180,11 @@ pub struct ColumnBatchIter<T: Copy, F: Fn(&[u8]) -> Result<Vec<T>>> {
     chunk_bytes: Vec<u8>,
     walker_pos: usize,
     codec: CompressionCodec,
+    // Q06.c2 (2026-05-24): repetition + definition levels for the
+    // column, computed once at ctor time so per-page V1 body parsing
+    // can strip the rep/def prefixes.
+    max_rep_level: u16,
+    max_def_level: u16,
     total_values: usize,
     emitted_to_carry: usize,
     batch_size: usize,
@@ -2177,7 +2231,14 @@ impl<T: Copy, F: Fn(&[u8]) -> Result<Vec<T>>> ColumnBatchIter<T, F> {
                     continue;
                 }
                 PageType::DataPage | PageType::DataPageV2 => {
-                    let info = data_page_view(&hdr, body, self.codec, &mut self.decomp)?;
+                    let info = data_page_view(
+                        &hdr,
+                        body,
+                        self.codec,
+                        self.max_rep_level,
+                        self.max_def_level,
+                        &mut self.decomp,
+                    )?;
                     let before = self.carry.len();
                     match info.encoding {
                         Encoding::Plain => {
@@ -2266,11 +2327,14 @@ fn batch_iter_new<T: Copy, F: Fn(&[u8]) -> Result<Vec<T>>>(
     if batch_size == 0 {
         return Err(CodecError::InvalidInput("batch_size must be > 0".into()));
     }
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     Ok(ColumnBatchIter {
         chunk_bytes,
         walker_pos: 0,
         codec,
+        max_rep_level,
+        max_def_level,
         total_values,
         emitted_to_carry: 0,
         batch_size,
@@ -2337,6 +2401,9 @@ pub struct ColumnByteArrayBatchIter {
     chunk_bytes: Vec<u8>,
     walker_pos: usize,
     codec: CompressionCodec,
+    // Q06.c2 (2026-05-24): see ColumnBatchIter.
+    max_rep_level: u16,
+    max_def_level: u16,
     total_values: usize,
     emitted_to_carry: usize,
     batch_size: usize,
@@ -2379,7 +2446,14 @@ impl ColumnByteArrayBatchIter {
                     continue;
                 }
                 PageType::DataPage | PageType::DataPageV2 => {
-                    let info = data_page_view(&hdr, body, self.codec, &mut self.decomp)?;
+                    let info = data_page_view(
+                        &hdr,
+                        body,
+                        self.codec,
+                        self.max_rep_level,
+                        self.max_def_level,
+                        &mut self.decomp,
+                    )?;
                     let before = self.carry.len();
                     match info.encoding {
                         Encoding::Plain => {
@@ -2483,11 +2557,14 @@ pub fn read_column_byte_array_batches(
     if batch_size == 0 {
         return Err(CodecError::InvalidInput("batch_size must be > 0".into()));
     }
-    let (chunk_bytes, total_values, codec) = read_chunk_raw(file, row_group, column)?;
+    let (chunk_bytes, total_values, codec, max_rep_level, max_def_level) =
+        read_chunk_raw(file, row_group, column)?;
     Ok(ColumnByteArrayBatchIter {
         chunk_bytes,
         walker_pos: 0,
         codec,
+        max_rep_level,
+        max_def_level,
         total_values,
         emitted_to_carry: 0,
         batch_size,

@@ -29,6 +29,7 @@ pub mod dict;
 #[cfg(feature = "encryption")]
 pub mod encrypted;
 pub mod error;
+pub mod index;
 pub mod levels;
 pub mod page_index;
 #[cfg(feature = "parallel")]

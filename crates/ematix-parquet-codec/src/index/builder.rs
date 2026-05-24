@@ -38,6 +38,7 @@ use std::path::Path;
 use ematix_parquet_format::types::{CompressionCodec, ParquetType};
 use ematix_parquet_io::ParquetFile;
 
+use crate::bloom::{optimal_num_blocks, parquet_xxh64, SplitBlockBloomFilterBuilder};
 use crate::error::{CodecError, Result};
 use crate::index::fingerprint::compute_source_fingerprint;
 use crate::index::manifest::{IndexEntry, IndexKind, IndexManifest, PhysicalType, MANIFEST_KEY};
@@ -347,6 +348,156 @@ impl<'a> IndexBuilder<'a> {
         ];
         let opts = WriteOptions {
             default_codec: CompressionCodec::Snappy,
+            kv_metadata: Some(&kvs),
+            ..WriteOptions::default()
+        };
+        write_table_with_options_to_path(out_path, cols, &opts)
+    }
+
+    /// Build a **per-source-page Bloom filter** index over an `INT64`
+    /// column and write it as a sidecar. Each row in the sidecar
+    /// holds the SBBF bitset (+ a small header) for one source page;
+    /// readers probe the bloom for a query value to decide which
+    /// pages are worth fully scanning.
+    ///
+    /// `target_fpp` is the false-positive probability per page —
+    /// `0.01` is a reasonable default. The actual size of each
+    /// bloom is `optimal_num_blocks(distinct_per_page, fpp) * 32`
+    /// bytes plus the small `BloomFilterHeader` Thrift prefix
+    /// (~20 bytes). For a 32 K-value page with ~30 K distinct INT64
+    /// values at `fpp=0.01` this is ~36 KB per bloom; for the
+    /// low-cardinality Q14-shape `l_shipdate` page (~2500 distinct)
+    /// it's ~3 KB.
+    ///
+    /// Bloom filters are *equality-only* — they have no notion of
+    /// ranges. For range queries use [`Self::write_sorted_i64`].
+    pub fn write_bloom_page_i64<P: AsRef<Path>>(
+        &self,
+        out_path: P,
+        index_name: &str,
+        source_column: usize,
+        target_fpp: f64,
+    ) -> Result<()> {
+        let md = self
+            .source
+            .metadata()
+            .map_err(|e| CodecError::InvalidInput(format!("read parquet metadata: {e}")))?;
+        let leaf_schema_idx = source_column
+            .checked_add(1)
+            .ok_or_else(|| CodecError::InvalidInput("source_column index overflow".into()))?;
+        let leaf = md.schema.get(leaf_schema_idx).ok_or_else(|| {
+            CodecError::InvalidInput(format!(
+                "source_column {source_column} out of range in flat schema"
+            ))
+        })?;
+        let leaf_type = leaf.column_type.ok_or_else(|| {
+            CodecError::InvalidInput(format!(
+                "schema element at leaf {source_column} has no physical type (group node?)"
+            ))
+        })?;
+        if leaf_type != ParquetType::Int64 {
+            return Err(CodecError::InvalidInput(format!(
+                "write_bloom_page_i64: source column {source_column} is {leaf_type:?}, expected INT64"
+            )));
+        }
+        if !(target_fpp > 0.0 && target_fpp < 1.0) {
+            return Err(CodecError::InvalidInput(format!(
+                "write_bloom_page_i64: target_fpp must be in (0, 1), got {target_fpp}"
+            )));
+        }
+
+        // (source_rg, source_page) → SBBF bytes (header + bitset).
+        // Output is sorted lexicographically by (rg, page) so a
+        // sequential scan walks pages in their source-file order;
+        // a future ColumnIndex on the sidecar's source_rg/source_page
+        // columns lets a reader page-skip the sidecar too.
+        let mut entries: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+
+        for rg in 0..md.row_groups.len() {
+            let values = read_column_i64(self.source, rg, source_column)?;
+            let mut absolute_offsets: Vec<DataPageLayout> = Vec::new();
+            walk_data_pages(self.source, rg, source_column, |layout| {
+                absolute_offsets.push(layout);
+                Ok(())
+            })?;
+            let summed: usize = absolute_offsets.iter().map(|p| p.num_values).sum();
+            if summed != values.len() {
+                return Err(CodecError::InvalidInput(format!(
+                    "page-layout walk for rg={rg} col={source_column} summed to {summed} values, \
+                     but column decoded {}",
+                    values.len()
+                )));
+            }
+
+            for page in &absolute_offsets {
+                let slice = &values[page.first_row..page.first_row + page.num_values];
+
+                // Distinct count of i64s in the page. A HashSet is the
+                // simplest correct way; per-page memory is bounded by
+                // the page's row count.
+                let mut distinct: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                for &v in slice {
+                    distinct.insert(v);
+                }
+                let n_distinct = distinct.len();
+
+                // Empty page → emit an empty filter (single 32-byte
+                // block, all zeros). Probing returns false for every
+                // value, which is the right answer.
+                let num_blocks = optimal_num_blocks(n_distinct, target_fpp);
+                let mut bloom = SplitBlockBloomFilterBuilder::new(num_blocks);
+                for v in distinct {
+                    // Parquet's spec hashes the PLAIN-encoded form;
+                    // for INT64 that's the 8-byte little-endian bytes.
+                    bloom.insert_hash(parquet_xxh64(&v.to_le_bytes()));
+                }
+                entries.push((rg as u32, page.page_idx, bloom.into_bytes()));
+            }
+        }
+
+        // Sort (rg, page) ASC.
+        entries.sort_by_key(|(rg, page, _)| (*rg, *page));
+
+        let n = entries.len();
+        let mut col_rg: Vec<i32> = Vec::with_capacity(n);
+        let mut col_page: Vec<i32> = Vec::with_capacity(n);
+        let mut col_bloom_owned: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for (rg, page, bytes) in entries {
+            col_rg.push(rg as i32);
+            col_page.push(page as i32);
+            col_bloom_owned.push(bytes);
+        }
+
+        let fp = compute_source_fingerprint(self.source)?;
+        let leaf_name = std::str::from_utf8(leaf.name).map_err(|_| {
+            CodecError::InvalidInput("schema element name is not valid UTF-8".into())
+        })?;
+        let manifest = IndexManifest {
+            source_fingerprint: fp,
+            indexes: vec![IndexEntry {
+                name: index_name.to_owned(),
+                kind: IndexKind::BloomPage {
+                    source_column: leaf_name.to_owned(),
+                    target_fpp,
+                },
+                sidecar_row_group: 0,
+            }],
+        };
+        let manifest_json = manifest.to_json();
+        let kvs = [(MANIFEST_KEY, manifest_json.as_str())];
+
+        let bloom_slices: Vec<&[u8]> = col_bloom_owned.iter().map(|v| v.as_slice()).collect();
+        let cols: &[(&str, ColumnData<'_>)] = &[
+            ("source_rg", ColumnData::I32(&col_rg)),
+            ("source_page", ColumnData::I32(&col_page)),
+            ("bloom_block", ColumnData::ByteArray(&bloom_slices)),
+        ];
+        // No compression for the bloom column: the bitset is
+        // designed to look uniform-random, so dictionary and Snappy
+        // can only hurt. Page offsets (small ints) ride along
+        // uncompressed here too for one less codec dispatch.
+        let opts = WriteOptions {
+            default_codec: CompressionCodec::Uncompressed,
             kv_metadata: Some(&kvs),
             ..WriteOptions::default()
         };

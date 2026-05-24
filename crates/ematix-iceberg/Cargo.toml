@@ -33,6 +33,11 @@ iceberg = { version = "0.6", optional = true }
 # manifest accessors are all `async`. Dev-only; production callers
 # bring their own runtime.
 tokio = { version = "1", features = ["rt", "macros"] }
+# Temp warehouse directory for the Π.22c oracle. `MemoryCatalog` is
+# named for the in-memory *catalog* state (table → metadata mapping)
+# but its `FileIO` writes real manifest avro files to disk; we point
+# it at a temp dir so test runs leave no artefacts.
+tempfile = "3"
 
 [lints]
 workspace = true

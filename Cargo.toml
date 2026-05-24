@@ -6,6 +6,7 @@ members = [
     "crates/ematix-parquet-codec",
     "crates/ematix-parquet-async",
     "crates/ematix-parquet-crypto",
+    "crates/ematix-iceberg",
 ]
 
 [workspace.package]

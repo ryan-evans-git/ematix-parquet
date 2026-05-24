@@ -1,0 +1,23 @@
+[package]
+name = "ematix-iceberg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Iceberg table-format integration for ematix-parquet sidecar indexes. Defines the extension fields appended to Iceberg `data_file` manifest entries (per-file sidecar path + per-index summaries) for file-level pruning before opening sidecars."
+readme = "../../README.md"
+
+[lib]
+name = "ematix_iceberg"
+
+[dependencies]
+# Reuse the codec's `Key` type so the iceberg layer and the per-file
+# sidecar layer agree on physical-type representation end-to-end. The
+# crate also re-exports `PhysicalType` which we mirror onto our
+# `SummaryKey` discriminant.
+ematix-parquet-codec = { path = "../ematix-parquet-codec", version = "0.15" }
+
+[lints]
+workspace = true

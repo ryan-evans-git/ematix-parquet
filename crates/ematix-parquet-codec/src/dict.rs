@@ -510,23 +510,66 @@ fn fused_bitmap_chunk(
             _ => {}
         }
     }
-    // Scalar fallback: unpack, gather, pack.
+    // Splash-shaped portable pack: unpack indices (already dispatches to
+    // NEON via `unpack_indices_into` on aarch64), then 8-lane branchless
+    // gather + OR-fold per output byte. Same shape as `pack_predicate_byte`
+    // in `bitpack_neon`, but pure Rust so LLVM autovectorizes on x86_64
+    // (the OR-shift chain pipelines through ILP; the 8 independent loads
+    // do not depend on each other so the load units stay busy).
+    //
+    // Bounds elision: the caller enforces `dict_mask.len() ≥ 1 << bit_width`
+    // (see `decode_rle_dictionary_predicate_bitmap`), and bit-packed
+    // indices are `bit_width`-bounded by construction, so every
+    // `idx < dict_mask.len()`. The NEON predicate kernels rely on the
+    // same precondition; matching their contract.
     let mut idxs: Vec<u32> = Vec::with_capacity(n);
     unpack_indices_into(chunk, n, bit_width, &mut idxs)?;
+    debug_assert_eq!(idxs.len(), n);
+
     let bytes = n.div_ceil(8);
     let out_start = out.len();
     out.resize(out_start + bytes, 0);
-    for (row, idx) in idxs.into_iter().enumerate() {
-        let i = idx as usize;
-        if i >= dict_mask.len() {
-            return Err(CodecError::DictIndexOutOfRange {
-                index: idx,
-                dict_size: dict_mask.len(),
-            });
+
+    let full_blocks = n / 8;
+    let tail = n % 8;
+
+    for blk in 0..full_blocks {
+        let base = blk * 8;
+        // SAFETY: `idxs.len() == n`, `base + 7 < full_blocks * 8 ≤ n`.
+        // Each `idx` is `bit_width`-bounded; `dict_mask.len() ≥ 1 << bit_width`.
+        // `out_start + blk < out_start + bytes == out.len()`.
+        unsafe {
+            let b0 = *dict_mask.get_unchecked(*idxs.get_unchecked(base) as usize);
+            let b1 = *dict_mask.get_unchecked(*idxs.get_unchecked(base + 1) as usize);
+            let b2 = *dict_mask.get_unchecked(*idxs.get_unchecked(base + 2) as usize);
+            let b3 = *dict_mask.get_unchecked(*idxs.get_unchecked(base + 3) as usize);
+            let b4 = *dict_mask.get_unchecked(*idxs.get_unchecked(base + 4) as usize);
+            let b5 = *dict_mask.get_unchecked(*idxs.get_unchecked(base + 5) as usize);
+            let b6 = *dict_mask.get_unchecked(*idxs.get_unchecked(base + 6) as usize);
+            let b7 = *dict_mask.get_unchecked(*idxs.get_unchecked(base + 7) as usize);
+            *out.get_unchecked_mut(out_start + blk) = b0
+                | (b1 << 1)
+                | (b2 << 2)
+                | (b3 << 3)
+                | (b4 << 4)
+                | (b5 << 5)
+                | (b6 << 6)
+                | (b7 << 7);
         }
-        let bit = dict_mask[i];
-        out[out_start + row / 8] |= bit << (row % 8);
     }
+
+    if tail > 0 {
+        let base = full_blocks * 8;
+        let mut byte = 0u8;
+        for i in 0..tail {
+            // SAFETY: as above; `base + i < n`.
+            let idx = unsafe { *idxs.get_unchecked(base + i) as usize };
+            let bit = unsafe { *dict_mask.get_unchecked(idx) };
+            byte |= bit << i;
+        }
+        out[out_start + full_blocks] = byte;
+    }
+
     Ok(())
 }
 

@@ -15,11 +15,12 @@
 //!
 //! ## Status
 //!
-//! - **Π.17a (this module): scaffolding + manifest + source-file
-//!   fingerprint.** No index logic yet — this PR locks in the file
-//!   format, the `KeyValueMetadata` manifest schema, and the contract
-//!   that a sidecar reader rejects on source-file mismatch.
-//! - Π.17b: sorted-index builder + reader for `INT64`.
+//! - Π.17a: scaffolding + manifest + source-file fingerprint.
+//! - **Π.17b (this module): sorted-index builder + reader for
+//!   `INT64`** + the `read_column_i64_where_eq` convenience entry.
+//!   `Key::I64`-only at the lookup API; `Key::I32` and `Key::Bytes`
+//!   variants are reserved so Π.18 can drop them in without an API
+//!   bump.
 //! - Π.18: sorted index for `INT32` + `BYTE_ARRAY`; range queries.
 //! - Π.19: per-page Bloom + composite (leading-prefix) index.
 //! - Π.20: inverted (text) index + tokenizer trait.
@@ -37,11 +38,19 @@
 //! to a specific footer state; any rewrite of the source invalidates
 //! every sidecar built against it.
 
+pub mod builder;
 pub mod fingerprint;
 pub mod manifest;
+pub mod page_layout;
+pub mod reader;
+pub mod types;
 
+pub use builder::IndexBuilder;
 pub use fingerprint::{compute_source_fingerprint, crc32_ieee};
 pub use manifest::{
     IndexEntry, IndexKind, IndexManifest, ManifestError, PhysicalType, SourceFingerprint,
     Tokenizer, MANIFEST_KEY, MANIFEST_VERSION,
 };
+pub use page_layout::{walk_data_pages, DataPageLayout};
+pub use reader::ParquetIndex;
+pub use types::{IndexHit, Key};

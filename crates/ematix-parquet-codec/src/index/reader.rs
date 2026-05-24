@@ -580,9 +580,11 @@ impl ParquetIndex {
         let idx = self.find_index(index_name)?;
         let tokenizer = match &idx.entry.kind {
             IndexKind::Inverted { tokenizer, .. } => *tokenizer,
-            _ => return Err(CodecError::InvalidInput(format!(
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
                 "read_column_byte_array_where_token: index `{index_name}` is not an inverted index"
-            ))),
+            )))
+            }
         };
         let toks = tokenizer.tokenize(query);
         if toks.len() != 1 {

@@ -20,6 +20,7 @@ use std::path::Path;
 
 use ematix_parquet_io::ParquetFile;
 
+use crate::bloom::{parquet_xxh64, SplitBlockBloomFilter};
 use crate::error::{CodecError, Result};
 use crate::index::fingerprint::compute_source_fingerprint;
 use crate::index::manifest::{IndexEntry, IndexKind, IndexManifest, ManifestError, MANIFEST_KEY};
@@ -61,17 +62,43 @@ struct LoadedTypedBytes {
     rowsets: Vec<Vec<u8>>,
 }
 
+/// One loaded page-Bloom index. Each row of the sidecar parquet
+/// becomes one `(source_rg, source_page, bloom_bytes)` triple; the
+/// `bloom_bytes` is the SBBF `header + bitset` form
+/// (`SplitBlockBloomFilterBuilder::into_bytes()`).
 #[derive(Debug)]
-enum LoadedSorted {
-    I64(LoadedTypedI64),
-    I32(LoadedTypedI32),
-    Bytes(LoadedTypedBytes),
+struct LoadedBloomPage {
+    source_rgs: Vec<i32>,
+    source_pages: Vec<i32>,
+    blooms: Vec<Vec<u8>>,
+}
+
+/// One loaded composite (INT64, INT64) leading-prefix index. Five
+/// parallel vectors: `(value_a, value_b)` is the sort key,
+/// `(target_rg, target_page, rowset)` carries the page-relative hit
+/// (anchored to `source_columns[0]`'s page layout).
+#[derive(Debug)]
+struct LoadedTypedCompositeI64I64 {
+    values_a: Vec<i64>,
+    values_b: Vec<i64>,
+    target_rgs: Vec<i32>,
+    target_pages: Vec<i32>,
+    rowsets: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+enum LoadedIndexData {
+    SortedI64(LoadedTypedI64),
+    SortedI32(LoadedTypedI32),
+    SortedBytes(LoadedTypedBytes),
+    BloomPage(LoadedBloomPage),
+    CompositePrefixI64I64(LoadedTypedCompositeI64I64),
 }
 
 #[derive(Debug)]
 struct LoadedIndex {
     entry: IndexEntry,
-    data: LoadedSorted,
+    data: LoadedIndexData,
 }
 
 /// Parsed sidecar parquet. Owns the manifest and the in-memory index
@@ -143,7 +170,7 @@ impl ParquetIndex {
                                 &target_pages,
                                 &rowsets,
                             )?;
-                            LoadedSorted::I64(LoadedTypedI64 {
+                            LoadedIndexData::SortedI64(LoadedTypedI64 {
                                 values,
                                 target_rgs,
                                 target_pages,
@@ -163,7 +190,7 @@ impl ParquetIndex {
                                 &target_pages,
                                 &rowsets,
                             )?;
-                            LoadedSorted::I32(LoadedTypedI32 {
+                            LoadedIndexData::SortedI32(LoadedTypedI32 {
                                 values,
                                 target_rgs,
                                 target_pages,
@@ -183,7 +210,7 @@ impl ParquetIndex {
                                 &target_pages,
                                 &rowsets,
                             )?;
-                            LoadedSorted::Bytes(LoadedTypedBytes {
+                            LoadedIndexData::SortedBytes(LoadedTypedBytes {
                                 values,
                                 target_rgs,
                                 target_pages,
@@ -196,10 +223,86 @@ impl ParquetIndex {
                         data,
                     });
                 }
-                // Other kinds reserved for Π.19+ (BloomPage,
-                // CompositePrefix, Inverted). Skipping is forward-compat
-                // friendly — a request for one of them through
-                // `lookup_eq` will fail loud at lookup time.
+                IndexKind::CompositePrefix {
+                    source_columns,
+                    physical_types,
+                } => {
+                    // MVP: only (INT64, INT64) is supported.
+                    if source_columns.len() != 2
+                        || physical_types.len() != 2
+                        || physical_types[0] != PhysicalType::Int64
+                        || physical_types[1] != PhysicalType::Int64
+                    {
+                        return Err(CodecError::InvalidInput(format!(
+                            "composite-prefix index `{}`: MVP supports exactly (INT64, INT64); got types {:?}",
+                            entry.name, physical_types
+                        )));
+                    }
+                    let rg = entry.sidecar_row_group as usize;
+                    // Schema: value_a INT64, value_b INT64, target_rg INT32, target_page INT32, target_rowset BYTE_ARRAY.
+                    let values_a = read_column_i64(&idx_file, rg, 0)?;
+                    let values_b = read_column_i64(&idx_file, rg, 1)?;
+                    let target_rgs = read_column_i32(&idx_file, rg, 2)?;
+                    let target_pages = read_column_i32(&idx_file, rg, 3)?;
+                    let rowsets = read_column_byte_array(&idx_file, rg, 4)?;
+                    let n = values_a.len();
+                    if values_b.len() != n
+                        || target_rgs.len() != n
+                        || target_pages.len() != n
+                        || rowsets.len() != n
+                    {
+                        return Err(CodecError::InvalidInput(format!(
+                            "composite-prefix index `{}` row group {} has mismatched column lengths \
+                             (a={}, b={}, rg={}, page={}, rowset={})",
+                            entry.name,
+                            rg,
+                            n,
+                            values_b.len(),
+                            target_rgs.len(),
+                            target_pages.len(),
+                            rowsets.len()
+                        )));
+                    }
+                    indexes.push(LoadedIndex {
+                        entry: entry.clone(),
+                        data: LoadedIndexData::CompositePrefixI64I64(LoadedTypedCompositeI64I64 {
+                            values_a,
+                            values_b,
+                            target_rgs,
+                            target_pages,
+                            rowsets,
+                        }),
+                    });
+                }
+                IndexKind::BloomPage { .. } => {
+                    let rg = entry.sidecar_row_group as usize;
+                    // Schema: source_rg INT32, source_page INT32, bloom_block BYTE_ARRAY.
+                    let source_rgs = read_column_i32(&idx_file, rg, 0)?;
+                    let source_pages = read_column_i32(&idx_file, rg, 1)?;
+                    let blooms = read_column_byte_array(&idx_file, rg, 2)?;
+                    if source_rgs.len() != source_pages.len() || source_rgs.len() != blooms.len() {
+                        return Err(CodecError::InvalidInput(format!(
+                            "page-bloom index `{}` row group {} has mismatched column lengths \
+                             (source_rgs={}, source_pages={}, blooms={})",
+                            entry.name,
+                            rg,
+                            source_rgs.len(),
+                            source_pages.len(),
+                            blooms.len()
+                        )));
+                    }
+                    indexes.push(LoadedIndex {
+                        entry: entry.clone(),
+                        data: LoadedIndexData::BloomPage(LoadedBloomPage {
+                            source_rgs,
+                            source_pages,
+                            blooms,
+                        }),
+                    });
+                }
+                // CompositePrefix + Inverted reserved for Π.19b / Π.20.
+                // Skipping is forward-compat friendly — a lookup
+                // request for one of them will fail loud by name.
                 _ => continue,
             }
         }
@@ -233,9 +336,9 @@ impl ParquetIndex {
             )));
         }
         match (&idx.data, key) {
-            (LoadedSorted::I64(d), Key::I64(v)) => Ok(eq_hits_i64(d, *v)),
-            (LoadedSorted::I32(d), Key::I32(v)) => Ok(eq_hits_i32(d, *v)),
-            (LoadedSorted::Bytes(d), Key::Bytes(v)) => Ok(eq_hits_bytes(d, v)),
+            (LoadedIndexData::SortedI64(d), Key::I64(v)) => Ok(eq_hits_i64(d, *v)),
+            (LoadedIndexData::SortedI32(d), Key::I32(v)) => Ok(eq_hits_i32(d, *v)),
+            (LoadedIndexData::SortedBytes(d), Key::Bytes(v)) => Ok(eq_hits_bytes(d, v)),
             _ => Err(CodecError::InvalidInput(format!(
                 "lookup_eq: key/index type mismatch on `{index_name}`"
             ))),
@@ -272,19 +375,19 @@ impl ParquetIndex {
             )));
         }
         match (&idx.data, lo, hi) {
-            (LoadedSorted::I64(d), Key::I64(a), Key::I64(b)) => {
+            (LoadedIndexData::SortedI64(d), Key::I64(a), Key::I64(b)) => {
                 if a > b {
                     return Ok(Vec::new());
                 }
                 Ok(range_hits_i64(d, *a..=*b))
             }
-            (LoadedSorted::I32(d), Key::I32(a), Key::I32(b)) => {
+            (LoadedIndexData::SortedI32(d), Key::I32(a), Key::I32(b)) => {
                 if a > b {
                     return Ok(Vec::new());
                 }
                 Ok(range_hits_i32(d, *a..=*b))
             }
-            (LoadedSorted::Bytes(d), Key::Bytes(a), Key::Bytes(b)) => {
+            (LoadedIndexData::SortedBytes(d), Key::Bytes(a), Key::Bytes(b)) => {
                 if a > b {
                     return Ok(Vec::new());
                 }
@@ -294,6 +397,236 @@ impl ParquetIndex {
                 "lookup_range: key/index type mismatch on `{index_name}`"
             ))),
         }
+    }
+
+    // ============================================================
+    // Composite leading-prefix lookups
+    // ============================================================
+
+    /// Exact 2-tuple equality on a composite `(INT64, INT64)` index.
+    /// Returns every `(rg, page, rowset)` triple containing rows
+    /// where `(value_a, value_b) == (key_a, key_b)`.
+    ///
+    /// Anchored to `source_columns[0]`'s page layout — see
+    /// [`crate::index::IndexBuilder::write_sorted_composite_prefix_i64_i64`].
+    pub fn lookup_composite_eq(
+        &self,
+        index_name: &str,
+        key_a: &Key<'_>,
+        key_b: &Key<'_>,
+    ) -> Result<Vec<IndexHit>> {
+        let idx = self.find_index(index_name)?;
+        let d = match &idx.data {
+            LoadedIndexData::CompositePrefixI64I64(d) => d,
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
+                    "lookup_composite_eq: index `{index_name}` is not a (INT64, INT64) composite-prefix index"
+                )))
+            }
+        };
+        let (a, b) = match (key_a, key_b) {
+            (Key::I64(a), Key::I64(b)) => (*a, *b),
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
+                    "lookup_composite_eq: key variants `{}`+`{}` do not match (INT64, INT64)",
+                    key_a.variant_name(),
+                    key_b.variant_name()
+                )))
+            }
+        };
+        Ok(composite_eq_hits(d, a, b))
+    }
+
+    /// Leading-prefix equality on a composite `(INT64, INT64)`
+    /// index: returns every hit whose `value_a == key_a`, regardless
+    /// of `value_b`. The trailing dimension is left free — useful
+    /// for "WHERE col_a = X AND col_b IN [...]"-shaped predicates
+    /// where the IN-list is too big to lookup point-wise.
+    pub fn lookup_composite_prefix(
+        &self,
+        index_name: &str,
+        key_a: &Key<'_>,
+    ) -> Result<Vec<IndexHit>> {
+        let idx = self.find_index(index_name)?;
+        let d = match &idx.data {
+            LoadedIndexData::CompositePrefixI64I64(d) => d,
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
+                    "lookup_composite_prefix: index `{index_name}` is not a (INT64, INT64) composite-prefix index"
+                )))
+            }
+        };
+        let a = match key_a {
+            Key::I64(a) => *a,
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
+                    "lookup_composite_prefix: key variant `{}` does not match INT64",
+                    key_a.variant_name()
+                )))
+            }
+        };
+        Ok(composite_prefix_hits(d, a))
+    }
+
+    /// `INT64` exact 2-tuple composite + masked decode. Equivalent
+    /// to: `lookup_composite_eq → assemble per-rg bitmap → read_column_i64_masked_into`.
+    pub fn read_column_i64_where_composite_eq(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key_a: i64,
+        key_b: i64,
+        target_column: usize,
+    ) -> Result<Vec<i64>> {
+        let hits = self.lookup_composite_eq(index_name, &Key::I64(key_a), &Key::I64(key_b))?;
+        self.materialize_i64_composite(source, index_name, &hits, target_column)
+    }
+
+    /// `INT64` leading-prefix composite + masked decode.
+    pub fn read_column_i64_where_composite_prefix(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key_a: i64,
+        target_column: usize,
+    ) -> Result<Vec<i64>> {
+        let hits = self.lookup_composite_prefix(index_name, &Key::I64(key_a))?;
+        self.materialize_i64_composite(source, index_name, &hits, target_column)
+    }
+
+    // ============================================================
+    // bloom_probe + read_column_*_via_bloom_eq
+    // ============================================================
+
+    /// Probe a page-Bloom index with an equality query. Returns the
+    /// `(rg, page)` pairs whose Bloom filter says the value *might*
+    /// be present. False positives are possible (bounded by the
+    /// `target_fpp` chosen at build time); false negatives are not.
+    ///
+    /// The returned list is ordered by `(rg, page)` ASC (the
+    /// sidecar's build-time sort). Callers that want to materialize
+    /// rows should use [`Self::read_column_i64_via_bloom_eq`] —
+    /// `bloom_probe` is the lower-level primitive useful when
+    /// combining the result with another index or with manual scan
+    /// logic.
+    pub fn bloom_probe(&self, index_name: &str, key: &Key<'_>) -> Result<Vec<(u32, u32)>> {
+        let idx = self.find_index(index_name)?;
+        let bloom = match &idx.data {
+            LoadedIndexData::BloomPage(b) => b,
+            _ => {
+                return Err(CodecError::InvalidInput(format!(
+                    "bloom_probe: index `{index_name}` is not a page-Bloom index"
+                )))
+            }
+        };
+        // Hash the key per Parquet's spec (PLAIN-encoded bytes).
+        let hash = match key {
+            Key::I64(v) => parquet_xxh64(&v.to_le_bytes()),
+            Key::I32(v) => parquet_xxh64(&v.to_le_bytes()),
+            Key::Bytes(v) => parquet_xxh64(v),
+        };
+        let mut hits: Vec<(u32, u32)> = Vec::new();
+        for i in 0..bloom.blooms.len() {
+            let f = SplitBlockBloomFilter::from_bytes(&bloom.blooms[i])?;
+            if f.contains_hash(hash) {
+                hits.push((bloom.source_rgs[i] as u32, bloom.source_pages[i] as u32));
+            }
+        }
+        Ok(hits)
+    }
+
+    /// `INT64` equality lookup via a page-Bloom index.
+    ///
+    /// `bloom_probe` returns *candidate* `(rg, page)` pairs — some
+    /// of which may be false positives. This method, for each
+    /// candidate page, masks all rows in the page as "decode me",
+    /// calls `read_column_i64_masked_into` (which gets the v0.14.0
+    /// skip-decompress-when-zero-popcount lever for *non*-matched
+    /// pages for free), and then **filters the result** in memory
+    /// for exact equality. The output is the same as what a sorted
+    /// equality index would have returned, modulo CPU cost on
+    /// false-positive pages.
+    ///
+    /// Use a Bloom-only index when the source has too many distinct
+    /// values for a sorted index to be cost-effective, or when you
+    /// only need pruning (no rowset granularity).
+    pub fn read_column_i64_via_bloom_eq(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key: i64,
+        target_column: usize,
+    ) -> Result<Vec<i64>> {
+        let candidate_pages = self.bloom_probe(index_name, &Key::I64(key))?;
+        if candidate_pages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Resolve the indexed column's leaf ordinal so we can walk its
+        // page layout and convert (rg, page) → first_row range.
+        let idx = self.find_index(index_name)?;
+        let source_col_name = match &idx.entry.kind {
+            IndexKind::BloomPage { source_column, .. } => source_column.as_str(),
+            _ => unreachable!("bloom_probe already validated the kind"),
+        };
+        let source_col_idx = resolve_leaf_by_name(source, source_col_name)?;
+
+        // Group candidates by row group; build a chunk-wide bitmap
+        // per row group with full rows set in the candidate pages.
+        let md = source
+            .metadata()
+            .map_err(|e| CodecError::InvalidInput(format!("source metadata: {e}")))?;
+        let mut by_rg: std::collections::BTreeMap<u32, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for (rg, page) in candidate_pages {
+            by_rg.entry(rg).or_default().push(page);
+        }
+
+        let mut decoded: Vec<i64> = Vec::new();
+        for (rg, pages) in by_rg {
+            let rg_meta = md.row_groups.get(rg as usize).ok_or_else(|| {
+                CodecError::InvalidInput(format!(
+                    "bloom hit references row_group {rg} out of source range"
+                ))
+            })?;
+            let n_rows = rg_meta.num_rows as usize;
+            let mut bitmap = vec![0u8; n_rows.div_ceil(8)];
+
+            // Walk indexed column to get page boundaries.
+            let mut page_layouts: Vec<(usize, usize)> = Vec::new(); // (first_row, num_values)
+            walk_data_pages(source, rg as usize, source_col_idx, |layout| {
+                page_layouts.push((layout.first_row, layout.num_values));
+                Ok(())
+            })?;
+
+            for page in pages {
+                let (first_row, num_values) =
+                    *page_layouts.get(page as usize).ok_or_else(|| {
+                        CodecError::InvalidInput(format!(
+                            "bloom hit references page {page} in rg {rg} but indexed column has only {} pages",
+                            page_layouts.len()
+                        ))
+                    })?;
+                let end = first_row + num_values;
+                // Set bits [first_row, end). Byte-granular fast path
+                // for the dense interior, bit-granular at the edges.
+                set_range_bits(&mut bitmap, first_row, end);
+            }
+
+            crate::read::read_column_i64_masked_into(
+                source,
+                rg as usize,
+                target_column,
+                &bitmap,
+                &mut decoded,
+            )?;
+        }
+
+        // Filter for exact equality: Bloom has false positives, so
+        // the decoded set may include extra rows from candidate pages
+        // that didn't actually match.
+        decoded.retain(|&v| v == key);
+        Ok(decoded)
     }
 
     // ============================================================
@@ -422,6 +755,21 @@ impl ParquetIndex {
         Ok(out)
     }
 
+    /// Composite-index sibling of [`Self::materialize_i64`]. Same
+    /// body — `assemble_bitmaps` already dispatches on Sorted vs
+    /// CompositePrefix to find the indexed column — but exposed as a
+    /// separately-named helper so future composite-specific
+    /// optimizations don't have to retrofit the sorted-only path.
+    fn materialize_i64_composite(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        hits: &[IndexHit],
+        target_column: usize,
+    ) -> Result<Vec<i64>> {
+        self.materialize_i64(source, index_name, hits, target_column)
+    }
+
     fn materialize_i32(
         &self,
         source: &ParquetFile,
@@ -475,6 +823,11 @@ impl ParquetIndex {
     /// sized to the row group's `num_rows`; bits are placed using
     /// the *indexed* column's page boundaries (since rowsets are
     /// page-relative to the indexed column).
+    ///
+    /// Works for both Sorted and CompositePrefix index kinds — the
+    /// "indexed column" for a composite is `source_columns[0]` (the
+    /// leading sort key, which is the column whose page layout
+    /// rowsets are anchored to by the builder).
     fn assemble_bitmaps(
         &self,
         source: &ParquetFile,
@@ -484,9 +837,16 @@ impl ParquetIndex {
         let idx = self.find_index(index_name)?;
         let source_col_name = match &idx.entry.kind {
             IndexKind::Sorted { source_column, .. } => source_column.as_str(),
+            IndexKind::CompositePrefix { source_columns, .. } => {
+                source_columns.first().map(String::as_str).ok_or_else(|| {
+                    CodecError::InvalidInput(format!(
+                        "composite index `{index_name}` has empty source_columns"
+                    ))
+                })?
+            }
             _ => {
                 return Err(CodecError::InvalidInput(format!(
-                    "index `{index_name}` is not a sorted index"
+                    "index `{index_name}` does not produce IndexHits"
                 )))
             }
         };
@@ -616,6 +976,52 @@ fn range_hits_bytes(d: &LoadedTypedBytes, lo: &[u8], hi: &[u8]) -> Vec<IndexHit>
     collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
 }
 
+fn composite_eq_hits(d: &LoadedTypedCompositeI64I64, a: i64, b: i64) -> Vec<IndexHit> {
+    // Two-step binary search:
+    //   1. Find the run where values_a == a (partition by `< a` and `<= a`).
+    //   2. Within that run, find the row where values_b == b.
+    // Both runs are tiny once values_a is pinned, so a linear scan
+    // for the second step is fine and avoids a second sorted-by-b
+    // contract requirement.
+    let a_start = d.values_a.partition_point(|v| *v < a);
+    let a_end = d.values_a.partition_point(|v| *v <= a);
+    if a_start == a_end {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // Within the a-run, the rows are sorted by (a, b, rg, page).
+    // Since values_a is constant, sort within the run is by (b, rg, page).
+    // Use binary search on b for efficiency.
+    let b_slice = &d.values_b[a_start..a_end];
+    let b_start_local = b_slice.partition_point(|v| *v < b);
+    let b_end_local = b_slice.partition_point(|v| *v <= b);
+    if b_start_local == b_end_local {
+        return out;
+    }
+    for i in (a_start + b_start_local)..(a_start + b_end_local) {
+        out.push(IndexHit {
+            row_group: d.target_rgs[i] as u32,
+            page: d.target_pages[i] as u32,
+            rowset: d.rowsets[i].clone(),
+        });
+    }
+    out
+}
+
+fn composite_prefix_hits(d: &LoadedTypedCompositeI64I64, a: i64) -> Vec<IndexHit> {
+    let start = d.values_a.partition_point(|v| *v < a);
+    let end = d.values_a.partition_point(|v| *v <= a);
+    let mut out = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end {
+        out.push(IndexHit {
+            row_group: d.target_rgs[i] as u32,
+            page: d.target_pages[i] as u32,
+            rowset: d.rowsets[i].clone(),
+        });
+    }
+    out
+}
+
 fn collect_hits(
     target_rgs: &[i32],
     target_pages: &[i32],
@@ -670,6 +1076,35 @@ fn sorted_physical_type(entry: &IndexEntry) -> Result<PhysicalType> {
 
 fn codec_err(e: ManifestError) -> CodecError {
     CodecError::InvalidInput(format!("{e}"))
+}
+
+/// Set bits `[start_bit, end_bit)` in a packed bitmap. Used by the
+/// page-Bloom convenience entry to mark all rows in candidate
+/// pages "decode me".
+fn set_range_bits(bitmap: &mut [u8], start_bit: usize, end_bit: usize) {
+    if start_bit >= end_bit {
+        return;
+    }
+    let n_bits = bitmap.len() * 8;
+    let end_bit = end_bit.min(n_bits);
+    let start_bit = start_bit.min(end_bit);
+
+    // Head: bit-by-bit until aligned to a byte boundary.
+    let mut bit = start_bit;
+    while bit < end_bit && bit % 8 != 0 {
+        bitmap[bit / 8] |= 1 << (bit % 8);
+        bit += 1;
+    }
+    // Body: whole bytes (= 0xFF).
+    while bit + 8 <= end_bit {
+        bitmap[bit / 8] = 0xFF;
+        bit += 8;
+    }
+    // Tail: bit-by-bit.
+    while bit < end_bit {
+        bitmap[bit / 8] |= 1 << (bit % 8);
+        bit += 1;
+    }
 }
 
 fn resolve_leaf_by_name(source: &ParquetFile, name: &str) -> Result<usize> {

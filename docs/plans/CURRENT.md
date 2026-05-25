@@ -1566,6 +1566,29 @@ new index oracles + 59 iceberg tests on top.
 
 ---
 
+## v0.16.1 patch — `ematix-iceberg` joins the crates.io publish chain
+
+v0.16.0 shipped the new `ematix-iceberg` crate in the workspace
+but `.github/workflows/release.yml` only listed the five original
+crates (format / io / crypto / codec / async). The v0.16.0 tag
+therefore published only those five — `ematix-iceberg` stayed at
+path-dep only, unreachable from crates.io.
+
+This patch adds the missing publish step. No source changes; only
+`release.yml` (adds the sixth `cargo publish -p ematix-iceberg`
+step after async, with the usual 45 s propagation sleep) and the
+workspace version bump 0.16.0 → 0.16.1. The five existing crates
+re-publish at 0.16.1 unchanged from 0.16.0 (cargo doesn't allow
+re-publishing a single crate at the same version) — same code,
+new tag.
+
+Inter-crate `version = "0.16"` pins stay; 0.16.1 satisfies that
+constraint via semver.
+
+**Released as v0.16.1.**
+
+---
+
 ## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot

@@ -510,6 +510,48 @@ fn fused_bitmap_chunk(
             _ => {}
         }
     }
+    // x86_64 mirror: same six bit-widths get fused AVX2 decoders that
+    // avoid the `Vec<u32>` round-trip the portable fallback below uses.
+    // AVX2 is checked via `is_x86_feature_detected!` — non-AVX2 x86 boxes
+    // (rare; pre-Haswell) fall through to the portable path.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            match bit_width {
+                12 => {
+                    return crate::bitpack_avx2::decode_predicate_bitmap_avx2_bw12(
+                        chunk, n, dict_mask, out,
+                    )
+                }
+                14 => {
+                    return crate::bitpack_avx2::decode_predicate_bitmap_avx2_bw14(
+                        chunk, n, dict_mask, out,
+                    )
+                }
+                15 => {
+                    return crate::bitpack_avx2::decode_predicate_bitmap_avx2_bw15(
+                        chunk, n, dict_mask, out,
+                    )
+                }
+                16 => {
+                    return crate::bitpack_avx2::decode_predicate_bitmap_avx2_bw16(
+                        chunk, n, dict_mask, out,
+                    )
+                }
+                17 => {
+                    return crate::bitpack_avx2::decode_predicate_bitmap_avx2_bw17(
+                        chunk, n, dict_mask, out,
+                    )
+                }
+                18 => {
+                    return crate::bitpack_avx2::decode_predicate_bitmap_avx2_bw18(
+                        chunk, n, dict_mask, out,
+                    )
+                }
+                _ => {}
+            }
+        }
+    }
     // Splash-shaped portable pack: unpack indices (already dispatches to
     // NEON via `unpack_indices_into` on aarch64), then 8-lane branchless
     // gather + OR-fold per output byte. Same shape as `pack_predicate_byte`

@@ -4045,3 +4045,451 @@ unsafe fn unpack_avx2_bw32_unchecked(packed: &[u8], full_blocks: usize, out: &mu
     }
     out.set_len(out_start_len + full_blocks * 8);
 }
+
+// =============================================================================
+// Predicate-fused decoders — AVX2 mirrors of `bitpack_neon::
+// decode_predicate_bitmap_neon_bw*`.
+//
+// Each `decode_predicate_bitmap_avx2_bwN` consumes a bit-packed page,
+// resolves every 8-row block into a stack `[u32; 8]` staging buffer via
+// the matching `unpack_avx2_bwN_into_staging` callback, then packs one
+// output byte by gathering 8 mask bits from `dict_mask` and OR-folding
+// them lane-by-lane (`pack_predicate_byte` below).
+//
+// The fusion benefit vs the generic `unpack_indices_into + 8-lane pack`
+// path used by `dict::fused_bitmap_chunk` is L1 pressure: the staging
+// buffer is `&mut [u32; 8]` on the stack (32 bytes, register-resident
+// in practice), so unpacked indices never round-trip through a
+// `Vec<u32>` heap allocation across block boundaries.
+//
+// Wired in from `dict::fused_bitmap_chunk` via `#[cfg(target_arch =
+// "x86_64")]`.  Bit-widths covered: 12, 14, 15, 16, 17, 18 — the dict
+// widths that show up in TPC-H lineitem (l_shipdate / l_commitdate /
+// l_receiptdate at 12; l_shipmode / l_shipinstruct at 14-15; larger
+// auxiliary columns at 17-18).
+// =============================================================================
+
+/// Scalar gather + pack one output byte from 8 unpacked indices.
+/// Local duplicate of `bitpack_neon::pack_predicate_byte` (private
+/// to each arch-specific module).
+///
+/// SAFETY: caller guarantees every `idxs[i] < dict_mask.len()`,
+/// which is enforced upstream by the bit-width vs `dict_mask.len()`
+/// check in each `decode_predicate_bitmap_avx2_bw*` entry point.
+#[inline]
+unsafe fn pack_predicate_byte(idxs: &[u32; 8], mask_ptr: *const u8) -> u8 {
+    let b0 = *mask_ptr.add(idxs[0] as usize);
+    let b1 = *mask_ptr.add(idxs[1] as usize);
+    let b2 = *mask_ptr.add(idxs[2] as usize);
+    let b3 = *mask_ptr.add(idxs[3] as usize);
+    let b4 = *mask_ptr.add(idxs[4] as usize);
+    let b5 = *mask_ptr.add(idxs[5] as usize);
+    let b6 = *mask_ptr.add(idxs[6] as usize);
+    let b7 = *mask_ptr.add(idxs[7] as usize);
+    b0 | (b1 << 1) | (b2 << 2) | (b3 << 3) | (b4 << 4) | (b5 << 5) | (b6 << 6) | (b7 << 7)
+}
+
+/// Predicate-fused decode for bw=12: indices ∈ [0, 4096), `dict_mask`
+/// must be ≥ 4096 bytes.
+pub fn decode_predicate_bitmap_avx2_bw12(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 12) {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw12 fused: dict_mask must be ≥ 4096 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 12).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw12 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 12 * (full_blocks - 1) + 16 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_avx2_bw12_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 12 / 8..], remaining, 12, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}
+
+/// Predicate-fused decode for bw=14: indices ∈ [0, 16384), `dict_mask`
+/// must be ≥ 16384 bytes.
+pub fn decode_predicate_bitmap_avx2_bw14(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 14) {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw14 fused: dict_mask must be ≥ 16384 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 14).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw14 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 14 * (full_blocks - 1) + 16 {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_avx2_bw14_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 14 / 8..], remaining, 14, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}
+
+/// Predicate-fused decode for bw=15: indices ∈ [0, 32768), `dict_mask`
+/// must be ≥ 32768 bytes.
+pub fn decode_predicate_bitmap_avx2_bw15(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 15) {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw15 fused: dict_mask must be ≥ 32768 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 15).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw15 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 15 * (full_blocks - 1) + 24 {
+        // bw=15 staging unpacker reads from offset 0 (16 bytes) and
+        // offset 7 (16 bytes) → up to byte 22 per block; the canonical
+        // safe-blocks budget is 24 to match the lookup wrapper.
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_avx2_bw15_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 15 / 8..], remaining, 15, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}
+
+/// Predicate-fused decode for bw=16: indices ∈ [0, 65536), `dict_mask`
+/// must be ≥ 65536 bytes.  bw=16 reads exactly 16 bytes per block,
+/// so the safe-blocks check is `packed.len() >= 16 * full_blocks`
+/// (no speculative-read past the last block).
+pub fn decode_predicate_bitmap_avx2_bw16(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 16) {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw16 fused: dict_mask must be ≥ 65536 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = num_values * 2;
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw16 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 16 * full_blocks {
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_avx2_bw16_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 16 / 8..], remaining, 16, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}
+
+/// Predicate-fused decode for bw=17: indices ∈ [0, 131072), `dict_mask`
+/// must be ≥ 131072 bytes.
+pub fn decode_predicate_bitmap_avx2_bw17(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 17) {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw17 fused: dict_mask must be ≥ 131072 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 17).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw17 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 17 * (full_blocks - 1) + 24 {
+        // bw=17 staging unpacker speculatively reads up to 24 bytes
+        // past the block start (see `unpack_avx2_bw17_into_staging`).
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_avx2_bw17_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 17 / 8..], remaining, 17, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}
+
+/// Predicate-fused decode for bw=18: indices ∈ [0, 262144), `dict_mask`
+/// must be ≥ 262144 bytes.
+pub fn decode_predicate_bitmap_avx2_bw18(
+    packed: &[u8],
+    num_values: usize,
+    dict_mask: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if dict_mask.len() < (1 << 18) {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw18 fused: dict_mask must be ≥ 262144 entries (got {})",
+            dict_mask.len()
+        )));
+    }
+    if num_values == 0 {
+        return Ok(());
+    }
+    let required_bytes = (num_values * 18).div_ceil(8);
+    if packed.len() < required_bytes {
+        return Err(CodecError::Decompress(format!(
+            "avx2 bw18 fused: packed has {} bytes, need {}",
+            packed.len(),
+            required_bytes
+        )));
+    }
+
+    let bitmap_bytes = num_values.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    let out_start = out.len();
+    out.resize(out_start + bitmap_bytes, 0);
+
+    let full_blocks = num_values / 8;
+    let safe_full_blocks = if full_blocks == 0 {
+        0
+    } else if packed.len() >= 18 * (full_blocks - 1) + 24 {
+        // bw=18 staging unpacker speculatively reads up to 24 bytes
+        // past the block start (see `unpack_avx2_bw18_into_staging`).
+        full_blocks
+    } else {
+        full_blocks - 1
+    };
+
+    let mask_ptr = dict_mask.as_ptr();
+    let mut staging = [0u32; 8];
+    unsafe {
+        let bitmap_ptr = out.as_mut_ptr().add(out_start);
+        let mut blk_idx = 0usize;
+        unpack_avx2_bw18_into_staging(packed, safe_full_blocks, &mut staging, |idxs| {
+            *bitmap_ptr.add(blk_idx) = pack_predicate_byte(idxs, mask_ptr);
+            blk_idx += 1;
+            Ok(())
+        })?;
+    }
+
+    let processed = safe_full_blocks * 8;
+    let remaining = num_values - processed;
+    if remaining > 0 {
+        let mut idxs: Vec<u32> = Vec::with_capacity(remaining);
+        scalar_bw_n(&packed[processed * 18 / 8..], remaining, 18, &mut idxs);
+        for (i, idx) in idxs.into_iter().enumerate() {
+            let bit = unsafe { *mask_ptr.add(idx as usize) };
+            let row = processed + i;
+            out[out_start + row / 8] |= bit << (row % 8);
+        }
+    }
+    Ok(())
+}

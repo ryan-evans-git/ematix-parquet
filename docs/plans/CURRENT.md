@@ -1386,6 +1386,186 @@ example (`bench_varint.rs`): 119 LOC. No deletions.
 
 ---
 
+## v0.16.0 — sidecar indexes + Iceberg dataset layer
+
+The headline release of the post-v1 cycle. Adds **Postgres-style
+indexes on top of any existing Parquet file, without rewriting the
+file**, plus an Iceberg-table integration that lifts the per-file
+sidecar into a dataset-level prune chain. No write-path or async-
+façade changes to existing crates — strictly additive surface in
+a new module (`ematix-parquet-codec::index`) and a new crate
+(`ematix-iceberg`).
+
+### Π.17 — Sidecar-index core (per-file)
+
+**Π.17a — module scaffolding (#78).** New `index` module under
+`ematix-parquet-codec` carrying the on-disk contract: hand-rolled
+JSON manifest under `ematix_index_manifest_v1` in the sidecar
+footer's `KeyValueMetadata`, plus a `SourceFingerprint`
+(footer_length + CRC32(footer) + num_rows + num_row_groups) that
+binds the sidecar to a specific state of its source `.parquet`.
+Reader fails fast on mismatch — sidecars are immutable against
+their source.
+
+**Π.17b — sorted INT64 index (#79, #80).** First index type lands:
+sorted INT64 with `read_column_i64_where_eq` + `lookup_eq`. The
+sidecar itself is a Parquet file with one row group per index,
+schema `(value, target_rg, target_page, target_rowset)`, sorted
+ASC on `value`. Native `ColumnIndex` on the value column gives
+log-page lookup for free. Prerequisite PR #79 wires
+`KeyValueMetadata` writes through `WriteOptions::kv_metadata` so
+the sidecar can carry its manifest.
+
+### Π.18 — Sorted INT32 + BYTE_ARRAY + range queries (#82)
+
+Mirrors Π.17b for the remaining two physical types the codec's
+sorted-key infrastructure already supports. Adds `lookup_range`
+(scans the sidecar's `[lo, hi]` window via the native `ColumnIndex`
+on the sorted-key column) plus the matching `read_column_*_where_range`
+convenience entries. After Π.18 the sorted-index surface covers
+`INT32`, `INT64`, `BYTE_ARRAY` for both eq and inclusive range.
+
+### Π.19 — Page-Bloom and composite leading-prefix indexes (#83)
+
+**Π.19a — page-Bloom (`INT64` only).** One `SplitBlockBloomFilter`
+per source page, stored as `(source_rg, source_page, bloom_block)`
+in the sidecar. `bloom_probe(key)` returns the pages whose Bloom
+said "maybe"; `read_column_i64_via_bloom_eq` is the convenience
+entry that probes, decodes the candidate pages, and filters
+in-memory so false positives are eliminated. Cheaper than sorted
+for high-cardinality columns where a sorted index's
+`O(distinct × page_bitmap_len)` build memory doesn't pay back.
+
+**Π.19b — composite leading-prefix (`INT64 × INT64`).** Two-column
+sorted index on `(value_a, value_b)`. Supports
+`a = X AND b = Y` (full), `a = X` alone (leading-prefix), and
+`a = X AND b IN [...]`. One index covers both query shapes —
+useful when the workload always filters on `a` and sometimes
+additionally on `b`.
+
+### Π.20 — Inverted text index + tokenizer trait (#84)
+
+Inverted (text) index over `BYTE_ARRAY`. Schema is
+`(token, target_rg, target_page, target_rowset)` sorted by token;
+posting list per distinct token. Tokenizer choice
+(`WhitespaceLowercaseV1` in v0.16.0) recorded in the manifest so
+the reader applies the same transform to query terms — same
+tokenizer in, same tokens out, or the index is corrupt by
+construction. Tokenizer is an enum so future stemmers / Unicode-
+aware tokenizers are additive without breaking the wire format.
+
+After Π.20 the per-file sidecar layer is complete: four index
+types covering eq, range, multi-column, and text contains.
+
+### Π.21 — Iceberg integration (new `ematix-iceberg` crate)
+
+**Π.21a — extension format + scaffold (#85).** New crate carrying
+the **contract** for the dataset layer: an
+`EmatixDataFileExtension { sidecar_relative_path, summaries: Vec<IndexSummary> }`
+type serialised as JSON. Each `IndexSummary { name, min_key,
+max_key, dataset_bloom }` is a per-index file-level summary the
+planner consults *before* opening any sidecar. Pruning predicates
+(`could_contain_eq`, `could_contain_range`) are conservative —
+return `false` only when provably out of range, never a false
+negative.
+
+**Π.21b — iceberg-rust integration (#86).** Behind a default-off
+`iceberg` Cargo feature. The extension JSON travels inside Iceberg
+`DataFile.key_metadata` with a 4-byte `b"EMTX"` magic prefix to
+coexist with any legitimate encryption metadata: `decode_key_metadata`
+returns `Ok(None)` for non-magic bytes, never an error. File-level
+prune helpers (`prune_data_files_eq`, `prune_data_files_range`)
+work over `&[DataFile]` and return the surviving subset. Crate-
+local `rust-version = "1.85"` matches `iceberg = "0.6"`'s MSRV;
+default (contract-only) builds still respect workspace MSRV 1.80.
+
+### Π.22 — End-to-end dataset query path
+
+**Π.22a — sidecar URI resolution (#87).** `resolve_sidecar_uri`
+joins a relative sidecar path to the data file's directory
+(uniform across `s3://`, `file://`, bare paths). `PrunedDataFile`
+bundles `DataFile + extension + resolved sidecar URI` — the unit
+a query executor iterates. `pair_with_extensions` drops files
+without our extension (the only non-conservative operation in the
+crate — candidates must be plannable).
+
+**Π.22b — async manifest walker (#88).** `collect_data_files(&Table)
+-> Vec<DataFile>` walks the current snapshot's manifest list +
+manifests, keeping only alive `Data` entries. Empty Vec (not an
+error) when there's no current snapshot. Adds `IcebergIndexError::Iceberg(...)`
+variant; tokio as a dev-dep for the async test.
+
+**Π.22c — end-to-end oracle (#89).** Integration test that builds
+a real Iceberg table on local FS via `MemoryCatalog`, writes
+manifest + manifest-list avro files via `ManifestWriterBuilder` +
+`ManifestListWriter`, attaches an extension to each `data_file.key_metadata`,
+then drives the whole flow: `collect_data_files` → `prune_data_files_eq`
+→ `pair_with_extensions`. Confirms the extension survives the
+Avro round-trip bit-identical and that the prune set matches what
+the per-file summaries promise.
+
+(`iceberg = "0.6"`'s `MemoryCatalog::update_table` is
+`FeatureUnsupported`, so the test sidesteps `Transaction::commit`
+by writing manifests directly and promoting the snapshot via the
+public `TableMetadataBuilder::set_branch_snapshot`. Same on-wire
+shape; doesn't need a Sql/Rest catalog in-process.)
+
+### Performance — `bench_indexed_lookup` (#90)
+
+A new example backs the "≥ 10× on selective predicates" claim with
+reproducible numbers. 1M-row INT64 source, 100 distinct values in
+sorted runs, 100 row groups of 10K rows each; median of 8 iters
+on Apple Silicon:
+
+| predicate (selectivity) | baseline       | indexed        | speedup |
+| ----------------------- | -------------- | -------------- | ------- |
+| `eq @ min`              | 4.638 ms       | 0.116 ms       | **40×** |
+| `eq @ mid`              | 3.772 ms       | 0.144 ms       | **26×** |
+| `eq @ max`              | 3.761 ms       | 0.115 ms       | **33×** |
+| `range 1%`              | 3.793 ms       | 0.116 ms       | **33×** |
+| `range 5%`              | 3.838 ms       | 0.406 ms       | **9.5×** |
+| `range 10%`             | 3.861 ms       | 0.789 ms       | 4.9×    |
+| `range 50%`             | 6.173 ms       | 3.819 ms       | 1.6×    |
+| `range 100%`            | 7.137 ms       | 8.197 ms       | 0.87×   |
+
+The big wins come from two stacked mechanisms: (a) the sidecar
+pinpoints the one row group containing the key, the other 99 are
+eliminated entirely (zero CPU); (b) within the surviving group
+masked-decode only emits the matching rows. Crossover where
+indexing stops paying is around 60% selectivity — that's the
+planner's signal to fall back to a full scan via the per-file
+`IndexSummary` *before* opening the sidecar.
+
+### Documentation (#91)
+
+Three additions so the capability is discoverable from a fresh
+`git clone`:
+
+- README: "Sidecar indexes" + "Iceberg dataset layer" highlights
+  citing the bench numbers; `ematix-iceberg` added to the crate-
+  layout table.
+- `docs/sidecar-indexes.md`: full reference covering when to use
+  each index type, wire format, staleness / rebuild semantics,
+  build cost, error variants, and what's not yet supported.
+- `docs/ematix-flow-integration.md`: three concrete integration
+  patterns (plain Parquet with optional sidecar fallback, Iceberg
+  datasets, write-side sidecar emission) with working code keyed
+  to current `main` APIs.
+
+### Net diff
+
+`crates/ematix-parquet-codec/src/index/` — new sub-tree (~3000
+LOC across builder/reader/manifest/page_layout/fingerprint/types).
+`crates/ematix-iceberg/` — new crate (~1600 LOC). New examples /
+oracles / docs ~1100 LOC. The existing crates' surface is
+*additive* — `WriteOptions` grows a `kv_metadata` field; nothing
+else changed. All ~340 existing codec tests continue to pass; 78
+new index oracles + 59 iceberg tests on top.
+
+**Released as v0.16.0.**
+
+---
+
 ## Π.16 — Custom LLVM codegen for hot decode paths (speculative)
 
 **Goal.** Photon (Databricks) generates per-query LLVM IR for hot

@@ -6,8 +6,8 @@ Hand-tuned SIMD on AArch64 (NEON) and x86_64 (AVX2). Full read and write coverag
 
 ```toml
 [dependencies]
-ematix-parquet-codec = "0.15"
-ematix-parquet-io    = "0.15"
+ematix-parquet-codec = "0.16"
+ematix-parquet-io    = "0.16"
 ```
 
 ## Why

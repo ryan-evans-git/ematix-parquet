@@ -92,6 +92,10 @@ read_column_byte_array_offsets_masked_into(
 
 **Parquet Modular Encryption.** AES-GCM read + write for both PME modes (plaintext footer / encrypted footer) behind a default-off `encryption` feature.
 
+**Sidecar indexes (post-hoc, no source rewrite).** Build a `.parquet.idx` next to any existing `.parquet` and use it to skip-decompress whole row groups + masked-decode only matching rows. Four index types: sorted (eq + range on `INT32`/`INT64`/`BYTE_ARRAY`), per-page Bloom (eq on `INT64`), composite leading-prefix (`INT64 × INT64`), inverted text (`BYTE_ARRAY`). Selective predicates win **26–40×** over full scan on the bench (`cargo run --release --example bench_indexed_lookup`). Adds indexes to a column the file was never sorted on — without touching the file. See [`docs/sidecar-indexes.md`](docs/sidecar-indexes.md).
+
+**Iceberg dataset layer.** `ematix-iceberg` lifts the per-file sidecar to multi-file Iceberg tables: each `data_file` manifest entry carries a per-index `(min_key, max_key)` summary plus the relative sidecar path, so a query for `customer_id = X` against a million-file table prunes at the manifest level (`O(1)` per file) *before* opening any sidecar. Off by default — `--features iceberg`.
+
 ## Crate layout
 
 | Crate                    | Purpose                                                                 |
@@ -101,6 +105,7 @@ read_column_byte_array_offsets_masked_into(
 | `ematix-parquet-codec`   | Decoders, encoders, SIMD bit-unpackers, compression, read/write façades. Optional `parallel` (rayon) and `encryption` (AES-GCM) features. |
 | `ematix-parquet-crypto`  | AES-GCM primitives + AAD construction for PME.                          |
 | `ematix-parquet-async`   | Async façade over any `object_store::ObjectStore` (S3, GCS, Azure, …).  |
+| `ematix-iceberg`         | Iceberg dataset-layer integration — per-`data_file` extension fields + file-level prune helpers. Default-light contract types; `--features iceberg` adds the `iceberg-rust` integration. |
 
 ## Testing
 

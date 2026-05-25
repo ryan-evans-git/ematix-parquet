@@ -155,5 +155,15 @@ name = "bench_parallel_scaling"
 path = "examples/bench_parallel_scaling.rs"
 required-features = ["parallel"]
 
+# Sidecar-index perf bench (Π.17–Π.20). Builds a synthetic INT64
+# parquet + sorted sidecar, sweeps eq + range predicates at
+# selectivities from 1% to 100%, reports baseline-full-scan vs
+# indexed-lookup wall-time and the speedup ratio. Backs the
+# "≥ 10× on selective predicates" claim with reproducible numbers.
+# Run: cargo run --release --example bench_indexed_lookup
+[[example]]
+name = "bench_indexed_lookup"
+path = "examples/bench_indexed_lookup.rs"
+
 [lints]
 workspace = true

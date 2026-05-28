@@ -1671,7 +1671,7 @@ fn read_column_index_bytes(
     row_group: usize,
     column: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let md = file.metadata().map_err(io_to_codec)?;
+    let md = file.cached_metadata().map_err(io_to_codec)?;
     let rg = md
         .row_groups
         .get(row_group)
@@ -1851,7 +1851,7 @@ fn data_page_view<'a>(
 }
 
 fn type_length_for(file: &ParquetFile, column: usize) -> Result<i32> {
-    let md = file.metadata().map_err(io_to_codec)?;
+    let md = file.cached_metadata().map_err(io_to_codec)?;
     // Schema is depth-first; column N is the (N+1)-th leaf — but in
     // practice for flat REQUIRED columns the schema has [root, leaf0,
     // leaf1, ...]. Walk leaves to find the Nth.
@@ -2085,7 +2085,7 @@ fn read_chunk_raw(
     row_group: usize,
     column: usize,
 ) -> Result<(Vec<u8>, usize, CompressionCodec, u16, u16)> {
-    let md = file.metadata().map_err(io_to_codec)?;
+    let md = file.cached_metadata().map_err(io_to_codec)?;
     let rg = md
         .row_groups
         .get(row_group)

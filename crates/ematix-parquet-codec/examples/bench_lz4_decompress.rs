@@ -34,9 +34,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pick col_idx 5 (l_extendedprice) — known LZ4_RAW + high uncompressed
     // size, representative of the Q06 hot column.
-    let col_idx: usize = std::env::var("COL").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let col_idx: usize = std::env::var("COL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     let col_name = std::str::from_utf8(
-        &md.row_groups[0].columns[col_idx]
+        md.row_groups[0].columns[col_idx]
             .meta_data
             .as_ref()
             .unwrap()
@@ -126,8 +129,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gbps_in,
         best * 1e9 / total_uncomp as f64,
     );
-    println!(
-        "(single-thread; multi-thread scaling assumed near-linear up to memory BW)",
-    );
+    println!("(single-thread; multi-thread scaling assumed near-linear up to memory BW)",);
     Ok(())
 }

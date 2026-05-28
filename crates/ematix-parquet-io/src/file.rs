@@ -174,10 +174,7 @@ impl ParquetFile {
         // A concurrent caller may win the race; either stored value is
         // equivalent (deterministic parse of the same bytes).
         let _ = self.cached_meta.set(md_static);
-        Ok(self
-            .cached_meta
-            .get()
-            .expect("cached_meta populated above"))
+        Ok(self.cached_meta.get().expect("cached_meta populated above"))
     }
 
     /// Read `length` bytes starting at byte `offset` into a fresh Vec.

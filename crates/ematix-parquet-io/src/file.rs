@@ -24,6 +24,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use ematix_parquet_format::compact::Cursor;
 use ematix_parquet_format::metadata::{read_file_metadata, FileMetaData};
@@ -44,6 +45,12 @@ pub struct ParquetFile {
     /// because parquet writes the row-group bodies immediately followed
     /// by the footer trailer.
     footer_offset: u64,
+    /// Lazily-parsed, cached `FileMetaData` borrowing into `footer_bytes`.
+    /// The stored `'static` lifetime is a controlled lie — see
+    /// [`ParquetFile::cached_metadata`] for the soundness argument.
+    /// `OnceLock` (not `OnceCell`) because `&ParquetFile` is shared
+    /// across decode threads in the lock-free pread model.
+    cached_meta: OnceLock<FileMetaData<'static>>,
 }
 
 impl ParquetFile {
@@ -102,6 +109,7 @@ impl ParquetFile {
             file_size,
             footer_bytes,
             footer_offset,
+            cached_meta: OnceLock::new(),
         })
     }
 
@@ -122,10 +130,51 @@ impl ParquetFile {
     }
 
     /// Decode the file's `FileMetaData`. Re-decodes on every call;
-    /// callers that need it repeatedly should bind it.
+    /// callers that need it repeatedly should bind it, or use
+    /// [`ParquetFile::cached_metadata`] for a memoized borrow.
     pub fn metadata(&self) -> Result<FileMetaData<'_>> {
         let mut cur = Cursor::new(&self.footer_bytes);
         Ok(read_file_metadata(&mut cur)?)
+    }
+
+    /// Decode the file's `FileMetaData` **once** and cache it for the
+    /// lifetime of this `ParquetFile`. Subsequent calls return a
+    /// borrow of the cached struct with no re-parse.
+    ///
+    /// This matters because the original `metadata()` re-parses the
+    /// entire thrift footer — for a wide, many-row-group file (e.g.
+    /// TPC-H lineitem SF=10: 58 row groups × 16 columns, each with
+    /// statistics + page-encoding-stats) that's a non-trivial cost,
+    /// and the per-column-chunk decode path (`read_chunk_raw`) calls
+    /// it once per (row_group, column). Profiling Q06 SF=10 showed
+    /// the redundant footer re-parse (`read_column_metadata` +
+    /// `read_column_chunk`) outweighed the actual column decode.
+    ///
+    /// # Soundness
+    ///
+    /// The cached `FileMetaData<'static>` borrows `&[u8]` slices into
+    /// `self.footer_bytes`, whose backing heap allocation is created
+    /// once in [`ParquetFile::open`] and never mutated, grown, or
+    /// dropped before `self`. Moving `self` moves the `Vec` header
+    /// (ptr/len/cap) but not the heap buffer, so the cached borrows
+    /// stay valid across moves. The `'static` in the field type is a
+    /// stand-in for "as long as `self`"; every public borrow handed
+    /// out is re-bound to `&self` so a caller can never outlive the
+    /// backing bytes. `footer_bytes` is never exposed mutably.
+    pub fn cached_metadata(&self) -> Result<&FileMetaData<'_>> {
+        if let Some(m) = self.cached_meta.get() {
+            return Ok(m);
+        }
+        let mut cur = Cursor::new(&self.footer_bytes);
+        let md = read_file_metadata(&mut cur)?;
+        // SAFETY: see the soundness note above. The borrowed bytes
+        // live in `self.footer_bytes` and outlive every `&self` use.
+        let md_static: FileMetaData<'static> =
+            unsafe { std::mem::transmute::<FileMetaData<'_>, FileMetaData<'static>>(md) };
+        // A concurrent caller may win the race; either stored value is
+        // equivalent (deterministic parse of the same bytes).
+        let _ = self.cached_meta.set(md_static);
+        Ok(self.cached_meta.get().expect("cached_meta populated above"))
     }
 
     /// Read `length` bytes starting at byte `offset` into a fresh Vec.

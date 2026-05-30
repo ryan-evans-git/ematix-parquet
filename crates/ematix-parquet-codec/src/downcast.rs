@@ -1,0 +1,393 @@
+//! REV.12 — integer downcast-on-read (foundation).
+//!
+//! When a physically-INT64 column's value range (from row-group / page
+//! statistics) fits in a narrower integer width, decode it directly
+//! into that narrower width. A narrower in-memory representation means
+//! less decode bandwidth and a smaller cache footprint in the hash
+//! tables / sort buffers the column feeds downstream — the lever DuckDB
+//! gets from `__internal_compress_integral_uinteger`.
+//!
+//! This module is the FOUNDATION: the width DECISION plus the narrowing
+//! PLAIN decoders. It is opt-in and additive — the existing
+//! [`crate::plain::decode_plain_i64`] `-> Vec<i64>` path is untouched.
+//! Wiring real row-group statistics into the decode orchestrator and a
+//! public column-level entry point is a follow-on slice; frame-of-
+//! reference (offset-from-min) narrowing for clustered-but-large ranges
+//! is a further extension on top of [`narrowest_int_target`].
+//!
+//! ## Why keys are the prime target
+//!
+//! For group-by / join KEYS only equality (and, for sorts, ordering)
+//! matters — never the arithmetic value. A width narrowing preserves
+//! both, so the whole hash/probe can run on the narrow type and only the
+//! small final output is re-widened. Value columns that get summed would
+//! pay a re-widen per row; keys don't.
+//!
+//! ## Safety
+//!
+//! `f64 -> f32` is deliberately NOT offered here: it loses precision and
+//! would break exact value-validation on aggregate sums. Downcast in this
+//! module is integer-only and lossless — guarded by [`narrowest_int_target`],
+//! which never returns a target that cannot hold every value in the range.
+
+use crate::error::{CodecError, Result};
+use crate::plain::decode_plain_i64;
+
+/// The narrowest integer target that losslessly holds a value range.
+///
+/// Ordered conceptually narrowest-first by byte width (1 → 2 → 4 → 8).
+/// Within a width, the signed variant is preferred; the unsigned variant
+/// is chosen only when a non-negative minimum lets it cover a `max` the
+/// signed variant cannot (e.g. `[0, 200]` → `U8`, since `200 > i8::MAX`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntTarget {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    /// No narrowing — the range needs the full 64 bits.
+    I64,
+}
+
+impl IntTarget {
+    /// Bytes per value in the narrowed in-memory representation.
+    pub fn width_bytes(self) -> usize {
+        match self {
+            IntTarget::I8 | IntTarget::U8 => 1,
+            IntTarget::I16 | IntTarget::U16 => 2,
+            IntTarget::I32 | IntTarget::U32 => 4,
+            IntTarget::I64 => 8,
+        }
+    }
+
+    /// True if this target narrows below the source's 8 bytes.
+    pub fn is_narrowing(self) -> bool {
+        self.width_bytes() < 8
+    }
+}
+
+/// Pick the narrowest [`IntTarget`] that losslessly holds every value in
+/// `[min, max]`. Caller supplies the column's true min/max (e.g. decoded
+/// from row-group statistics). Decides by byte width first (1 → 2 → 4 →
+/// 8); within a width prefers signed, falling to unsigned only when a
+/// non-negative `min` lets it reach a `max` the signed variant can't.
+///
+/// The returned target is guaranteed to hold the whole range, so a
+/// subsequent narrowing decode is lossless.
+pub fn narrowest_int_target(min: i64, max: i64) -> IntTarget {
+    debug_assert!(min <= max, "narrowest_int_target: min {min} > max {max}");
+    // 1 byte
+    if min >= i8::MIN as i64 && max <= i8::MAX as i64 {
+        return IntTarget::I8;
+    }
+    if min >= 0 && max <= u8::MAX as i64 {
+        return IntTarget::U8;
+    }
+    // 2 bytes
+    if min >= i16::MIN as i64 && max <= i16::MAX as i64 {
+        return IntTarget::I16;
+    }
+    if min >= 0 && max <= u16::MAX as i64 {
+        return IntTarget::U16;
+    }
+    // 4 bytes
+    if min >= i32::MIN as i64 && max <= i32::MAX as i64 {
+        return IntTarget::I32;
+    }
+    if min >= 0 && max <= u32::MAX as i64 {
+        return IntTarget::U32;
+    }
+    // 8 bytes — no narrowing possible.
+    IntTarget::I64
+}
+
+/// Result of a narrowing INT64 PLAIN decode. The variant matches the
+/// [`IntTarget`] used; [`NarrowedI64::I64`] means no narrowing was applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NarrowedI64 {
+    I8(Vec<i8>),
+    U8(Vec<u8>),
+    I16(Vec<i16>),
+    U16(Vec<u16>),
+    I32(Vec<i32>),
+    U32(Vec<u32>),
+    I64(Vec<i64>),
+}
+
+impl NarrowedI64 {
+    pub fn len(&self) -> usize {
+        match self {
+            NarrowedI64::I8(v) => v.len(),
+            NarrowedI64::U8(v) => v.len(),
+            NarrowedI64::I16(v) => v.len(),
+            NarrowedI64::U16(v) => v.len(),
+            NarrowedI64::I32(v) => v.len(),
+            NarrowedI64::U32(v) => v.len(),
+            NarrowedI64::I64(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The [`IntTarget`] this result was decoded to.
+    pub fn target(&self) -> IntTarget {
+        match self {
+            NarrowedI64::I8(_) => IntTarget::I8,
+            NarrowedI64::U8(_) => IntTarget::U8,
+            NarrowedI64::I16(_) => IntTarget::I16,
+            NarrowedI64::U16(_) => IntTarget::U16,
+            NarrowedI64::I32(_) => IntTarget::I32,
+            NarrowedI64::U32(_) => IntTarget::U32,
+            NarrowedI64::I64(_) => IntTarget::I64,
+        }
+    }
+
+    /// Heap bytes held by the value buffer. Lets callers confirm the
+    /// footprint saving vs the i64 path (`len * 8`).
+    pub fn byte_size(&self) -> usize {
+        self.len() * self.target().width_bytes()
+    }
+
+    /// Re-widen every value back to i64. Used for verification and by
+    /// consumers that still want i64 (the narrowing was lossless, so
+    /// this round-trips the original values exactly).
+    pub fn to_i64(&self) -> Vec<i64> {
+        match self {
+            NarrowedI64::I8(v) => v.iter().map(|&x| x as i64).collect(),
+            NarrowedI64::U8(v) => v.iter().map(|&x| x as i64).collect(),
+            NarrowedI64::I16(v) => v.iter().map(|&x| x as i64).collect(),
+            NarrowedI64::U16(v) => v.iter().map(|&x| x as i64).collect(),
+            NarrowedI64::I32(v) => v.iter().map(|&x| x as i64).collect(),
+            NarrowedI64::U32(v) => v.iter().map(|&x| x as i64).collect(),
+            NarrowedI64::I64(v) => v.clone(),
+        }
+    }
+}
+
+/// Decode a PLAIN-encoded INT64 buffer, narrowing each value to `target`.
+///
+/// The buffer length must be an exact multiple of 8 (same wire contract
+/// as [`decode_plain_i64`]). For [`IntTarget::I64`] this is exactly
+/// `decode_plain_i64` (no narrowing). The caller is responsible for
+/// having chosen `target` via [`narrowest_int_target`] from the column's
+/// true range; narrowing to a target that does not hold every value would
+/// truncate (debug-asserted per value, release-mode wraps via `as`).
+pub fn decode_plain_i64_narrowed(bytes: &[u8], target: IntTarget) -> Result<NarrowedI64> {
+    Ok(match target {
+        IntTarget::I8 => NarrowedI64::I8(narrow_decode(bytes, |v| {
+            debug_assert!(v >= i8::MIN as i64 && v <= i8::MAX as i64, "i8 downcast lost {v}");
+            v as i8
+        })?),
+        IntTarget::U8 => NarrowedI64::U8(narrow_decode(bytes, |v| {
+            debug_assert!(v >= 0 && v <= u8::MAX as i64, "u8 downcast lost {v}");
+            v as u8
+        })?),
+        IntTarget::I16 => NarrowedI64::I16(narrow_decode(bytes, |v| {
+            debug_assert!(v >= i16::MIN as i64 && v <= i16::MAX as i64, "i16 downcast lost {v}");
+            v as i16
+        })?),
+        IntTarget::U16 => NarrowedI64::U16(narrow_decode(bytes, |v| {
+            debug_assert!(v >= 0 && v <= u16::MAX as i64, "u16 downcast lost {v}");
+            v as u16
+        })?),
+        IntTarget::I32 => NarrowedI64::I32(narrow_decode(bytes, |v| {
+            debug_assert!(v >= i32::MIN as i64 && v <= i32::MAX as i64, "i32 downcast lost {v}");
+            v as i32
+        })?),
+        IntTarget::U32 => NarrowedI64::U32(narrow_decode(bytes, |v| {
+            debug_assert!(v >= 0 && v <= u32::MAX as i64, "u32 downcast lost {v}");
+            v as u32
+        })?),
+        IntTarget::I64 => NarrowedI64::I64(decode_plain_i64(bytes)?),
+    })
+}
+
+/// Convenience: pick the narrowest target from `[min, max]` and decode in
+/// one call. The common entry point once stats are in hand.
+pub fn decode_plain_i64_auto(bytes: &[u8], min: i64, max: i64) -> Result<NarrowedI64> {
+    decode_plain_i64_narrowed(bytes, narrowest_int_target(min, max))
+}
+
+/// Shared narrowing loop: read each 8-byte LE i64 and map it through `f`.
+/// Distinct from [`crate::plain`]'s `plain_memcpy` fast path because the
+/// destination width differs from the source — a per-value cast is
+/// required (no raw memcpy possible across widths).
+#[inline]
+fn narrow_decode<T, F>(bytes: &[u8], f: F) -> Result<Vec<T>>
+where
+    F: Fn(i64) -> T,
+{
+    if bytes.len() % 8 != 0 {
+        return Err(CodecError::UnalignedPlainBuffer {
+            value_width: 8,
+            buffer_len: bytes.len(),
+        });
+    }
+    let n = bytes.len() / 8;
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(8) {
+        out.push(f(i64::from_le_bytes(chunk.try_into().unwrap())));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plain::decode_plain_i64;
+
+    fn plain_bytes(vals: &[i64]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(vals.len() * 8);
+        for &v in vals {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn narrowest_target_picks_smallest_fitting_width() {
+        // 1 byte
+        assert_eq!(narrowest_int_target(1, 7), IntTarget::I8); // l_linenumber
+        assert_eq!(narrowest_int_target(1, 50), IntTarget::I8); // l_quantity
+        assert_eq!(narrowest_int_target(0, 24), IntTarget::I8); // nationkey
+        assert_eq!(narrowest_int_target(-128, 127), IntTarget::I8);
+        // exceeds i8 but non-negative & fits u8
+        assert_eq!(narrowest_int_target(0, 200), IntTarget::U8);
+        assert_eq!(narrowest_int_target(0, 255), IntTarget::U8);
+        // 2 bytes
+        assert_eq!(narrowest_int_target(-129, 127), IntTarget::I16);
+        assert_eq!(narrowest_int_target(0, 32_767), IntTarget::I16);
+        assert_eq!(narrowest_int_target(0, 40_000), IntTarget::U16);
+        assert_eq!(narrowest_int_target(0, 65_535), IntTarget::U16);
+        // 4 bytes — TPC-H SF=100 l_orderkey range (~600M fits i32)
+        assert_eq!(narrowest_int_target(1, 600_000_000), IntTarget::I32);
+        assert_eq!(narrowest_int_target(-1, i32::MAX as i64), IntTarget::I32);
+        // exceeds i32 but non-negative & fits u32 (SF~300-700 headroom)
+        assert_eq!(
+            narrowest_int_target(0, i32::MAX as i64 + 1),
+            IntTarget::U32
+        );
+        assert_eq!(narrowest_int_target(0, u32::MAX as i64), IntTarget::U32);
+        // 8 bytes — no narrowing
+        assert_eq!(
+            narrowest_int_target(0, u32::MAX as i64 + 1),
+            IntTarget::I64
+        );
+        assert_eq!(narrowest_int_target(i64::MIN, i64::MAX), IntTarget::I64);
+        assert_eq!(narrowest_int_target(-1, i64::MAX), IntTarget::I64);
+    }
+
+    #[test]
+    fn width_bytes_are_correct() {
+        assert_eq!(IntTarget::I8.width_bytes(), 1);
+        assert_eq!(IntTarget::U8.width_bytes(), 1);
+        assert_eq!(IntTarget::I16.width_bytes(), 2);
+        assert_eq!(IntTarget::U16.width_bytes(), 2);
+        assert_eq!(IntTarget::I32.width_bytes(), 4);
+        assert_eq!(IntTarget::U32.width_bytes(), 4);
+        assert_eq!(IntTarget::I64.width_bytes(), 8);
+        assert!(IntTarget::I32.is_narrowing());
+        assert!(!IntTarget::I64.is_narrowing());
+    }
+
+    #[test]
+    fn auto_decode_roundtrips_against_independent_i64_path() {
+        // Cross-check: the narrowed decode, re-widened, must equal the
+        // independent decode_plain_i64 path. A symmetric bug in both can't
+        // pass because they share no code (one casts per value, the other
+        // memcpys 8-byte words).
+        let cases: Vec<Vec<i64>> = vec![
+            vec![1, 2, 3, 4, 5, 6, 7],       // -> I8
+            vec![0, 24, 13, 7, 1],            // -> I8
+            vec![0, 200, 100, 255],           // -> U8
+            vec![-100, 30_000, 0, -1],        // -> I16
+            vec![1, 600_000_000, 250_000_000], // -> I32 (SF=100 orderkey-ish)
+            vec![0, 3_000_000_000, 42],       // -> U32 (exceeds i32)
+            vec![0, 10_000_000_000, 1],       // -> I64 (no narrowing)
+        ];
+        let expected_targets = [
+            IntTarget::I8,
+            IntTarget::I8,
+            IntTarget::U8,
+            IntTarget::I16,
+            IntTarget::I32,
+            IntTarget::U32,
+            IntTarget::I64,
+        ];
+        for (vals, want_target) in cases.iter().zip(expected_targets) {
+            let bytes = plain_bytes(vals);
+            let min = *vals.iter().min().unwrap();
+            let max = *vals.iter().max().unwrap();
+            let narrowed = decode_plain_i64_auto(&bytes, min, max).unwrap();
+            assert_eq!(
+                narrowed.target(),
+                want_target,
+                "wrong target for {vals:?}"
+            );
+            // Re-widened narrowed values == independent i64 decode.
+            let ground_truth = decode_plain_i64(&bytes).unwrap();
+            assert_eq!(narrowed.to_i64(), ground_truth, "value mismatch for {vals:?}");
+            assert_eq!(narrowed.len(), vals.len());
+        }
+    }
+
+    #[test]
+    fn narrowing_actually_shrinks_footprint() {
+        // SF=100 orderkey-shaped: i32 target halves bytes vs i64.
+        let vals: Vec<i64> = (1..=1000).map(|i| i * 600_000).collect(); // max 600M
+        let bytes = plain_bytes(&vals);
+        let narrowed = decode_plain_i64_auto(&bytes, 600_000, 600_000_000).unwrap();
+        assert_eq!(narrowed.target(), IntTarget::I32);
+        assert_eq!(narrowed.byte_size(), vals.len() * 4);
+        // vs the i64 path footprint
+        let i64_footprint = decode_plain_i64(&bytes).unwrap().len() * 8;
+        assert_eq!(narrowed.byte_size() * 2, i64_footprint);
+    }
+
+    #[test]
+    fn explicit_target_decode_matches_cast() {
+        let vals: Vec<i64> = vec![-5, -1, 0, 1, 100, 127];
+        let bytes = plain_bytes(&vals);
+        let narrowed = decode_plain_i64_narrowed(&bytes, IntTarget::I8).unwrap();
+        match narrowed {
+            NarrowedI64::I8(v) => {
+                let expect: Vec<i8> = vals.iter().map(|&x| x as i8).collect();
+                assert_eq!(v, expect);
+            }
+            other => panic!("expected I8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i64_target_equals_plain_decode() {
+        let vals: Vec<i64> = vec![i64::MIN, -1, 0, 1, i64::MAX, 10_000_000_000];
+        let bytes = plain_bytes(&vals);
+        let narrowed = decode_plain_i64_narrowed(&bytes, IntTarget::I64).unwrap();
+        assert_eq!(narrowed, NarrowedI64::I64(decode_plain_i64(&bytes).unwrap()));
+    }
+
+    #[test]
+    fn empty_buffer_is_empty_not_error() {
+        let narrowed = decode_plain_i64_auto(&[], 0, 0).unwrap();
+        assert!(narrowed.is_empty());
+        // min==max==0 -> narrowest is I8
+        assert_eq!(narrowed.target(), IntTarget::I8);
+    }
+
+    #[test]
+    fn unaligned_buffer_errors() {
+        let bytes = vec![0u8; 12]; // not a multiple of 8
+        let err = decode_plain_i64_narrowed(&bytes, IntTarget::I32);
+        assert!(matches!(
+            err,
+            Err(CodecError::UnalignedPlainBuffer {
+                value_width: 8,
+                buffer_len: 12
+            })
+        ));
+    }
+}

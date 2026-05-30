@@ -26,6 +26,7 @@ pub mod column;
 pub mod compression;
 pub mod delta;
 pub mod dict;
+pub mod downcast;
 #[cfg(feature = "encryption")]
 pub mod encrypted;
 pub mod error;

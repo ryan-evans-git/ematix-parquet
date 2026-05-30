@@ -178,31 +178,65 @@ impl NarrowedI64 {
 /// truncate (debug-asserted per value, release-mode wraps via `as`).
 pub fn decode_plain_i64_narrowed(bytes: &[u8], target: IntTarget) -> Result<NarrowedI64> {
     Ok(match target {
-        IntTarget::I8 => NarrowedI64::I8(narrow_decode(bytes, |v| {
-            debug_assert!(v >= i8::MIN as i64 && v <= i8::MAX as i64, "i8 downcast lost {v}");
-            v as i8
-        })?),
-        IntTarget::U8 => NarrowedI64::U8(narrow_decode(bytes, |v| {
-            debug_assert!(v >= 0 && v <= u8::MAX as i64, "u8 downcast lost {v}");
-            v as u8
-        })?),
-        IntTarget::I16 => NarrowedI64::I16(narrow_decode(bytes, |v| {
-            debug_assert!(v >= i16::MIN as i64 && v <= i16::MAX as i64, "i16 downcast lost {v}");
-            v as i16
-        })?),
-        IntTarget::U16 => NarrowedI64::U16(narrow_decode(bytes, |v| {
-            debug_assert!(v >= 0 && v <= u16::MAX as i64, "u16 downcast lost {v}");
-            v as u16
-        })?),
-        IntTarget::I32 => NarrowedI64::I32(narrow_decode(bytes, |v| {
-            debug_assert!(v >= i32::MIN as i64 && v <= i32::MAX as i64, "i32 downcast lost {v}");
-            v as i32
-        })?),
-        IntTarget::U32 => NarrowedI64::U32(narrow_decode(bytes, |v| {
-            debug_assert!(v >= 0 && v <= u32::MAX as i64, "u32 downcast lost {v}");
-            v as u32
-        })?),
+        IntTarget::I8 => NarrowedI64::I8(decode_plain_i64_as_i8(bytes)?),
+        IntTarget::U8 => NarrowedI64::U8(decode_plain_i64_as_u8(bytes)?),
+        IntTarget::I16 => NarrowedI64::I16(decode_plain_i64_as_i16(bytes)?),
+        IntTarget::U16 => NarrowedI64::U16(decode_plain_i64_as_u16(bytes)?),
+        IntTarget::I32 => NarrowedI64::I32(decode_plain_i64_as_i32(bytes)?),
+        IntTarget::U32 => NarrowedI64::U32(decode_plain_i64_as_u32(bytes)?),
         IntTarget::I64 => NarrowedI64::I64(decode_plain_i64(bytes)?),
+    })
+}
+
+// ---------------------------------------------------------------------
+// Per-target narrowing PLAIN decoders. The caller must have proven the
+// range fits (via `narrowest_int_target`) — narrowing is lossless and
+// debug-asserted per value. These are the homogeneous `Fn(&[u8]) ->
+// Result<Vec<T>>` decoders that `read::read_column_i64_downcast` hands to
+// the generic chunk orchestrator (`decode_chunk_into`), so an INT64
+// column narrows DURING decode (PLAIN + dictionary pages alike) with no
+// transient `Vec<i64>` — no 2× memory peak on a 600M-row SF=100 column.
+// ---------------------------------------------------------------------
+
+pub fn decode_plain_i64_as_i8(bytes: &[u8]) -> Result<Vec<i8>> {
+    narrow_decode(bytes, |v| {
+        debug_assert!(v >= i8::MIN as i64 && v <= i8::MAX as i64, "i8 downcast lost {v}");
+        v as i8
+    })
+}
+
+pub fn decode_plain_i64_as_u8(bytes: &[u8]) -> Result<Vec<u8>> {
+    narrow_decode(bytes, |v| {
+        debug_assert!(v >= 0 && v <= u8::MAX as i64, "u8 downcast lost {v}");
+        v as u8
+    })
+}
+
+pub fn decode_plain_i64_as_i16(bytes: &[u8]) -> Result<Vec<i16>> {
+    narrow_decode(bytes, |v| {
+        debug_assert!(v >= i16::MIN as i64 && v <= i16::MAX as i64, "i16 downcast lost {v}");
+        v as i16
+    })
+}
+
+pub fn decode_plain_i64_as_u16(bytes: &[u8]) -> Result<Vec<u16>> {
+    narrow_decode(bytes, |v| {
+        debug_assert!(v >= 0 && v <= u16::MAX as i64, "u16 downcast lost {v}");
+        v as u16
+    })
+}
+
+pub fn decode_plain_i64_as_i32(bytes: &[u8]) -> Result<Vec<i32>> {
+    narrow_decode(bytes, |v| {
+        debug_assert!(v >= i32::MIN as i64 && v <= i32::MAX as i64, "i32 downcast lost {v}");
+        v as i32
+    })
+}
+
+pub fn decode_plain_i64_as_u32(bytes: &[u8]) -> Result<Vec<u32>> {
+    narrow_decode(bytes, |v| {
+        debug_assert!(v >= 0 && v <= u32::MAX as i64, "u32 downcast lost {v}");
+        v as u32
     })
 }
 

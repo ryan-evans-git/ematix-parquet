@@ -36,6 +36,11 @@ use crate::plain::{
     plain_sparse_decode_byte_array_offsets_into, plain_sparse_decode_f64_into,
     plain_sparse_decode_i32_into, plain_sparse_decode_i64_into, Int96,
 };
+use crate::downcast::{
+    decode_plain_i64_as_i16, decode_plain_i64_as_i32, decode_plain_i64_as_i8,
+    decode_plain_i64_as_u16, decode_plain_i64_as_u32, decode_plain_i64_as_u8,
+    narrowest_int_target, IntTarget, NarrowedI64,
+};
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
 /// `Vec<i64>`. Requires the column's physical type to be INT64.
@@ -58,6 +63,104 @@ pub fn read_column_i64_into(
     decode_chunk_into(file, row_group, column, out, |bytes| {
         decode_plain_i64(bytes)
     })
+}
+
+/// REV.12 — read an INT64 column chunk, narrowing on read to the
+/// smallest integer width the column's row-group statistics prove safe.
+///
+/// When stats show every value fits a narrower type, the chunk decodes
+/// *directly* into that width — PLAIN and dictionary-encoded pages alike,
+/// through the generic chunk orchestrator — with **no transient
+/// `Vec<i64>`** (so no 2× memory peak on a 600M-row SF=100 column). Falls
+/// back to full-width [`NarrowedI64::I64`] whenever stats are absent or
+/// don't prove a narrowing safe — it never narrows without proof.
+///
+/// Contract (same as [`read_column_i64`]): the column's physical type
+/// must be INT64. The narrowed width is order- and equality-preserving,
+/// so the result is a drop-in for group-by / join keys; re-widen with
+/// [`NarrowedI64::to_i64`] if a consumer needs i64.
+pub fn read_column_i64_downcast(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<NarrowedI64> {
+    let target = column_narrow_target(file, row_group, column)?;
+    Ok(match target {
+        IntTarget::I8 => {
+            let mut out = Vec::new();
+            decode_chunk_into(file, row_group, column, &mut out, decode_plain_i64_as_i8)?;
+            NarrowedI64::I8(out)
+        }
+        IntTarget::U8 => {
+            let mut out = Vec::new();
+            decode_chunk_into(file, row_group, column, &mut out, decode_plain_i64_as_u8)?;
+            NarrowedI64::U8(out)
+        }
+        IntTarget::I16 => {
+            let mut out = Vec::new();
+            decode_chunk_into(file, row_group, column, &mut out, decode_plain_i64_as_i16)?;
+            NarrowedI64::I16(out)
+        }
+        IntTarget::U16 => {
+            let mut out = Vec::new();
+            decode_chunk_into(file, row_group, column, &mut out, decode_plain_i64_as_u16)?;
+            NarrowedI64::U16(out)
+        }
+        IntTarget::I32 => {
+            let mut out = Vec::new();
+            decode_chunk_into(file, row_group, column, &mut out, decode_plain_i64_as_i32)?;
+            NarrowedI64::I32(out)
+        }
+        IntTarget::U32 => {
+            let mut out = Vec::new();
+            decode_chunk_into(file, row_group, column, &mut out, decode_plain_i64_as_u32)?;
+            NarrowedI64::U32(out)
+        }
+        IntTarget::I64 => {
+            let mut out = Vec::new();
+            decode_chunk_into(file, row_group, column, &mut out, decode_plain_i64)?;
+            NarrowedI64::I64(out)
+        }
+    })
+}
+
+/// Decide the narrowing target for an INT64 column from its row-group
+/// statistics. Returns [`IntTarget::I64`] (no narrowing) whenever the
+/// decision can't be made safely: missing column / `meta_data` /
+/// `statistics`, stats min/max not in the 8-byte INT64 form, or a
+/// malformed `min > max`.
+fn column_narrow_target(
+    file: &ParquetFile,
+    row_group: usize,
+    column: usize,
+) -> Result<IntTarget> {
+    let md = file.cached_metadata().map_err(io_to_codec)?;
+    let cm = match md
+        .row_groups
+        .get(row_group)
+        .and_then(|rg| rg.columns.get(column))
+        .and_then(|c| c.meta_data.as_ref())
+    {
+        Some(cm) => cm,
+        None => return Ok(IntTarget::I64),
+    };
+    let Some(stats) = cm.statistics.as_ref() else {
+        return Ok(IntTarget::I64);
+    };
+    // Prefer the modern min_value/max_value; fall back to deprecated min/max.
+    let min_bytes = stats.min_value.or(stats.min);
+    let max_bytes = stats.max_value.or(stats.max);
+    match (min_bytes, max_bytes) {
+        (Some(mn), Some(mx)) if mn.len() == 8 && mx.len() == 8 => {
+            let min = i64::from_le_bytes(mn.try_into().unwrap());
+            let max = i64::from_le_bytes(mx.try_into().unwrap());
+            if min > max {
+                return Ok(IntTarget::I64);
+            }
+            Ok(narrowest_int_target(min, max))
+        }
+        _ => Ok(IntTarget::I64),
+    }
 }
 
 /// Read the entire column chunk at (`row_group`, `column`) into a

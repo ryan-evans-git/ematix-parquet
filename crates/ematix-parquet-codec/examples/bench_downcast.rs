@@ -110,19 +110,48 @@ fn main() {
         total
     });
 
-    let delta = (dc - base) / base * 100.0;
-    println!(
-        "\nverdict: downcast decode {} baseline by {:+.1}%  ({})",
-        if delta <= 0.0 {
-            "BEATS/ties"
-        } else {
-            "is slower than"
+    // Flow-side equivalent (what KEYS.2 ships): decode the full i64 column,
+    // then a separate vectorized narrow pass i64->i32. Mirrors the arrow
+    // `cast` at the scan boundary — same 8N-read + 4N-write traffic AND the
+    // transient Vec<i64> that the fused decoder path (redux) avoids. The
+    // redux's whole-program benefit over shipped KEYS.2 is exactly
+    // (flow-side - redux), so this arm is the Phase-0 ceiling.
+    let flowside = time_it(
+        "read_column_i64 + narrow pass (flow-side)",
+        warmups,
+        trials,
+        || {
+            let mut total = 0;
+            for &rg in &rgs {
+                let v = read_column_i64(&file, rg, col).unwrap();
+                let n = v.len();
+                let mut out: Vec<i32> = Vec::with_capacity(n);
+                let dst = out.as_mut_ptr();
+                let src = v.as_ptr();
+                for i in 0..n {
+                    // SAFETY: out has n slots; src has n i64s; i < n.
+                    unsafe { dst.add(i).write(*src.add(i) as i32) };
+                }
+                unsafe { out.set_len(n) };
+                total += out.len();
+                std::hint::black_box(&out);
+            }
+            total
         },
-        delta,
+    );
+
+    let delta = (dc - base) / base * 100.0;
+    let redux_vs_flow = (dc - flowside) / flowside * 100.0;
+    println!("\nverdict (decode stage, p50):");
+    println!(
+        "  decoder-downcast vs plain i64 decode                : {delta:+.1}%  ({})",
         if delta <= 5.0 {
-            "no meaningful decode regression — footprint win is free"
+            "no decode regression"
         } else {
-            "decode regression — narrowing cast costs more than the smaller output saves"
+            "decode regression"
         }
+    );
+    println!(
+        "  decoder-downcast (redux) vs decode+narrow (KEYS.2)  : {redux_vs_flow:+.1}%  <-- Phase-0 ceiling: how much the 8-site redux could save over shipped flow-side cast"
     );
 }

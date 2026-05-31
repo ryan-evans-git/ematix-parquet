@@ -57,11 +57,17 @@ fn main() {
     let file = ParquetFile::open(&path).expect("open parquet file");
     let n_rg = file.cached_metadata().expect("metadata").row_groups.len();
     let rgs_req = env_usize("RGS", 8);
-    let rg_count = if rgs_req == 0 { n_rg } else { rgs_req.min(n_rg) };
+    let rg_count = if rgs_req == 0 {
+        n_rg
+    } else {
+        rgs_req.min(n_rg)
+    };
 
     println!("=== REV.12 decode-side microbench ===");
     println!("file   : {path}");
-    println!("column : {col}   row_groups: {rg_count}/{n_rg}   trials: {trials} (+{warmups} warmup)\n");
+    println!(
+        "column : {col}   row_groups: {rg_count}/{n_rg}   trials: {trials} (+{warmups} warmup)\n"
+    );
 
     // Correctness + footprint on row group 0.
     let nd = read_column_i64_downcast(&file, 0, col).expect("downcast rg0");
@@ -107,7 +113,11 @@ fn main() {
     let delta = (dc - base) / base * 100.0;
     println!(
         "\nverdict: downcast decode {} baseline by {:+.1}%  ({})",
-        if delta <= 0.0 { "BEATS/ties" } else { "is slower than" },
+        if delta <= 0.0 {
+            "BEATS/ties"
+        } else {
+            "is slower than"
+        },
         delta,
         if delta <= 5.0 {
             "no meaningful decode regression — footprint win is free"

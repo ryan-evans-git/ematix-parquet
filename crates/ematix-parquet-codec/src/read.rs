@@ -28,6 +28,11 @@ use crate::compression::{
     decompress_snappy_into, decompress_zstd_into_capped,
 };
 use crate::dict::{decode_rle_dictionary_into, gather_dict_at_bitmap_into};
+use crate::downcast::{
+    decode_plain_i64_as_i16, decode_plain_i64_as_i32, decode_plain_i64_as_i8,
+    decode_plain_i64_as_u16, decode_plain_i64_as_u32, decode_plain_i64_as_u8, narrowest_int_target,
+    IntTarget, NarrowedI64,
+};
 use crate::error::{CodecError, Result};
 use crate::page_index::{select_pages_overlapping_i32, select_pages_overlapping_i64};
 use crate::plain::{
@@ -35,11 +40,6 @@ use crate::plain::{
     decode_plain_i64, decode_plain_int96, plain_sparse_decode_byte_array_into,
     plain_sparse_decode_byte_array_offsets_into, plain_sparse_decode_f64_into,
     plain_sparse_decode_i32_into, plain_sparse_decode_i64_into, Int96,
-};
-use crate::downcast::{
-    decode_plain_i64_as_i16, decode_plain_i64_as_i32, decode_plain_i64_as_i8,
-    decode_plain_i64_as_u16, decode_plain_i64_as_u32, decode_plain_i64_as_u8,
-    narrowest_int_target, IntTarget, NarrowedI64,
 };
 
 /// Read the entire column chunk at (`row_group`, `column`) into a
@@ -129,11 +129,7 @@ pub fn read_column_i64_downcast(
 /// decision can't be made safely: missing column / `meta_data` /
 /// `statistics`, stats min/max not in the 8-byte INT64 form, or a
 /// malformed `min > max`.
-fn column_narrow_target(
-    file: &ParquetFile,
-    row_group: usize,
-    column: usize,
-) -> Result<IntTarget> {
+fn column_narrow_target(file: &ParquetFile, row_group: usize, column: usize) -> Result<IntTarget> {
     let md = file.cached_metadata().map_err(io_to_codec)?;
     let cm = match md
         .row_groups

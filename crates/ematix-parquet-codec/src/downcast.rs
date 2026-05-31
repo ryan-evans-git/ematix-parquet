@@ -31,7 +31,7 @@
 //! which never returns a target that cannot hold every value in the range.
 
 use crate::error::{CodecError, Result};
-use crate::plain::decode_plain_i64;
+use crate::plain::{decode_plain_i32, decode_plain_i64};
 
 /// The narrowest integer target that losslessly holds a value range.
 ///
@@ -390,6 +390,132 @@ pub fn decode_plain_i64_frame_auto(bytes: &[u8], min: i64, max: i64) -> Result<F
     decode_plain_i64_frame(bytes, offset, target)
 }
 
+// ---------------------------------------------------------------------
+// INT32-source narrowing.
+//
+// A physically-INT32 column (4-byte PLAIN words) is often wider than its
+// values need: TPC-H DATE is stored INT32 (days since epoch, abs range
+// ~[8035, 10592]) and fits I16 by ABSOLUTE range; small INT32 keys/codes
+// fit I8. This mirrors the INT64 path on a 4-byte source — results reuse
+// [`NarrowedI64`] (the target width set is the same). For an INT32 source
+// the natural full-width target is [`IntTarget::I32`] (a 4->4 identity,
+// equal to the plain decode); `narrowest_int_target` on an i32-range value
+// never returns I64/U32, so the auto path only ever narrows.
+// ---------------------------------------------------------------------
+
+/// Decode a PLAIN-encoded INT32 buffer (4-byte LE per value), narrowing
+/// each value to `target`. The buffer length must be a multiple of 4 (same
+/// wire contract as [`decode_plain_i32`]). [`IntTarget::I32`] is the
+/// identity (full width, reuses the canonical plain path);
+/// [`IntTarget::I64`] widens losslessly and is only reachable when a caller
+/// passes it explicitly — the auto path never selects it for an i32-range
+/// column. Narrowing is lossless and debug-asserted per value.
+pub fn decode_plain_i32_narrowed(bytes: &[u8], target: IntTarget) -> Result<NarrowedI64> {
+    Ok(match target {
+        IntTarget::I8 => NarrowedI64::I8(narrow_decode_i32(bytes, |v| {
+            debug_assert!(
+                v >= i8::MIN as i32 && v <= i8::MAX as i32,
+                "i8 downcast lost {v}"
+            );
+            v as i8
+        })?),
+        IntTarget::U8 => NarrowedI64::U8(narrow_decode_i32(bytes, |v| {
+            debug_assert!(v >= 0 && v <= u8::MAX as i32, "u8 downcast lost {v}");
+            v as u8
+        })?),
+        IntTarget::I16 => NarrowedI64::I16(narrow_decode_i32(bytes, |v| {
+            debug_assert!(
+                v >= i16::MIN as i32 && v <= i16::MAX as i32,
+                "i16 downcast lost {v}"
+            );
+            v as i16
+        })?),
+        IntTarget::U16 => NarrowedI64::U16(narrow_decode_i32(bytes, |v| {
+            debug_assert!(v >= 0 && v <= u16::MAX as i32, "u16 downcast lost {v}");
+            v as u16
+        })?),
+        // Full width: a 4->4 identity. Reuse the canonical plain decode
+        // (shares no code with narrow_decode_i32, so the roundtrip test
+        // genuinely cross-checks the narrowing arms).
+        IntTarget::I32 => NarrowedI64::I32(decode_plain_i32(bytes)?),
+        IntTarget::U32 => NarrowedI64::U32(narrow_decode_i32(bytes, |v| {
+            debug_assert!(v >= 0, "u32 downcast lost {v}");
+            v as u32
+        })?),
+        // Widening (every i32 fits i64). Never chosen by the auto path.
+        IntTarget::I64 => NarrowedI64::I64(narrow_decode_i32(bytes, |v| v as i64)?),
+    })
+}
+
+/// Convenience: pick the narrowest target from `[min, max]` (the column's
+/// true range, supplied as i64) and decode the INT32 buffer in one call.
+pub fn decode_plain_i32_auto(bytes: &[u8], min: i64, max: i64) -> Result<NarrowedI64> {
+    decode_plain_i32_narrowed(bytes, narrowest_int_target(min, max))
+}
+
+/// Frame-of-reference narrowing for an INT32 source: narrow each
+/// `value - offset` to `target`. Mirrors [`decode_plain_i64_frame`] on a
+/// 4-byte source. Caller picks `(offset, target)` via
+/// [`frame_of_reference_target`]; the delta narrowing is lossless
+/// (debug-asserted per value).
+pub fn decode_plain_i32_frame(
+    bytes: &[u8],
+    offset: i64,
+    target: IntTarget,
+) -> Result<FrameNarrowed> {
+    let data = match target {
+        IntTarget::I8 => NarrowedI64::I8(narrow_decode_i32(bytes, |v| {
+            let d = v as i64 - offset;
+            debug_assert!(
+                d >= i8::MIN as i64 && d <= i8::MAX as i64,
+                "i8 frame lost {v}"
+            );
+            d as i8
+        })?),
+        IntTarget::U8 => NarrowedI64::U8(narrow_decode_i32(bytes, |v| {
+            let d = v as i64 - offset;
+            debug_assert!(d >= 0 && d <= u8::MAX as i64, "u8 frame lost {v}");
+            d as u8
+        })?),
+        IntTarget::I16 => NarrowedI64::I16(narrow_decode_i32(bytes, |v| {
+            let d = v as i64 - offset;
+            debug_assert!(
+                d >= i16::MIN as i64 && d <= i16::MAX as i64,
+                "i16 frame lost {v}"
+            );
+            d as i16
+        })?),
+        IntTarget::U16 => NarrowedI64::U16(narrow_decode_i32(bytes, |v| {
+            let d = v as i64 - offset;
+            debug_assert!(d >= 0 && d <= u16::MAX as i64, "u16 frame lost {v}");
+            d as u16
+        })?),
+        IntTarget::I32 => NarrowedI64::I32(narrow_decode_i32(bytes, |v| {
+            let d = v as i64 - offset;
+            debug_assert!(
+                d >= i32::MIN as i64 && d <= i32::MAX as i64,
+                "i32 frame lost {v}"
+            );
+            d as i32
+        })?),
+        IntTarget::U32 => NarrowedI64::U32(narrow_decode_i32(bytes, |v| {
+            let d = v as i64 - offset;
+            debug_assert!(d >= 0 && d <= u32::MAX as i64, "u32 frame lost {v}");
+            d as u32
+        })?),
+        // No narrowing: offset is 0 here, so this is the widened full read.
+        IntTarget::I64 => NarrowedI64::I64(narrow_decode_i32(bytes, |v| v as i64 - offset)?),
+    };
+    Ok(FrameNarrowed { offset, data })
+}
+
+/// Convenience: pick the frame `(offset, target)` from `[min, max]` and
+/// decode the INT32 buffer in one call.
+pub fn decode_plain_i32_frame_auto(bytes: &[u8], min: i64, max: i64) -> Result<FrameNarrowed> {
+    let (offset, target) = frame_of_reference_target(min, max);
+    decode_plain_i32_frame(bytes, offset, target)
+}
+
 /// Shared narrowing loop: read each 8-byte LE i64 and map it through `f`.
 /// Distinct from [`crate::plain`]'s `plain_memcpy` fast path because the
 /// destination width differs from the source — a per-value cast is
@@ -413,10 +539,33 @@ where
     Ok(out)
 }
 
+/// INT32 analogue of [`narrow_decode`]: read each 4-byte LE i32 and map it
+/// through `f`. Same wire contract as [`decode_plain_i32`] (length must be
+/// a multiple of 4); the destination width differs from the 4-byte source
+/// (except the identity arm), so a per-value cast is required.
+#[inline]
+fn narrow_decode_i32<T, F>(bytes: &[u8], f: F) -> Result<Vec<T>>
+where
+    F: Fn(i32) -> T,
+{
+    if bytes.len() % 4 != 0 {
+        return Err(CodecError::UnalignedPlainBuffer {
+            value_width: 4,
+            buffer_len: bytes.len(),
+        });
+    }
+    let n = bytes.len() / 4;
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(4) {
+        out.push(f(i32::from_le_bytes(chunk.try_into().unwrap())));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plain::decode_plain_i64;
+    use crate::plain::{decode_plain_i32, decode_plain_i64};
 
     fn plain_bytes(vals: &[i64]) -> Vec<u8> {
         let mut b = Vec::with_capacity(vals.len() * 8);
@@ -640,5 +789,147 @@ mod tests {
     fn frame_empty_buffer_is_empty() {
         let fr = decode_plain_i64_frame_auto(&[], 100, 100).unwrap();
         assert!(fr.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // INT32-source narrowing — DATE(INT32)->I16, small INT32 keys->I8.
+    // Mirrors the INT64 path on a 4-byte source; results reuse NarrowedI64.
+    // -----------------------------------------------------------------
+
+    fn plain_bytes_i32(vals: &[i32]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(vals.len() * 4);
+        for &v in vals {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn i32_date_range_narrows_to_i16() {
+        // TPC-H DATE stored INT32 (days since epoch): 1992-01-01..1998-12-31
+        // ~= [8035, 10592]. Fits I16 by ABSOLUTE range (no frame needed).
+        assert_eq!(narrowest_int_target(8035, 10592), IntTarget::I16);
+    }
+
+    #[test]
+    fn i32_auto_decode_roundtrips_against_plain_i32() {
+        // Re-widened narrowed decode must equal the independent
+        // decode_plain_i32 path (which shares no code with narrow_decode_i32
+        // for the narrowing arms).
+        let cases: Vec<Vec<i32>> = vec![
+            vec![8035, 9000, 10592, 8500], // DATE-shaped -> I16
+            vec![1, 2, 3, 7],              // -> I8
+            vec![0, 200, 100, 255],        // -> U8
+            vec![-100, 30_000, 0, -1],     // -> I16
+            vec![i32::MIN, i32::MAX, 0],   // -> I32 (full width identity)
+        ];
+        let expected = [
+            IntTarget::I16,
+            IntTarget::I8,
+            IntTarget::U8,
+            IntTarget::I16,
+            IntTarget::I32,
+        ];
+        for (vals, want) in cases.iter().zip(expected) {
+            let bytes = plain_bytes_i32(vals);
+            let min = *vals.iter().min().unwrap() as i64;
+            let max = *vals.iter().max().unwrap() as i64;
+            let narrowed = decode_plain_i32_auto(&bytes, min, max).unwrap();
+            assert_eq!(narrowed.target(), want, "wrong target for {vals:?}");
+            let ground_truth: Vec<i64> = decode_plain_i32(&bytes)
+                .unwrap()
+                .iter()
+                .map(|&x| x as i64)
+                .collect();
+            assert_eq!(
+                narrowed.to_i64(),
+                ground_truth,
+                "value mismatch for {vals:?}"
+            );
+            assert_eq!(narrowed.len(), vals.len());
+        }
+    }
+
+    #[test]
+    fn i32_date_narrowing_halves_footprint() {
+        // 1000 DATE-shaped values: I16 target = 2 bytes vs source 4.
+        let vals: Vec<i32> = (0..1000).map(|i| 8035 + (i % 2557)).collect();
+        let bytes = plain_bytes_i32(&vals);
+        let narrowed = decode_plain_i32_auto(&bytes, 8035, 10592).unwrap();
+        assert_eq!(narrowed.target(), IntTarget::I16);
+        assert_eq!(narrowed.byte_size(), vals.len() * 2);
+        let i32_footprint = decode_plain_i32(&bytes).unwrap().len() * 4;
+        assert_eq!(narrowed.byte_size() * 2, i32_footprint);
+    }
+
+    #[test]
+    fn i32_explicit_target_decode_matches_cast() {
+        let vals: Vec<i32> = vec![-5, -1, 0, 1, 100, 127];
+        let bytes = plain_bytes_i32(&vals);
+        let narrowed = decode_plain_i32_narrowed(&bytes, IntTarget::I8).unwrap();
+        match narrowed {
+            NarrowedI64::I8(v) => {
+                let expect: Vec<i8> = vals.iter().map(|&x| x as i8).collect();
+                assert_eq!(v, expect);
+            }
+            other => panic!("expected I8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i32_full_width_target_equals_plain_i32() {
+        let vals: Vec<i32> = vec![i32::MIN, -1, 0, 1, i32::MAX, 123_456];
+        let bytes = plain_bytes_i32(&vals);
+        let narrowed = decode_plain_i32_narrowed(&bytes, IntTarget::I32).unwrap();
+        assert_eq!(
+            narrowed,
+            NarrowedI64::I32(decode_plain_i32(&bytes).unwrap())
+        );
+    }
+
+    #[test]
+    fn i32_unaligned_buffer_errors() {
+        let bytes = vec![0u8; 6]; // not a multiple of 4
+        let err = decode_plain_i32_narrowed(&bytes, IntTarget::I16);
+        assert!(matches!(
+            err,
+            Err(CodecError::UnalignedPlainBuffer {
+                value_width: 4,
+                buffer_len: 6
+            })
+        ));
+    }
+
+    #[test]
+    fn i32_empty_buffer_is_empty() {
+        let narrowed = decode_plain_i32_auto(&[], 0, 0).unwrap();
+        assert!(narrowed.is_empty());
+        assert_eq!(narrowed.target(), IntTarget::I8); // min==max==0 -> I8
+    }
+
+    #[test]
+    fn i32_frame_roundtrips_to_i64() {
+        // Clustered i32: base 2_000_000 (> i16 abs) + small span -> frame narrows.
+        let vals: Vec<i32> = vec![2_000_000, 2_000_500, 2_000_999, 2_000_001];
+        let bytes = plain_bytes_i32(&vals);
+        let fr = decode_plain_i32_frame_auto(&bytes, 2_000_000, 2_000_999).unwrap();
+        assert_eq!(fr.offset, 2_000_000);
+        assert_eq!(fr.target(), IntTarget::I16); // span 999 -> I16
+        let ground_truth: Vec<i64> = vals.iter().map(|&x| x as i64).collect();
+        assert_eq!(fr.to_i64(), ground_truth);
+    }
+
+    #[test]
+    fn i32_frame_beats_absolute_when_clustered() {
+        // Absolute needs I32 (base 2e6 > i16::MAX); span 999 fits I16 via frame.
+        let base = 2_000_000i32;
+        let vals: Vec<i32> = (0..1000).map(|i| base + i).collect(); // span 999
+        let bytes = plain_bytes_i32(&vals);
+        let abs = decode_plain_i32_auto(&bytes, base as i64, (base + 999) as i64).unwrap();
+        let fr = decode_plain_i32_frame_auto(&bytes, base as i64, (base + 999) as i64).unwrap();
+        assert_eq!(abs.target(), IntTarget::I32); // absolute: 4 bytes
+        assert_eq!(fr.target(), IntTarget::I16); // frame: 2 bytes
+        assert!(fr.byte_size() < abs.byte_size());
+        assert_eq!(fr.to_i64(), abs.to_i64());
     }
 }

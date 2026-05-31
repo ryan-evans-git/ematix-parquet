@@ -52,7 +52,10 @@ fn narrows_to_i16_for_mid_range() {
 #[test]
 fn narrows_to_i32_for_sf100_orderkey_range() {
     // l_orderkey at SF=100 (~600M) fits i32.
-    roundtrip(&[1, 600_000_000, 250_000_000, 42, 599_999_999], IntTarget::I32);
+    roundtrip(
+        &[1, 600_000_000, 250_000_000, 42, 599_999_999],
+        IntTarget::I32,
+    );
 }
 
 #[test]

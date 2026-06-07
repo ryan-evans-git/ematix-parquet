@@ -23,8 +23,9 @@
 //!   - snap_into / snap_presized     → the zero-fill memset tax (a free lever
 //!     via uninit out if it's material)
 //!
-//! Usage:
-//!   cargo run --release -p ematix-parquet-codec --example bench_snappy_headroom
+//! Usage (gated behind the `libsnappy-bench` feature — links system libsnappy):
+//!   cargo run --release -p ematix-parquet-codec --features libsnappy-bench \
+//!     --example bench_snappy_headroom
 //! Env: TPCH_LINEITEM=<abs path> (default sf10 canonical snappy), COL=<idx> (5)
 
 use std::hint::black_box;

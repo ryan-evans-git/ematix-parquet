@@ -27,6 +27,13 @@ encryption = ["dep:ematix-parquet-crypto"]
 # free so single-threaded consumers don't pay the thread-pool
 # startup cost or the dep-tree weight.
 parallel = ["dep:rayon", "dep:libc"]
+# Microbench-only marker: gates the `bench_snappy_headroom` example,
+# which links the system Google libsnappy (`brew install snappy` /
+# `apt-get install libsnappy-dev`) to compare it against the pure-Rust
+# `snap` crate. OFF by default so `cargo build --all-targets` (and CI)
+# never require a system C library to build the workspace. Enables no
+# Rust code — it only flips the example's `required-features` gate.
+libsnappy-bench = []
 
 [dependencies]
 ematix-parquet-format = { path = "../ematix-parquet-format", version = "0.17" }
@@ -164,6 +171,19 @@ required-features = ["parallel"]
 [[example]]
 name = "bench_indexed_lookup"
 path = "examples/bench_indexed_lookup.rs"
+
+# Q15/Q06 Snappy decode-rate de-risk (PV.M.6 Phase-0). Compares the
+# pure-Rust `snap` crate against the system Google libsnappy (C) on
+# real extprice pages to test whether the "Snappy floor" is algorithm-
+# or memory-bound. Links a system C library, so it is gated behind the
+# `libsnappy-bench` feature — default and CI `--all-targets` builds
+# skip it (no system libsnappy required to build the workspace).
+# Run: cargo run --release -p ematix-parquet-codec \
+#   --features libsnappy-bench --example bench_snappy_headroom
+[[example]]
+name = "bench_snappy_headroom"
+path = "examples/bench_snappy_headroom.rs"
+required-features = ["libsnappy-bench"]
 
 [lints]
 workspace = true

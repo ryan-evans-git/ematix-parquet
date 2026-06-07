@@ -30,7 +30,7 @@ use std::path::Path;
 
 use ematix_parquet_format::metadata::{
     ColumnChunk, ColumnMetaData, DataPageHeader, DataPageHeaderV2, DictionaryPageHeader,
-    FileMetaData, IntType, LogicalType, PageHeader, RowGroup, SchemaElement, Statistics,
+    FileMetaData, PageHeader, RowGroup, SchemaElement, Statistics,
 };
 use ematix_parquet_format::metadata_writer::{write_file_metadata, write_page_header};
 use ematix_parquet_format::types::{
@@ -153,21 +153,16 @@ impl<'a> ColumnData<'a> {
     /// KEYS.4 — a `U64` column is physically INT64; mark it UINT_64 in the
     /// legacy `converted_type` so readers (incl. ematix `arrow_type_for`)
     /// surface it as unsigned. `None` for every signed/other type.
+    ///
+    /// We deliberately do NOT also emit the modern `logical_type`
+    /// Integer{64,unsigned}: this crate's `metadata_writer` does not
+    /// serialize `LogicalType` yet (it panics). `converted_type=UINT_64`
+    /// is standard, fully valid parquet, and sufficient for every reader
+    /// (ematix `arrow_type_for` checks converted_type first). Readers that
+    /// also honor logical_type still work — they just see converted_type.
     fn converted_type(&self) -> Option<ConvertedType> {
         match self {
             ColumnData::U64(_) => Some(ConvertedType::Uint64),
-            _ => None,
-        }
-    }
-
-    /// KEYS.4 — modern `logical_type` counterpart of `converted_type`:
-    /// `Integer(bit_width=64, is_signed=false)` for `U64`, else `None`.
-    fn logical_type(&self) -> Option<LogicalType<'static>> {
-        match self {
-            ColumnData::U64(_) => Some(LogicalType::Integer(IntType {
-                bit_width: 64,
-                is_signed: false,
-            })),
             _ => None,
         }
     }
@@ -820,11 +815,13 @@ fn write_table_inner_full_v2<W: Write>(
             name: name.as_bytes(),
             num_children: None,
             // KEYS.4: U64 columns carry the UINT_64 marker here (else None).
+            // logical_type stays None — metadata_writer can't serialize it
+            // yet; converted_type is sufficient + standard.
             converted_type: col.converted_type(),
             scale: None,
             precision: None,
             field_id: None,
-            logical_type: col.logical_type(),
+            logical_type: None,
         });
     }
 
@@ -2715,16 +2712,8 @@ mod u64_tests {
         let c = ColumnData::U64(v);
         assert!(matches!(c.parquet_type(), ParquetType::Int64));
         assert!(matches!(c.converted_type(), Some(ConvertedType::Uint64)));
-        assert!(matches!(
-            c.logical_type(),
-            Some(LogicalType::Integer(IntType {
-                bit_width: 64,
-                is_signed: false
-            }))
-        ));
         let i: &[i64] = &[1, 2, 3];
         assert!(ColumnData::I64(i).converted_type().is_none());
-        assert!(ColumnData::I64(i).logical_type().is_none());
     }
 
     /// KEYS.4 — the load-bearing property: U64 min/max are UNSIGNED.
@@ -2755,5 +2744,28 @@ mod u64_tests {
             want.extend_from_slice(&v.to_le_bytes());
         }
         assert_eq!(enc, want);
+    }
+
+    /// KEYS.4.e fixture generator — inert unless `U64_FIXTURE_OUT` is set.
+    /// Writes a small UINT_64 + INT64 parquet to the env-given path so
+    /// ematix-flow can commit it as a static e2e fixture. The u64 values
+    /// straddle the signed/unsigned divide: 2^63 and u64::MAX must sort
+    /// ABOVE the small positives (unsigned), not below (signed/buggy).
+    #[test]
+    fn emit_u64_fixture() {
+        let Some(out) = std::env::var_os("U64_FIXTURE_OUT") else {
+            return;
+        };
+        let ukey: &[u64] = &[1, 100, 1u64 << 63, u64::MAX, 5];
+        let payload: &[i64] = &[10, 20, 30, 40, 50];
+        write_table_to_path(
+            std::path::Path::new(&out),
+            &[
+                ("ukey", ColumnData::U64(ukey)),
+                ("payload", ColumnData::I64(payload)),
+            ],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
     }
 }

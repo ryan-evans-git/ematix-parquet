@@ -16,8 +16,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let md = file.metadata()?;
     let rg0 = &md.row_groups[0];
     println!("file: {path}");
-    println!("row_groups={}  cols={}", md.row_groups.len(), rg0.columns.len());
-    println!("{:<18} {:<10} {:>12} {:>12} {:<8} {}", "column", "codec", "comp_MB(rg0)", "uncomp_MB", "dict?", "encodings");
+    println!(
+        "row_groups={}  cols={}",
+        md.row_groups.len(),
+        rg0.columns.len()
+    );
+    println!(
+        "{:<18} {:<10} {:>12} {:>12} {:<8} encodings",
+        "column", "codec", "comp_MB(rg0)", "uncomp_MB", "dict?"
+    );
     let mut tot_comp = 0u64;
     let mut tot_uncomp = 0u64;
     for c in &rg0.columns {
@@ -40,7 +47,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tot_uncomp += cm.total_uncompressed_size as u64;
         println!(
             "{:<18} {:<10} {:>12.2} {:>12.2} {:<8} {}",
-            name, codec, comp, uncomp, has_dict, encs.join(",")
+            name,
+            codec,
+            comp,
+            uncomp,
+            has_dict,
+            encs.join(",")
         );
     }
     println!(

@@ -151,7 +151,11 @@ fn main() {
     println!(
         "survivors: eager={eager_surv} late={late_surv}  ({:.3}% selectivity){}",
         100.0 * eager_surv as f64 / eager_total.max(1) as f64,
-        if eager_surv == late_surv { " ✓ match" } else { " ✗ MISMATCH" }
+        if eager_surv == late_surv {
+            " ✓ match"
+        } else {
+            " ✗ MISMATCH"
+        }
     );
     println!();
     println!("=== payload decode strategy (partkey+orderkey+suppkey i64, extprice f64) ===");
@@ -160,6 +164,8 @@ fn main() {
     println!("  speedup EAGER/LATE            : {:.2}x", em / lm);
     println!();
     println!("Interpretation:");
-    println!("  >1.3x  => late-mat across the join is a real lever (payload decode is wasted today)");
+    println!(
+        "  >1.3x  => late-mat across the join is a real lever (payload decode is wasted today)"
+    );
     println!("  ~1.0x  => key-decode + 60M membership probe dominate; Q08 is decode-floored like Q06/Q15");
 }

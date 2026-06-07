@@ -30,11 +30,11 @@ use std::path::Path;
 
 use ematix_parquet_format::metadata::{
     ColumnChunk, ColumnMetaData, DataPageHeader, DataPageHeaderV2, DictionaryPageHeader,
-    FileMetaData, PageHeader, RowGroup, SchemaElement, Statistics,
+    FileMetaData, IntType, LogicalType, PageHeader, RowGroup, SchemaElement, Statistics,
 };
 use ematix_parquet_format::metadata_writer::{write_file_metadata, write_page_header};
 use ematix_parquet_format::types::{
-    CompressionCodec, Encoding, FieldRepetitionType, PageType, ParquetType,
+    CompressionCodec, ConvertedType, Encoding, FieldRepetitionType, PageType, ParquetType,
 };
 
 use crate::rle::{encode_rle_bit_packed, min_bit_width_for_dict};
@@ -59,6 +59,10 @@ const PARQUET_MAGIC_ENCRYPTED: &[u8; 4] = b"PARE";
 pub enum ColumnData<'a> {
     I32(&'a [i32]),
     I64(&'a [i64]),
+    /// Unsigned 64-bit. Physically stored as INT64 (parquet's only
+    /// 64-bit integer width); marked UINT_64 in the schema so readers
+    /// surface it as unsigned. KEYS.4.
+    U64(&'a [u64]),
     F64(&'a [f64]),
     Bool(&'a [bool]),
     ByteArray(&'a [&'a [u8]]),
@@ -69,6 +73,7 @@ impl<'a> ColumnData<'a> {
         match self {
             ColumnData::I32(v) => v.len(),
             ColumnData::I64(v) => v.len(),
+            ColumnData::U64(v) => v.len(),
             ColumnData::F64(v) => v.len(),
             ColumnData::Bool(v) => v.len(),
             ColumnData::ByteArray(v) => v.len(),
@@ -79,6 +84,9 @@ impl<'a> ColumnData<'a> {
         match self {
             ColumnData::I32(_) => ParquetType::Int32,
             ColumnData::I64(_) => ParquetType::Int64,
+            // U64 is physically INT64; the UINT_64 marker rides on the
+            // SchemaElement's converted_type/logical_type (KEYS.4).
+            ColumnData::U64(_) => ParquetType::Int64,
             ColumnData::F64(_) => ParquetType::Double,
             ColumnData::Bool(_) => ParquetType::Boolean,
             ColumnData::ByteArray(_) => ParquetType::ByteArray,
@@ -89,6 +97,7 @@ impl<'a> ColumnData<'a> {
         match self {
             ColumnData::I32(v) => encode_plain_i32(v),
             ColumnData::I64(v) => encode_plain_i64(v),
+            ColumnData::U64(v) => encode_plain_u64(v),
             ColumnData::F64(v) => encode_plain_f64(v),
             ColumnData::Bool(v) => encode_plain_bool(v),
             ColumnData::ByteArray(v) => encode_plain_byte_array(v),
@@ -102,6 +111,7 @@ impl<'a> ColumnData<'a> {
         match self {
             ColumnData::I32(v) => ColumnData::I32(&v[range]),
             ColumnData::I64(v) => ColumnData::I64(&v[range]),
+            ColumnData::U64(v) => ColumnData::U64(&v[range]),
             ColumnData::F64(v) => ColumnData::F64(&v[range]),
             ColumnData::Bool(v) => ColumnData::Bool(&v[range]),
             ColumnData::ByteArray(v) => ColumnData::ByteArray(&v[range]),
@@ -132,7 +142,33 @@ impl<'a> ColumnData<'a> {
                 let (dict, indices) = build_dict_byte_array(v);
                 Some((encode_plain_byte_array(&dict), dict.len(), indices))
             }
+            // U64 dict-encoding isn't wired (PLAIN only); the multi-column
+            // writer only calls this when dict is opted in, and the KEYS.4
+            // fixture path uses PLAIN. Falls back to PLAIN like Bool.
+            ColumnData::U64(_) => None,
             ColumnData::Bool(_) => None,
+        }
+    }
+
+    /// KEYS.4 — a `U64` column is physically INT64; mark it UINT_64 in the
+    /// legacy `converted_type` so readers (incl. ematix `arrow_type_for`)
+    /// surface it as unsigned. `None` for every signed/other type.
+    fn converted_type(&self) -> Option<ConvertedType> {
+        match self {
+            ColumnData::U64(_) => Some(ConvertedType::Uint64),
+            _ => None,
+        }
+    }
+
+    /// KEYS.4 — modern `logical_type` counterpart of `converted_type`:
+    /// `Integer(bit_width=64, is_signed=false)` for `U64`, else `None`.
+    fn logical_type(&self) -> Option<LogicalType<'static>> {
+        match self {
+            ColumnData::U64(_) => Some(LogicalType::Integer(IntType {
+                bit_width: 64,
+                is_signed: false,
+            })),
+            _ => None,
         }
     }
 }
@@ -783,11 +819,12 @@ fn write_table_inner_full_v2<W: Write>(
             repetition_type: Some(FieldRepetitionType::Required),
             name: name.as_bytes(),
             num_children: None,
-            converted_type: None,
+            // KEYS.4: U64 columns carry the UINT_64 marker here (else None).
+            converted_type: col.converted_type(),
             scale: None,
             precision: None,
             field_id: None,
-            logical_type: None,
+            logical_type: col.logical_type(),
         });
     }
 
@@ -1766,6 +1803,17 @@ fn encode_plain_i64(values: &[i64]) -> Vec<u8> {
     out
 }
 
+/// KEYS.4 — PLAIN INT64 encoding for a `U64` column. u64 and i64 share
+/// an 8-byte little-endian layout, so the on-disk bytes are identical to
+/// the i64 path for the same bit pattern; the reader reinterprets.
+fn encode_plain_u64(values: &[u64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 8);
+    for &v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
 fn encode_plain_i32(values: &[i32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 4);
     for &v in values {
@@ -1851,6 +1899,7 @@ fn compute_stats(col: &ColumnData<'_>) -> ColumnStats {
     match col {
         ColumnData::I32(v) => stats_i32(v),
         ColumnData::I64(v) => stats_i64(v),
+        ColumnData::U64(v) => stats_u64(v),
         ColumnData::F64(v) => stats_f64(v),
         ColumnData::Bool(v) => stats_bool(v),
         ColumnData::ByteArray(v) => stats_byte_array(v),
@@ -1885,6 +1934,13 @@ fn build_bloom_for_column(col: &ColumnData<'_>, target_fpp: f64) -> Vec<u8> {
             }
         }
         ColumnData::I64(vs) => {
+            let mut le = [0u8; 8];
+            for &v in *vs {
+                le.copy_from_slice(&v.to_le_bytes());
+                b.insert_bytes(&le);
+            }
+        }
+        ColumnData::U64(vs) => {
             let mut le = [0u8; 8];
             for &v in *vs {
                 le.copy_from_slice(&v.to_le_bytes());
@@ -1934,6 +1990,31 @@ fn stats_i32(v: &[i32]) -> ColumnStats {
 }
 
 fn stats_i64(v: &[i64]) -> ColumnStats {
+    let mut it = v.iter().copied();
+    let Some(first) = it.next() else {
+        return ColumnStats::default();
+    };
+    let (mut mn, mut mx) = (first, first);
+    for x in it {
+        if x < mn {
+            mn = x;
+        }
+        if x > mx {
+            mx = x;
+        }
+    }
+    ColumnStats {
+        min: Some(mn.to_le_bytes().to_vec()),
+        max: Some(mx.to_le_bytes().to_vec()),
+        null_count: 0,
+    }
+}
+
+/// KEYS.4 — UNSIGNED min/max for a `U64` column. Critical: `<`/`>` here
+/// are u64 comparisons, so 2^63 ranks above 5 (not below, as it would
+/// reading the same bits as i64). Signed min/max would emit a prune
+/// bound that drops valid rows once the reader treats the column as u64.
+fn stats_u64(v: &[u64]) -> ColumnStats {
     let mut it = v.iter().copied();
     let Some(first) = it.next() else {
         return ColumnStats::default();
@@ -2619,4 +2700,60 @@ pub fn write_byte_array_column_dict_to_path(
     )?;
     w.flush().map_err(io_to_codec)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod u64_tests {
+    use super::*;
+
+    /// KEYS.4 — a `U64` column is physically INT64 yet carries the
+    /// UINT_64 marker in both `converted_type` and `logical_type`, so a
+    /// reader surfaces it as unsigned. Signed/other types stay unmarked.
+    #[test]
+    fn u64_column_carries_uint64_marker_on_int64_physical() {
+        let v: &[u64] = &[0, 1, u64::MAX, 1u64 << 63];
+        let c = ColumnData::U64(v);
+        assert!(matches!(c.parquet_type(), ParquetType::Int64));
+        assert!(matches!(c.converted_type(), Some(ConvertedType::Uint64)));
+        assert!(matches!(
+            c.logical_type(),
+            Some(LogicalType::Integer(IntType {
+                bit_width: 64,
+                is_signed: false
+            }))
+        ));
+        let i: &[i64] = &[1, 2, 3];
+        assert!(ColumnData::I64(i).converted_type().is_none());
+        assert!(ColumnData::I64(i).logical_type().is_none());
+    }
+
+    /// KEYS.4 — the load-bearing property: U64 min/max are UNSIGNED.
+    /// 2^63 must rank as the max (not, read as i64, the min); 0 the min.
+    /// A signed bound here would prune valid u64 rows at read time.
+    #[test]
+    fn u64_stats_are_unsigned_not_signed() {
+        let vals: &[u64] = &[5, 1u64 << 63, 0, u64::MAX];
+        let s = compute_stats(&ColumnData::U64(vals));
+        assert_eq!(s.min.as_deref(), Some(&0u64.to_le_bytes()[..]));
+        assert_eq!(s.max.as_deref(), Some(&u64::MAX.to_le_bytes()[..]));
+        // Contrast: the same bits via the signed path pick i64::MIN (=2^63) as min.
+        let sbits: Vec<i64> = vals.iter().map(|&x| x as i64).collect();
+        assert_eq!(
+            stats_i64(&sbits).min.as_deref(),
+            Some(&i64::MIN.to_le_bytes()[..])
+        );
+    }
+
+    /// KEYS.4 — PLAIN encoding is the value's 8-byte LE, byte-identical to
+    /// the i64 layout for the same bit pattern (the reader reinterprets).
+    #[test]
+    fn u64_encode_plain_is_le_bytes() {
+        let vals: &[u64] = &[1, u64::MAX, 1u64 << 63];
+        let enc = ColumnData::U64(vals).encode_plain();
+        let mut want = Vec::new();
+        for v in vals {
+            want.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(enc, want);
+    }
 }

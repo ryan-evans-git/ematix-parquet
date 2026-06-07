@@ -6,7 +6,7 @@
 //!
 //!   - l_extendedprice (col 5, f64 PLAIN + Snappy): tests decompress + PLAIN decode.
 //!   - l_shipdate      (col 10, Date32/i32 DICT + Snappy): tests dict-index
-//!                     RLE/bitpack UNPACK (the port's target) + decompress.
+//!     RLE/bitpack UNPACK (the port's target) + decompress.
 //!
 //! Reports per column: median wall ms, values/s, and uncompressed MB/s
 //! (= n_values * sizeof(T) / time) so it's directly comparable to polars.
@@ -29,8 +29,14 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "examples/tpch/data/sf10/lineitem.parquet".to_string());
-    let reps: usize = std::env::var("REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
-    let warmups: usize = std::env::var("WARMUPS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let reps: usize = std::env::var("REPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let warmups: usize = std::env::var("WARMUPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
 
     let file = ParquetFile::open(&path).expect("open");
     let md = file.cached_metadata().expect("meta");
@@ -71,7 +77,10 @@ fn main() {
     let vps = n_vals as f64 / (m / 1000.0);
     let mbps = (n_vals as f64 * 8.0) / (m / 1000.0) / 1e6;
     println!("=== l_extendedprice (f64 PLAIN+Snappy) ===");
-    println!("  median {m:8.2} ms   {:.1} M values/s   {mbps:8.1} MB/s (uncompressed)", vps / 1e6);
+    println!(
+        "  median {m:8.2} ms   {:.1} M values/s   {mbps:8.1} MB/s (uncompressed)",
+        vps / 1e6
+    );
 
     // ---- l_shipdate (i32 dict) ----
     let mut ms = Vec::new();
@@ -94,7 +103,10 @@ fn main() {
     let vps = n_vals as f64 / (m / 1000.0);
     let mbps = (n_vals as f64 * 4.0) / (m / 1000.0) / 1e6;
     println!("=== l_shipdate (i32/Date32 DICT+Snappy) ===");
-    println!("  median {m:8.2} ms   {:.1} M values/s   {mbps:8.1} MB/s (uncompressed)", vps / 1e6);
+    println!(
+        "  median {m:8.2} ms   {:.1} M values/s   {mbps:8.1} MB/s (uncompressed)",
+        vps / 1e6
+    );
 
     println!("\n(checksums {checksum:.1} / {isum} — prevent dead-code elim)");
 }

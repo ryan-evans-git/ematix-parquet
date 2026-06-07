@@ -33,7 +33,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/Users/ryanevans/RustroverProjects/ematix-flow/examples/tpch/data/sf10/lineitem.parquet",
         )
     });
-    let col_idx: usize = std::env::var("COL").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let col_idx: usize = std::env::var("COL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     let file = ParquetFile::open(&path)?;
     let md = file.metadata()?;
 
@@ -54,7 +57,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mask[i / 8] |= 1 << (i % 8);
         i += 28;
     }
-    let n_set: usize = (0..n).filter(|&i| (mask[i / 8] >> (i % 8)) & 1 == 1).count();
+    let n_set: usize = (0..n)
+        .filter(|&i| (mask[i / 8] >> (i % 8)) & 1 == 1)
+        .count();
     println!("== f64 decode+sum mechanism (single-thread) ==  col {col_idx}");
     println!(
         "{:.1}M values, bytes 8-aligned={aligned}, mask {:.1}% ({} set)",
@@ -79,7 +84,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (best, cs)
     };
 
-    for &(label, all_ones) in &[("DENSE (all values)", true), ("3.6% MASKED (Q15 sel)", false)] {
+    for &(label, all_ones) in &[
+        ("DENSE (all values)", true),
+        ("3.6% MASKED (Q15 sel)", false),
+    ] {
         println!("\n--- {label} ---");
         let mut scratch: Vec<f64> = Vec::with_capacity(PAGE);
 
@@ -145,11 +153,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let (tc, cc) = bestof(&mut c);
 
-        println!("{:<16}{:>9.3} ms{:>9.2} GB/s", "A ematix_sparse", ta * 1e3, gbps(ta));
-        println!("{:<16}{:>9.3} ms{:>9.2} GB/s", "B fused_fromle", tb * 1e3, gbps(tb));
-        println!("{:<16}{:>9.3} ms{:>9.2} GB/s", "C zerocopy", tc * 1e3, gbps(tc));
-        let ok = (ca - cb).abs() / ca.abs().max(1.0) < 1e-9 && (ca - cc).abs() / ca.abs().max(1.0) < 1e-9;
-        println!("B/A={:.2}×  C/A={:.2}×  checksums_match={ok} (Σ={ca:.1})", ta / tb, ta / tc);
+        println!(
+            "{:<16}{:>9.3} ms{:>9.2} GB/s",
+            "A ematix_sparse",
+            ta * 1e3,
+            gbps(ta)
+        );
+        println!(
+            "{:<16}{:>9.3} ms{:>9.2} GB/s",
+            "B fused_fromle",
+            tb * 1e3,
+            gbps(tb)
+        );
+        println!(
+            "{:<16}{:>9.3} ms{:>9.2} GB/s",
+            "C zerocopy",
+            tc * 1e3,
+            gbps(tc)
+        );
+        let ok = (ca - cb).abs() / ca.abs().max(1.0) < 1e-9
+            && (ca - cc).abs() / ca.abs().max(1.0) < 1e-9;
+        println!(
+            "B/A={:.2}×  C/A={:.2}×  checksums_match={ok} (Σ={ca:.1})",
+            ta / tb,
+            ta / tc
+        );
     }
 
     println!("\nQ15 is 3.6%-MASKED. If A (sparse-skip) already ≈/beats B,C there → our");

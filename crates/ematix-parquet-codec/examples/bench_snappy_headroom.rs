@@ -34,8 +34,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use ematix_parquet_codec::compression::decompress_snappy_into;
-use ematix_parquet_io::ParquetFile;
 use ematix_parquet_io::pages::PageWalker;
+use ematix_parquet_io::ParquetFile;
 
 // Google libsnappy C API (brew install snappy). Build with
 // RUSTFLAGS="-L /opt/homebrew/lib". snappy_uncompress writes into a
@@ -59,12 +59,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/Users/ryanevans/RustroverProjects/ematix-flow/examples/tpch/data/sf10/lineitem.parquet",
         )
     });
-    let col_idx: usize = std::env::var("COL").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let col_idx: usize = std::env::var("COL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
 
     let file = ParquetFile::open(&path)?;
     let md = file.metadata()?;
     let col_name = std::str::from_utf8(
-        md.row_groups[0].columns[col_idx].meta_data.as_ref().unwrap().path_in_schema[0],
+        md.row_groups[0].columns[col_idx]
+            .meta_data
+            .as_ref()
+            .unwrap()
+            .path_in_schema[0],
     )
     .unwrap_or("?");
     println!("== Snappy decompress headroom probe ==");
@@ -91,7 +98,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if pages.is_empty() {
-        eprintln!("no data pages for col {col_idx} — is this column Snappy? (LZ4 sibling won't match)");
+        eprintln!(
+            "no data pages for col {col_idx} — is this column Snappy? (LZ4 sibling won't match)"
+        );
         std::process::exit(1);
     }
     println!(
@@ -200,17 +209,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         best_memcpy = best_memcpy.min(t0.elapsed().as_secs_f64());
     }
 
-    println!("\n{:<14} {:>9} {:>10} {:>12}", "arm", "ms", "GB/s_out", "ns/byte_out");
-    println!("{:<14} {:>9.3} {:>10.2} {:>12.3}", "snap_into", best_into * 1e3, gbps(best_into), nspb(best_into));
-    println!("{:<14} {:>9.3} {:>10.2} {:>12.3}", "snap_presized", best_presized * 1e3, gbps(best_presized), nspb(best_presized));
-    println!("{:<14} {:>9.3} {:>10.2} {:>12.3}  ok={}", "libsnappy", best_libsnappy * 1e3, gbps(best_libsnappy), nspb(best_libsnappy), ls_ok);
-    println!("{:<14} {:>9.3} {:>10.2} {:>12.3}", "memcpy", best_memcpy * 1e3, gbps(best_memcpy), nspb(best_memcpy));
+    println!(
+        "\n{:<14} {:>9} {:>10} {:>12}",
+        "arm", "ms", "GB/s_out", "ns/byte_out"
+    );
+    println!(
+        "{:<14} {:>9.3} {:>10.2} {:>12.3}",
+        "snap_into",
+        best_into * 1e3,
+        gbps(best_into),
+        nspb(best_into)
+    );
+    println!(
+        "{:<14} {:>9.3} {:>10.2} {:>12.3}",
+        "snap_presized",
+        best_presized * 1e3,
+        gbps(best_presized),
+        nspb(best_presized)
+    );
+    println!(
+        "{:<14} {:>9.3} {:>10.2} {:>12.3}  ok={}",
+        "libsnappy",
+        best_libsnappy * 1e3,
+        gbps(best_libsnappy),
+        nspb(best_libsnappy),
+        ls_ok
+    );
+    println!(
+        "{:<14} {:>9.3} {:>10.2} {:>12.3}",
+        "memcpy",
+        best_memcpy * 1e3,
+        gbps(best_memcpy),
+        nspb(best_memcpy)
+    );
 
     let vs_memcpy = best_presized / best_memcpy;
     let ls_speedup = (best_presized - best_libsnappy) / best_presized * 100.0;
     let memset_tax = (best_into - best_presized) / best_presized * 100.0;
     println!("\nsnap_presized / memcpy = {vs_memcpy:.1}× (rules OUT memory-bound: snap is compute-bound)");
-    println!("libsnappy vs snap_presized = {ls_speedup:+.1}% ({:.2}× snap rate)", best_presized / best_libsnappy);
+    println!(
+        "libsnappy vs snap_presized = {ls_speedup:+.1}% ({:.2}× snap rate)",
+        best_presized / best_libsnappy
+    );
     println!("zero-fill memset tax (snap_into vs snap_presized) = {memset_tax:+.1}%");
     println!(
         "VERDICT: {}",

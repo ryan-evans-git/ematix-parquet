@@ -23,8 +23,11 @@ use ematix_parquet_io::ParquetFile;
 use crate::bloom::{parquet_xxh64, SplitBlockBloomFilter};
 use crate::error::{CodecError, Result};
 use crate::index::fingerprint::compute_source_fingerprint;
-use crate::index::manifest::{IndexEntry, IndexKind, IndexManifest, ManifestError, MANIFEST_KEY};
+use crate::index::manifest::{
+    IndexEntry, IndexKind, IndexManifest, ManifestError, MANIFEST_KEY, MANIFEST_KEY_V2,
+};
 use crate::index::page_layout::walk_data_pages;
+use crate::index::rowset::{to_bitmap, RowsetFormat};
 use crate::index::types::{IndexHit, Key};
 use crate::index::PhysicalType;
 use crate::read::{read_column_byte_array, read_column_i32, read_column_i64};
@@ -120,6 +123,10 @@ struct LoadedIndex {
 pub struct ParquetIndex {
     manifest: IndexManifest,
     indexes: Vec<LoadedIndex>,
+    /// How stored rowset bytes are interpreted — decided by which
+    /// manifest KV key the sidecar carried (v1 = raw bitmaps,
+    /// v2 = tagged; see `index::rowset`).
+    rowset_format: RowsetFormat,
 }
 
 impl ParquetIndex {
@@ -140,9 +147,16 @@ impl ParquetIndex {
             .key_value_metadata
             .as_ref()
             .ok_or_else(|| codec_err(ManifestError::Missing))?;
-        let manifest_kv = kvs
+        // v2 first (tagged rowsets), fall back to v1 (raw bitmaps).
+        let (manifest_kv, rowset_format) = kvs
             .iter()
-            .find(|kv| kv.key == MANIFEST_KEY.as_bytes())
+            .find(|kv| kv.key == MANIFEST_KEY_V2.as_bytes())
+            .map(|kv| (kv, RowsetFormat::V2Tagged))
+            .or_else(|| {
+                kvs.iter()
+                    .find(|kv| kv.key == MANIFEST_KEY.as_bytes())
+                    .map(|kv| (kv, RowsetFormat::V1Raw))
+            })
             .ok_or_else(|| codec_err(ManifestError::Missing))?;
         let manifest_json_bytes = manifest_kv
             .value
@@ -346,7 +360,11 @@ impl ParquetIndex {
             }
         }
 
-        Ok(Self { manifest, indexes })
+        Ok(Self {
+            manifest,
+            indexes,
+            rowset_format,
+        })
     }
 
     /// Borrow the parsed manifest. Useful for tooling.
@@ -375,9 +393,11 @@ impl ParquetIndex {
             )));
         }
         match (&idx.data, key) {
-            (LoadedIndexData::SortedI64(d), Key::I64(v)) => Ok(eq_hits_i64(d, *v)),
-            (LoadedIndexData::SortedI32(d), Key::I32(v)) => Ok(eq_hits_i32(d, *v)),
-            (LoadedIndexData::SortedBytes(d), Key::Bytes(v)) => Ok(eq_hits_bytes(d, v)),
+            (LoadedIndexData::SortedI64(d), Key::I64(v)) => eq_hits_i64(d, *v, self.rowset_format),
+            (LoadedIndexData::SortedI32(d), Key::I32(v)) => eq_hits_i32(d, *v, self.rowset_format),
+            (LoadedIndexData::SortedBytes(d), Key::Bytes(v)) => {
+                eq_hits_bytes(d, v, self.rowset_format)
+            }
             _ => Err(CodecError::InvalidInput(format!(
                 "lookup_eq: key/index type mismatch on `{index_name}`"
             ))),
@@ -418,19 +438,19 @@ impl ParquetIndex {
                 if a > b {
                     return Ok(Vec::new());
                 }
-                Ok(range_hits_i64(d, *a..=*b))
+                range_hits_i64(d, *a..=*b, self.rowset_format)
             }
             (LoadedIndexData::SortedI32(d), Key::I32(a), Key::I32(b)) => {
                 if a > b {
                     return Ok(Vec::new());
                 }
-                Ok(range_hits_i32(d, *a..=*b))
+                range_hits_i32(d, *a..=*b, self.rowset_format)
             }
             (LoadedIndexData::SortedBytes(d), Key::Bytes(a), Key::Bytes(b)) => {
                 if a > b {
                     return Ok(Vec::new());
                 }
-                Ok(range_hits_bytes(d, a, b))
+                range_hits_bytes(d, a, b, self.rowset_format)
             }
             _ => Err(CodecError::InvalidInput(format!(
                 "lookup_range: key/index type mismatch on `{index_name}`"
@@ -473,7 +493,7 @@ impl ParquetIndex {
                 )))
             }
         };
-        Ok(composite_eq_hits(d, a, b))
+        composite_eq_hits(d, a, b, self.rowset_format)
     }
 
     /// Leading-prefix equality on a composite `(INT64, INT64)`
@@ -504,7 +524,7 @@ impl ParquetIndex {
                 )))
             }
         };
-        Ok(composite_prefix_hits(d, a))
+        composite_prefix_hits(d, a, self.rowset_format)
     }
 
     /// `INT64` exact 2-tuple composite + masked decode. Equivalent
@@ -558,7 +578,7 @@ impl ParquetIndex {
                 )))
             }
         };
-        Ok(inverted_eq_hits(d, normalized_token))
+        inverted_eq_hits(d, normalized_token, self.rowset_format)
     }
 
     /// Read the indexed `BYTE_ARRAY` target column for every row
@@ -1011,10 +1031,10 @@ impl ParquetIndex {
 // Per-type lookup helpers — binary-search + duplicate-walk.
 // ============================================================
 
-fn eq_hits_i64(d: &LoadedTypedI64, target: i64) -> Vec<IndexHit> {
+fn eq_hits_i64(d: &LoadedTypedI64, target: i64, format: RowsetFormat) -> Result<Vec<IndexHit>> {
     let pos = match d.values.binary_search(&target) {
         Ok(i) => i,
-        Err(_) => return Vec::new(),
+        Err(_) => return Ok(Vec::new()),
     };
     let mut start = pos;
     while start > 0 && d.values[start - 1] == target {
@@ -1024,13 +1044,20 @@ fn eq_hits_i64(d: &LoadedTypedI64, target: i64) -> Vec<IndexHit> {
     while end < d.values.len() && d.values[end] == target {
         end += 1;
     }
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn eq_hits_i32(d: &LoadedTypedI32, target: i32) -> Vec<IndexHit> {
+fn eq_hits_i32(d: &LoadedTypedI32, target: i32, format: RowsetFormat) -> Result<Vec<IndexHit>> {
     let pos = match d.values.binary_search(&target) {
         Ok(i) => i,
-        Err(_) => return Vec::new(),
+        Err(_) => return Ok(Vec::new()),
     };
     let mut start = pos;
     while start > 0 && d.values[start - 1] == target {
@@ -1040,13 +1067,24 @@ fn eq_hits_i32(d: &LoadedTypedI32, target: i32) -> Vec<IndexHit> {
     while end < d.values.len() && d.values[end] == target {
         end += 1;
     }
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn eq_hits_bytes(d: &LoadedTypedBytes, target: &[u8]) -> Vec<IndexHit> {
+fn eq_hits_bytes(
+    d: &LoadedTypedBytes,
+    target: &[u8],
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     let pos = match d.values.binary_search_by(|v| v.as_slice().cmp(target)) {
         Ok(i) => i,
-        Err(_) => return Vec::new(),
+        Err(_) => return Ok(Vec::new()),
     };
     let mut start = pos;
     while start > 0 && d.values[start - 1].as_slice() == target {
@@ -1056,32 +1094,78 @@ fn eq_hits_bytes(d: &LoadedTypedBytes, target: &[u8]) -> Vec<IndexHit> {
     while end < d.values.len() && d.values[end].as_slice() == target {
         end += 1;
     }
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn range_hits_i64(d: &LoadedTypedI64, range: RangeInclusive<i64>) -> Vec<IndexHit> {
+fn range_hits_i64(
+    d: &LoadedTypedI64,
+    range: RangeInclusive<i64>,
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     let (lo, hi) = (*range.start(), *range.end());
     // First index with value >= lo.
     let start = d.values.partition_point(|v| *v < lo);
     // First index with value > hi.
     let end = d.values.partition_point(|v| *v <= hi);
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn range_hits_i32(d: &LoadedTypedI32, range: RangeInclusive<i32>) -> Vec<IndexHit> {
+fn range_hits_i32(
+    d: &LoadedTypedI32,
+    range: RangeInclusive<i32>,
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     let (lo, hi) = (*range.start(), *range.end());
     let start = d.values.partition_point(|v| *v < lo);
     let end = d.values.partition_point(|v| *v <= hi);
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn range_hits_bytes(d: &LoadedTypedBytes, lo: &[u8], hi: &[u8]) -> Vec<IndexHit> {
+fn range_hits_bytes(
+    d: &LoadedTypedBytes,
+    lo: &[u8],
+    hi: &[u8],
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     let start = d.values.partition_point(|v| v.as_slice() < lo);
     let end = d.values.partition_point(|v| v.as_slice() <= hi);
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn composite_eq_hits(d: &LoadedTypedCompositeI64I64, a: i64, b: i64) -> Vec<IndexHit> {
+fn composite_eq_hits(
+    d: &LoadedTypedCompositeI64I64,
+    a: i64,
+    b: i64,
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     // Two-step binary search:
     //   1. Find the run where values_a == a (partition by `< a` and `<= a`).
     //   2. Within that run, find the row where values_b == b.
@@ -1091,7 +1175,7 @@ fn composite_eq_hits(d: &LoadedTypedCompositeI64I64, a: i64, b: i64) -> Vec<Inde
     let a_start = d.values_a.partition_point(|v| *v < a);
     let a_end = d.values_a.partition_point(|v| *v <= a);
     if a_start == a_end {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut out = Vec::new();
     // Within the a-run, the rows are sorted by (a, b, rg, page).
@@ -1101,25 +1185,30 @@ fn composite_eq_hits(d: &LoadedTypedCompositeI64I64, a: i64, b: i64) -> Vec<Inde
     let b_start_local = b_slice.partition_point(|v| *v < b);
     let b_end_local = b_slice.partition_point(|v| *v <= b);
     if b_start_local == b_end_local {
-        return out;
+        return Ok(out);
     }
-    for i in (a_start + b_start_local)..(a_start + b_end_local) {
-        out.push(IndexHit {
-            row_group: d.target_rgs[i] as u32,
-            page: d.target_pages[i] as u32,
-            rowset: d.rowsets[i].clone(),
-        });
-    }
-    out
+    out.extend(collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        a_start + b_start_local,
+        a_start + b_end_local,
+        format,
+    )?);
+    Ok(out)
 }
 
-fn inverted_eq_hits(d: &LoadedTypedInverted, token: &[u8]) -> Vec<IndexHit> {
+fn inverted_eq_hits(
+    d: &LoadedTypedInverted,
+    token: &[u8],
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     // `tokens` is sorted lex-ASC; binary search finds any row with
     // the target token, then linear scan covers duplicates of the
     // same token across pages.
     let pos = match d.tokens.binary_search_by(|t| t.as_slice().cmp(token)) {
         Ok(i) => i,
-        Err(_) => return Vec::new(),
+        Err(_) => return Ok(Vec::new()),
     };
     let mut start = pos;
     while start > 0 && d.tokens[start - 1].as_slice() == token {
@@ -1129,21 +1218,31 @@ fn inverted_eq_hits(d: &LoadedTypedInverted, token: &[u8]) -> Vec<IndexHit> {
     while end < d.tokens.len() && d.tokens[end].as_slice() == token {
         end += 1;
     }
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn composite_prefix_hits(d: &LoadedTypedCompositeI64I64, a: i64) -> Vec<IndexHit> {
+fn composite_prefix_hits(
+    d: &LoadedTypedCompositeI64I64,
+    a: i64,
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     let start = d.values_a.partition_point(|v| *v < a);
     let end = d.values_a.partition_point(|v| *v <= a);
-    let mut out = Vec::with_capacity(end.saturating_sub(start));
-    for i in start..end {
-        out.push(IndexHit {
-            row_group: d.target_rgs[i] as u32,
-            page: d.target_pages[i] as u32,
-            rowset: d.rowsets[i].clone(),
-        });
-    }
-    out
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
 fn collect_hits(
@@ -1152,16 +1251,20 @@ fn collect_hits(
     rowsets: &[Vec<u8>],
     start: usize,
     end: usize,
-) -> Vec<IndexHit> {
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     let mut out = Vec::with_capacity(end.saturating_sub(start));
     for i in start..end {
         out.push(IndexHit {
             row_group: target_rgs[i] as u32,
             page: target_pages[i] as u32,
-            rowset: rowsets[i].clone(),
+            // Normalize to the packed-bitmap contract at hit time —
+            // hits exist only for the looked-up key, so this touches
+            // a handful of rowsets however large the index is.
+            rowset: to_bitmap(&rowsets[i], format)?,
         });
     }
-    out
+    Ok(out)
 }
 
 // ============================================================

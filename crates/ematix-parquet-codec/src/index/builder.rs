@@ -42,7 +42,7 @@ use crate::bloom::{optimal_num_blocks, parquet_xxh64, SplitBlockBloomFilterBuild
 use crate::error::{CodecError, Result};
 use crate::index::fingerprint::compute_source_fingerprint;
 use crate::index::manifest::{
-    IndexEntry, IndexKind, IndexManifest, PhysicalType, Tokenizer, MANIFEST_KEY,
+    IndexEntry, IndexKind, IndexManifest, PhysicalType, Tokenizer, MANIFEST_KEY_V2,
 };
 use crate::index::page_layout::{walk_data_pages, DataPageLayout};
 use crate::read::{read_column_byte_array, read_column_i32, read_column_i64};
@@ -170,17 +170,11 @@ impl<'a> IndexBuilder<'a> {
             let positions = buckets
                 .remove(&(v, rg, page))
                 .expect("bucket exists for emitted key");
-            let bitmap_len = num_values.div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_len];
-            for r in positions {
-                let r = r as usize;
-                debug_assert!(r < num_values, "row_within_page out of range");
-                bitmap[r / 8] |= 1 << (r % 8);
-            }
+            let rowset = crate::index::rowset::encode_tagged(&positions, num_values);
             col_value.push(v);
             col_rg.push(rg as i32);
             col_page.push(page as i32);
-            col_rowset_owned.push(bitmap);
+            col_rowset_owned.push(rowset);
         }
 
         // ---- 4. Build manifest + emit sidecar parquet --------------
@@ -205,7 +199,7 @@ impl<'a> IndexBuilder<'a> {
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
 
         // ColumnData::ByteArray wants &[&[u8]], so we need a slice of
         // slices alongside the owned `Vec<Vec<u8>>`.
@@ -311,17 +305,11 @@ impl<'a> IndexBuilder<'a> {
             let positions = buckets
                 .remove(&(v, rg, page))
                 .expect("bucket exists for emitted key");
-            let bitmap_len = num_values.div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_len];
-            for r in positions {
-                let r = r as usize;
-                debug_assert!(r < num_values, "row_within_page out of range");
-                bitmap[r / 8] |= 1 << (r % 8);
-            }
+            let rowset = crate::index::rowset::encode_tagged(&positions, num_values);
             col_value.push(v);
             col_rg.push(rg as i32);
             col_page.push(page as i32);
-            col_rowset_owned.push(bitmap);
+            col_rowset_owned.push(rowset);
         }
 
         let fp = compute_source_fingerprint(self.source)?;
@@ -340,7 +328,7 @@ impl<'a> IndexBuilder<'a> {
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
         let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
         let cols: &[(&str, ColumnData<'_>)] = &[
             ("value", ColumnData::I32(&col_value)),
@@ -486,7 +474,7 @@ impl<'a> IndexBuilder<'a> {
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
 
         let bloom_slices: Vec<&[u8]> = col_bloom_owned.iter().map(|v| v.as_slice()).collect();
         let cols: &[(&str, ColumnData<'_>)] = &[
@@ -636,18 +624,12 @@ impl<'a> IndexBuilder<'a> {
             let positions = buckets
                 .remove(&(va, vb, rg, page))
                 .expect("bucket exists for emitted key");
-            let bitmap_len = num_values.div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_len];
-            for r in positions {
-                let r = r as usize;
-                debug_assert!(r < num_values);
-                bitmap[r / 8] |= 1 << (r % 8);
-            }
+            let rowset = crate::index::rowset::encode_tagged(&positions, num_values);
             col_value_a.push(va);
             col_value_b.push(vb);
             col_rg.push(rg as i32);
             col_page.push(page as i32);
-            col_rowset_owned.push(bitmap);
+            col_rowset_owned.push(rowset);
         }
 
         let fp = compute_source_fingerprint(self.source)?;
@@ -669,7 +651,7 @@ impl<'a> IndexBuilder<'a> {
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
         let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
         let cols: &[(&str, ColumnData<'_>)] = &[
             ("value_a", ColumnData::I64(&col_value_a)),
@@ -771,17 +753,11 @@ impl<'a> IndexBuilder<'a> {
             let positions = buckets
                 .remove(&(v.clone(), rg, page))
                 .expect("bucket exists for emitted key");
-            let bitmap_len = num_values.div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_len];
-            for r in positions {
-                let r = r as usize;
-                debug_assert!(r < num_values, "row_within_page out of range");
-                bitmap[r / 8] |= 1 << (r % 8);
-            }
+            let rowset = crate::index::rowset::encode_tagged(&positions, num_values);
             col_value_owned.push(v);
             col_rg.push(rg as i32);
             col_page.push(page as i32);
-            col_rowset_owned.push(bitmap);
+            col_rowset_owned.push(rowset);
         }
 
         let fp = compute_source_fingerprint(self.source)?;
@@ -800,7 +776,7 @@ impl<'a> IndexBuilder<'a> {
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
 
         let value_slices: Vec<&[u8]> = col_value_owned.iter().map(|v| v.as_slice()).collect();
         let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
@@ -928,17 +904,11 @@ impl<'a> IndexBuilder<'a> {
             let positions = buckets
                 .remove(&(tok.clone(), rg, page))
                 .expect("bucket exists for emitted key");
-            let bitmap_len = num_values.div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_len];
-            for rp in positions {
-                let rp = rp as usize;
-                debug_assert!(rp < num_values);
-                bitmap[rp / 8] |= 1 << (rp % 8);
-            }
+            let rowset = crate::index::rowset::encode_tagged(&positions, num_values);
             col_token_owned.push(tok);
             col_rg.push(rg as i32);
             col_page.push(page as i32);
-            col_rowset_owned.push(bitmap);
+            col_rowset_owned.push(rowset);
         }
 
         let fp = compute_source_fingerprint(self.source)?;
@@ -957,7 +927,7 @@ impl<'a> IndexBuilder<'a> {
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
         let token_slices: Vec<&[u8]> = col_token_owned.iter().map(|v| v.as_slice()).collect();
         let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
         let cols: &[(&str, ColumnData<'_>)] = &[

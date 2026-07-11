@@ -174,23 +174,26 @@ fn mixed_density_eq_and_range_parity() {
 
 // ---- version fencing ------------------------------------------------
 
-/// v2 sidecars carry ONLY the v2 manifest key: a v1 reader sees no
-/// v1 manifest and refuses (its documented fail-loud path), instead
-/// of silently misreading tagged rowsets as bitmaps.
+/// New sidecars carry ONLY the newest manifest key (v3 as of the
+/// chunked-body change): readers that predate it see no manifest they
+/// recognize and refuse (the documented fail-loud path), instead of
+/// silently misreading tagged rowsets / partial bodies.
 #[test]
-fn v2_sidecar_has_only_v2_manifest_key() {
+fn new_sidecars_carry_only_the_newest_manifest_key() {
     let dir = tempfile::tempdir().unwrap();
     let values: Vec<i64> = (0..1_000i64).collect();
     let (_, idx) = build(dir.path(), "fence", &values);
     let keys = kv_keys(&idx);
     assert!(
-        keys.iter().any(|k| k == V2_KEY),
-        "v2 manifest key missing: {keys:?}"
+        keys.iter().any(|k| k == "ematix_index_manifest_v3"),
+        "newest manifest key missing: {keys:?}"
     );
-    assert!(
-        !keys.iter().any(|k| k == V1_KEY),
-        "v1 manifest key must NOT be present on a v2 sidecar: {keys:?}"
-    );
+    for old in [V1_KEY, V2_KEY] {
+        assert!(
+            !keys.iter().any(|k| k == old),
+            "stale manifest key {old} must NOT be present: {keys:?}"
+        );
+    }
 }
 
 /// A legacy v1 sidecar (raw bitmaps, v1 manifest key) still reads —
@@ -228,6 +231,7 @@ fn legacy_v1_sidecar_still_reads() {
                 physical_type: PhysicalType::Int64,
             },
             sidecar_row_group: 0,
+            sidecar_row_group_count: 1,
         }],
     }
     .to_json();

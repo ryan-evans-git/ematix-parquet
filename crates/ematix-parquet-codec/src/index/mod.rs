@@ -47,11 +47,12 @@ pub(crate) mod rowset;
 pub mod types;
 
 pub use builder::IndexBuilder;
+pub use builder::SIDECAR_RG_ROWS;
 pub use fingerprint::{compute_source_fingerprint, crc32_ieee};
 pub use manifest::{
     IndexEntry, IndexKind, IndexManifest, ManifestError, PhysicalType, SourceFingerprint,
-    Tokenizer, MANIFEST_KEY, MANIFEST_KEY_V2, MANIFEST_VERSION,
+    Tokenizer, MANIFEST_KEY, MANIFEST_KEY_V2, MANIFEST_KEY_V3, MANIFEST_VERSION,
 };
 pub use page_layout::{walk_data_pages, DataPageLayout};
-pub use reader::ParquetIndex;
+pub use reader::{LazyParquetIndex, ParquetIndex};
 pub use types::{IndexHit, Key};

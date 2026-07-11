@@ -47,6 +47,17 @@ pub const MANIFEST_KEY: &str = "ematix_index_manifest_v1";
 /// bytes as a bitmap.
 pub const MANIFEST_KEY_V2: &str = "ematix_index_manifest_v2";
 
+/// v3 manifest key: v2's tagged rowsets PLUS chunked index bodies —
+/// `IndexEntry.sidecar_row_group_count` may exceed 1, with the body
+/// split across `[sidecar_row_group, sidecar_row_group + count)` row
+/// groups of the sidecar parquet (the writer cuts sorted-index bodies
+/// every `SIDECAR_RG_ROWS` rows so a lazy reader can footer-prune to
+/// the one row group containing a key instead of decoding the whole
+/// index). A v2-only reader would load just the first row group and
+/// silently drop hits, so the key is bumped: v2 readers refuse v3
+/// sidecars loudly. The v3 reader accepts v1/v2/v3.
+pub const MANIFEST_KEY_V3: &str = "ematix_index_manifest_v3";
+
 /// Symbolic version string embedded in the manifest payload. Matches
 /// the suffix of [`MANIFEST_KEY`]. Readers compare on the suffix, not
 /// this field — the field is informational only and never
@@ -90,9 +101,14 @@ pub struct IndexEntry {
     /// The kind of index — drives the row-group schema and the
     /// lookup algorithm.
     pub kind: IndexKind,
-    /// Index of the row group in the sidecar parquet file that
+    /// Index of the FIRST row group in the sidecar parquet file that
     /// holds this index's data.
     pub sidecar_row_group: u32,
+    /// How many consecutive row groups (starting at
+    /// `sidecar_row_group`) hold this index's body. 1 for v1/v2
+    /// sidecars and for small v3 bodies; chunked sorted indexes carry
+    /// more (see `MANIFEST_KEY_V3`).
+    pub sidecar_row_group_count: u32,
 }
 
 /// What kind of index this is. Each variant pins the schema of the
@@ -430,6 +446,8 @@ impl IndexEntry {
         write_json_string(s, &self.name);
         s.push_str(",\"sidecar_row_group\":");
         write!(s, "{}", self.sidecar_row_group).unwrap();
+        s.push_str(",\"sidecar_row_group_count\":");
+        write!(s, "{}", self.sidecar_row_group_count).unwrap();
         s.push(',');
         match &self.kind {
             IndexKind::Sorted {
@@ -505,6 +523,7 @@ fn parse_one_index(p: &mut JsonParser<'_>) -> Result<IndexEntry, ManifestError> 
     p.expect_obj_open()?;
     let mut name: Option<String> = None;
     let mut sidecar_row_group: Option<u32> = None;
+    let mut sidecar_row_group_count: Option<u32> = None;
     let mut typ: Option<String> = None;
     let mut source_column: Option<String> = None;
     let mut physical_type: Option<String> = None;
@@ -522,6 +541,7 @@ fn parse_one_index(p: &mut JsonParser<'_>) -> Result<IndexEntry, ManifestError> 
         match key.as_str() {
             "name" => name = Some(p.string()?),
             "sidecar_row_group" => sidecar_row_group = Some(p.u32()?),
+            "sidecar_row_group_count" => sidecar_row_group_count = Some(p.u32()?),
             "type" => typ = Some(p.string()?),
             "source_column" => source_column = Some(p.string()?),
             "physical_type" => physical_type = Some(p.string()?),
@@ -537,6 +557,8 @@ fn parse_one_index(p: &mut JsonParser<'_>) -> Result<IndexEntry, ManifestError> 
     let name = name.ok_or_else(|| ManifestError::Malformed("index.name".into()))?;
     let sidecar_row_group = sidecar_row_group
         .ok_or_else(|| ManifestError::Malformed("index.sidecar_row_group".into()))?;
+    // Absent on v1/v2 sidecars — their bodies are single row groups.
+    let sidecar_row_group_count = sidecar_row_group_count.unwrap_or(1).max(1);
     let typ = typ.ok_or_else(|| ManifestError::Malformed("index.type".into()))?;
 
     let kind = match typ.as_str() {
@@ -592,6 +614,7 @@ fn parse_one_index(p: &mut JsonParser<'_>) -> Result<IndexEntry, ManifestError> 
         name,
         kind,
         sidecar_row_group,
+        sidecar_row_group_count,
     })
 }
 
@@ -937,6 +960,7 @@ mod tests {
                         physical_type: PhysicalType::Int64,
                     },
                     sidecar_row_group: 0,
+                    sidecar_row_group_count: 1,
                 },
                 IndexEntry {
                     name: "idx_partkey_bloom".into(),
@@ -945,6 +969,7 @@ mod tests {
                         target_fpp: 0.01,
                     },
                     sidecar_row_group: 1,
+                    sidecar_row_group_count: 1,
                 },
                 IndexEntry {
                     name: "idx_shipdate_partkey".into(),
@@ -953,6 +978,7 @@ mod tests {
                         physical_types: vec![PhysicalType::Int32, PhysicalType::Int64],
                     },
                     sidecar_row_group: 2,
+                    sidecar_row_group_count: 1,
                 },
                 IndexEntry {
                     name: "idx_comment_text".into(),
@@ -961,6 +987,7 @@ mod tests {
                         tokenizer: Tokenizer::WhitespaceLowercaseV1,
                     },
                     sidecar_row_group: 3,
+                    sidecar_row_group_count: 1,
                 },
             ],
         }
@@ -1066,6 +1093,7 @@ mod tests {
                     physical_type: PhysicalType::ByteArray,
                 },
                 sidecar_row_group: 7,
+                sidecar_row_group_count: 1,
             }],
         };
         let j = m.to_json();

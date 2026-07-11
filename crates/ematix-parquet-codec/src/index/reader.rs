@@ -25,6 +25,7 @@ use crate::error::{CodecError, Result};
 use crate::index::fingerprint::compute_source_fingerprint;
 use crate::index::manifest::{
     IndexEntry, IndexKind, IndexManifest, ManifestError, MANIFEST_KEY, MANIFEST_KEY_V2,
+    MANIFEST_KEY_V3,
 };
 use crate::index::page_layout::walk_data_pages;
 use crate::index::rowset::{to_bitmap, RowsetFormat};
@@ -147,11 +148,17 @@ impl ParquetIndex {
             .key_value_metadata
             .as_ref()
             .ok_or_else(|| codec_err(ManifestError::Missing))?;
-        // v2 first (tagged rowsets), fall back to v1 (raw bitmaps).
+        // Newest first: v3 (tagged rowsets + chunked bodies), v2
+        // (tagged rowsets), v1 (raw bitmaps).
         let (manifest_kv, rowset_format) = kvs
             .iter()
-            .find(|kv| kv.key == MANIFEST_KEY_V2.as_bytes())
+            .find(|kv| kv.key == MANIFEST_KEY_V3.as_bytes())
             .map(|kv| (kv, RowsetFormat::V2Tagged))
+            .or_else(|| {
+                kvs.iter()
+                    .find(|kv| kv.key == MANIFEST_KEY_V2.as_bytes())
+                    .map(|kv| (kv, RowsetFormat::V2Tagged))
+            })
             .or_else(|| {
                 kvs.iter()
                     .find(|kv| kv.key == MANIFEST_KEY.as_bytes())
@@ -182,13 +189,16 @@ impl ParquetIndex {
         for entry in &manifest.indexes {
             match &entry.kind {
                 IndexKind::Sorted { physical_type, .. } => {
+                    // v3 bodies may span several row groups (see
+                    // MANIFEST_KEY_V3); v1/v2 always have count == 1.
                     let rg = entry.sidecar_row_group as usize;
+                    let rg_count = entry.sidecar_row_group_count.max(1) as usize;
                     let data = match physical_type {
                         PhysicalType::Int64 => {
-                            let values = read_column_i64(&idx_file, rg, 0)?;
-                            let target_rgs = read_column_i32(&idx_file, rg, 1)?;
-                            let target_pages = read_column_i32(&idx_file, rg, 2)?;
-                            let rowsets = read_column_byte_array(&idx_file, rg, 3)?;
+                            let values = read_column_i64_rgs(&idx_file, rg, rg_count, 0)?;
+                            let target_rgs = read_column_i32_rgs(&idx_file, rg, rg_count, 1)?;
+                            let target_pages = read_column_i32_rgs(&idx_file, rg, rg_count, 2)?;
+                            let rowsets = read_column_byte_array_rgs(&idx_file, rg, rg_count, 3)?;
                             check_aligned(
                                 &entry.name,
                                 rg,
@@ -205,10 +215,10 @@ impl ParquetIndex {
                             })
                         }
                         PhysicalType::Int32 => {
-                            let values = read_column_i32(&idx_file, rg, 0)?;
-                            let target_rgs = read_column_i32(&idx_file, rg, 1)?;
-                            let target_pages = read_column_i32(&idx_file, rg, 2)?;
-                            let rowsets = read_column_byte_array(&idx_file, rg, 3)?;
+                            let values = read_column_i32_rgs(&idx_file, rg, rg_count, 0)?;
+                            let target_rgs = read_column_i32_rgs(&idx_file, rg, rg_count, 1)?;
+                            let target_pages = read_column_i32_rgs(&idx_file, rg, rg_count, 2)?;
+                            let rowsets = read_column_byte_array_rgs(&idx_file, rg, rg_count, 3)?;
                             check_aligned(
                                 &entry.name,
                                 rg,
@@ -225,10 +235,10 @@ impl ParquetIndex {
                             })
                         }
                         PhysicalType::ByteArray => {
-                            let values = read_column_byte_array(&idx_file, rg, 0)?;
-                            let target_rgs = read_column_i32(&idx_file, rg, 1)?;
-                            let target_pages = read_column_i32(&idx_file, rg, 2)?;
-                            let rowsets = read_column_byte_array(&idx_file, rg, 3)?;
+                            let values = read_column_byte_array_rgs(&idx_file, rg, rg_count, 0)?;
+                            let target_rgs = read_column_i32_rgs(&idx_file, rg, rg_count, 1)?;
+                            let target_pages = read_column_i32_rgs(&idx_file, rg, rg_count, 2)?;
+                            let rowsets = read_column_byte_array_rgs(&idx_file, rg, rg_count, 3)?;
                             check_aligned(
                                 &entry.name,
                                 rg,
@@ -975,6 +985,19 @@ impl ParquetIndex {
                 )))
             }
         };
+        assemble_bitmaps_from(source, source_col_name, hits)
+    }
+}
+
+/// Body of [`ParquetIndex::assemble_bitmaps`], keyed on the resolved
+/// source column name so the lazy reader can share it without a
+/// loaded index.
+fn assemble_bitmaps_from(
+    source: &ParquetFile,
+    source_col_name: &str,
+    hits: &[IndexHit],
+) -> Result<Vec<(u32, Vec<u8>)>> {
+    {
         let source_col_idx = resolve_leaf_by_name(source, source_col_name)?;
 
         let md = source
@@ -1263,6 +1286,253 @@ fn collect_hits(
             // a handful of rowsets however large the index is.
             rowset: to_bitmap(&rowsets[i], format)?,
         });
+    }
+    Ok(out)
+}
+
+// ============================================================
+// Lazy reader — footer-pruned point lookups on chunked sidecars.
+// ============================================================
+
+/// Footer-only sidecar handle for point lookups on (v3) chunked
+/// sorted indexes.
+///
+/// [`ParquetIndex::open`] eagerly decodes the ENTIRE index body —
+/// on a 19M-value lineitem-part index that is ~1s and ~0.5-1 GB per
+/// open, which made an indexed point lookup SLOWER than a full scan
+/// at SF100. This handle reads only the manifest + fingerprint at
+/// open; `read_column_i64_where_eq` then binary-searches the sidecar
+/// row groups' footer min/max (the body is value-sorted, so RG bounds
+/// are ordered) and decodes ONLY the few-MB group(s) containing the
+/// key. v1/v2 single-RG sidecars work too — they just have one group
+/// to prune.
+pub struct LazyParquetIndex {
+    idx_file: ParquetFile,
+    manifest: IndexManifest,
+    rowset_format: RowsetFormat,
+}
+
+impl std::fmt::Debug for LazyParquetIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyParquetIndex")
+            .field("indexes", &self.manifest.indexes.len())
+            .field("rowset_format", &self.rowset_format)
+            .finish()
+    }
+}
+
+impl LazyParquetIndex {
+    /// Open `idx_path`, parse + fingerprint-verify the manifest
+    /// against `source`. No index data is decoded.
+    pub fn open<P: AsRef<Path>>(idx_path: P, source: &ParquetFile) -> Result<Self> {
+        let idx_file = ParquetFile::open(idx_path.as_ref())
+            .map_err(|e| CodecError::InvalidInput(format!("open sidecar: {e}")))?;
+        let md = idx_file
+            .metadata()
+            .map_err(|e| CodecError::InvalidInput(format!("read sidecar metadata: {e}")))?;
+        let kvs = md
+            .key_value_metadata
+            .as_ref()
+            .ok_or_else(|| codec_err(ManifestError::Missing))?;
+        let (manifest_kv, rowset_format) = kvs
+            .iter()
+            .find(|kv| kv.key == MANIFEST_KEY_V3.as_bytes())
+            .map(|kv| (kv, RowsetFormat::V2Tagged))
+            .or_else(|| {
+                kvs.iter()
+                    .find(|kv| kv.key == MANIFEST_KEY_V2.as_bytes())
+                    .map(|kv| (kv, RowsetFormat::V2Tagged))
+            })
+            .or_else(|| {
+                kvs.iter()
+                    .find(|kv| kv.key == MANIFEST_KEY.as_bytes())
+                    .map(|kv| (kv, RowsetFormat::V1Raw))
+            })
+            .ok_or_else(|| codec_err(ManifestError::Missing))?;
+        let manifest_json_bytes = manifest_kv
+            .value
+            .ok_or_else(|| codec_err(ManifestError::Missing))?;
+        let manifest_json = std::str::from_utf8(manifest_json_bytes).map_err(|_| {
+            codec_err(ManifestError::Malformed(
+                "manifest value is not valid UTF-8".into(),
+            ))
+        })?;
+        let manifest = IndexManifest::from_json(manifest_json).map_err(codec_err)?;
+        let actual_fp = compute_source_fingerprint(source)?;
+        if actual_fp != manifest.source_fingerprint {
+            return Err(codec_err(ManifestError::SourceFingerprintMismatch {
+                expected: manifest.source_fingerprint,
+                actual: actual_fp,
+            }));
+        }
+        Ok(Self {
+            idx_file,
+            manifest,
+            rowset_format,
+        })
+    }
+
+    pub fn manifest(&self) -> &IndexManifest {
+        &self.manifest
+    }
+
+    /// Indexed equality + masked decode for an `INT64` target column,
+    /// decoding only the sidecar row group(s) whose footer bounds
+    /// contain `key`. Sorted-INT64 indexes only.
+    pub fn read_column_i64_where_eq(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key: i64,
+        target_column: usize,
+    ) -> Result<Vec<i64>> {
+        let entry = self
+            .manifest
+            .indexes
+            .iter()
+            .find(|e| e.name == index_name)
+            .ok_or_else(|| {
+                CodecError::InvalidInput(format!("sidecar has no index named `{index_name}`"))
+            })?;
+        let source_col = match &entry.kind {
+            IndexKind::Sorted {
+                source_column,
+                physical_type: PhysicalType::Int64,
+            } => source_column.as_str(),
+            other => {
+                return Err(CodecError::InvalidInput(format!(
+                    "lazy eq lookup supports sorted INT64 indexes; `{index_name}` is {other:?}"
+                )))
+            }
+        };
+        let start = entry.sidecar_row_group as usize;
+        let count = entry.sidecar_row_group_count.max(1) as usize;
+        let idx_md = self
+            .idx_file
+            .metadata()
+            .map_err(|e| CodecError::InvalidInput(format!("sidecar metadata: {e}")))?;
+
+        let mut hits: Vec<IndexHit> = Vec::new();
+        for rg in start..start + count {
+            // Footer prune: skip groups whose value range excludes the
+            // key. Missing/short stats → conservatively decode.
+            if let Some((mn, mx)) = idx_rg_i64_bounds(&idx_md, rg, 0) {
+                if key < mn || key > mx {
+                    continue;
+                }
+            }
+            let values = read_column_i64(&self.idx_file, rg, 0)?;
+            let pos = match values.binary_search(&key) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let mut lo = pos;
+            while lo > 0 && values[lo - 1] == key {
+                lo -= 1;
+            }
+            let mut hi = pos + 1;
+            while hi < values.len() && values[hi] == key {
+                hi += 1;
+            }
+            let target_rgs = read_column_i32(&self.idx_file, rg, 1)?;
+            let target_pages = read_column_i32(&self.idx_file, rg, 2)?;
+            let rowsets = read_column_byte_array(&self.idx_file, rg, 3)?;
+            hits.extend(collect_hits(
+                &target_rgs,
+                &target_pages,
+                &rowsets,
+                lo,
+                hi,
+                self.rowset_format,
+            )?);
+        }
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bitmaps = assemble_bitmaps_from(source, source_col, &hits)?;
+        let mut out: Vec<i64> = Vec::new();
+        for (rg, bitmap) in bitmaps {
+            crate::read::read_column_i64_masked_into(
+                source,
+                rg as usize,
+                target_column,
+                &bitmap,
+                &mut out,
+            )?;
+        }
+        Ok(out)
+    }
+}
+
+/// Footer `[min, max]` of `column` in sidecar row group `rg`, when the
+/// writer recorded 8-byte INT64 stats (it does for the `value`
+/// column). `None` → caller must decode the group.
+fn idx_rg_i64_bounds(
+    md: &ematix_parquet_format::metadata::FileMetaData<'_>,
+    rg: usize,
+    column: usize,
+) -> Option<(i64, i64)> {
+    let cm = md
+        .row_groups
+        .get(rg)?
+        .columns
+        .get(column)?
+        .meta_data
+        .as_ref()?;
+    let stats = cm.statistics.as_ref()?;
+    let mn = stats.min_value.or(stats.min)?;
+    let mx = stats.max_value.or(stats.max)?;
+    if mn.len() == 8 && mx.len() == 8 {
+        Some((
+            i64::from_le_bytes(mn.try_into().ok()?),
+            i64::from_le_bytes(mx.try_into().ok()?),
+        ))
+    } else {
+        None
+    }
+}
+
+// ============================================================
+// Multi-row-group column reads (v3 chunked bodies).
+// ============================================================
+
+/// Concatenate `column` across `count` consecutive row groups
+/// starting at `start` — the eager load for a v3 chunked index body.
+fn read_column_i64_rgs(
+    f: &ParquetFile,
+    start: usize,
+    count: usize,
+    column: usize,
+) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    for rg in start..start + count {
+        out.extend(read_column_i64(f, rg, column)?);
+    }
+    Ok(out)
+}
+
+fn read_column_i32_rgs(
+    f: &ParquetFile,
+    start: usize,
+    count: usize,
+    column: usize,
+) -> Result<Vec<i32>> {
+    let mut out = Vec::new();
+    for rg in start..start + count {
+        out.extend(read_column_i32(f, rg, column)?);
+    }
+    Ok(out)
+}
+
+fn read_column_byte_array_rgs(
+    f: &ParquetFile,
+    start: usize,
+    count: usize,
+    column: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    for rg in start..start + count {
+        out.extend(read_column_byte_array(f, rg, column)?);
     }
     Ok(out)
 }

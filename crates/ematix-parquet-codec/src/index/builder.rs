@@ -42,7 +42,7 @@ use crate::bloom::{optimal_num_blocks, parquet_xxh64, SplitBlockBloomFilterBuild
 use crate::error::{CodecError, Result};
 use crate::index::fingerprint::compute_source_fingerprint;
 use crate::index::manifest::{
-    IndexEntry, IndexKind, IndexManifest, PhysicalType, Tokenizer, MANIFEST_KEY_V2,
+    IndexEntry, IndexKind, IndexManifest, PhysicalType, Tokenizer, MANIFEST_KEY_V3,
 };
 use crate::index::page_layout::{walk_data_pages, DataPageLayout};
 use crate::read::{read_column_byte_array, read_column_i32, read_column_i64};
@@ -54,6 +54,15 @@ use crate::write::{write_table_with_options_to_path, ColumnData, WriteOptions};
 pub struct IndexBuilder<'a> {
     source: &'a ParquetFile,
 }
+
+/// Sorted-index bodies are cut into row groups of this many index
+/// rows (v3 sidecars). Each RG carries footer min/max on the sorted
+/// `value` column, so a lazy reader can binary-search RG bounds and
+/// decode ONLY the ~few-MB group containing a key — instead of the
+/// v1/v2 whole-body eager load (~1s and ~0.5-1 GB on a 19M-value
+/// lineitem-part index; the "open cost" that made point lookups
+/// slower than full scans at SF100).
+pub const SIDECAR_RG_ROWS: usize = 256 * 1024;
 
 impl<'a> IndexBuilder<'a> {
     /// Wrap a source `.parquet`. The builder does no I/O until
@@ -196,10 +205,11 @@ impl<'a> IndexBuilder<'a> {
                     physical_type: PhysicalType::Int64,
                 },
                 sidecar_row_group: 0,
+                sidecar_row_group_count: n_rows.div_ceil(SIDECAR_RG_ROWS).max(1) as u32,
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V3, manifest_json.as_str())];
 
         // ColumnData::ByteArray wants &[&[u8]], so we need a slice of
         // slices alongside the owned `Vec<Vec<u8>>`.
@@ -217,6 +227,10 @@ impl<'a> IndexBuilder<'a> {
             // dense-or-sparse-but-compressible. Per-column codec
             // selection lands later; one codec for the whole file is
             // fine for MVP.
+            // Chunked body (v3): rows are sorted by `value`, so each
+            // row group's footer min/max form ordered, prunable ranges —
+            // the lazy reader's whole trick.
+            row_group_size: SIDECAR_RG_ROWS,
             default_codec: CompressionCodec::Snappy,
             kv_metadata: Some(&kvs),
             ..WriteOptions::default()
@@ -325,10 +339,11 @@ impl<'a> IndexBuilder<'a> {
                     physical_type: PhysicalType::Int32,
                 },
                 sidecar_row_group: 0,
+                sidecar_row_group_count: 1,
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V3, manifest_json.as_str())];
         let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
         let cols: &[(&str, ColumnData<'_>)] = &[
             ("value", ColumnData::I32(&col_value)),
@@ -471,10 +486,11 @@ impl<'a> IndexBuilder<'a> {
                     target_fpp,
                 },
                 sidecar_row_group: 0,
+                sidecar_row_group_count: 1,
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V3, manifest_json.as_str())];
 
         let bloom_slices: Vec<&[u8]> = col_bloom_owned.iter().map(|v| v.as_slice()).collect();
         let cols: &[(&str, ColumnData<'_>)] = &[
@@ -648,10 +664,11 @@ impl<'a> IndexBuilder<'a> {
                     physical_types: vec![PhysicalType::Int64, PhysicalType::Int64],
                 },
                 sidecar_row_group: 0,
+                sidecar_row_group_count: 1,
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V3, manifest_json.as_str())];
         let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
         let cols: &[(&str, ColumnData<'_>)] = &[
             ("value_a", ColumnData::I64(&col_value_a)),
@@ -773,10 +790,11 @@ impl<'a> IndexBuilder<'a> {
                     physical_type: PhysicalType::ByteArray,
                 },
                 sidecar_row_group: 0,
+                sidecar_row_group_count: 1,
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V3, manifest_json.as_str())];
 
         let value_slices: Vec<&[u8]> = col_value_owned.iter().map(|v| v.as_slice()).collect();
         let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
@@ -924,10 +942,11 @@ impl<'a> IndexBuilder<'a> {
                     tokenizer,
                 },
                 sidecar_row_group: 0,
+                sidecar_row_group_count: 1,
             }],
         };
         let manifest_json = manifest.to_json();
-        let kvs = [(MANIFEST_KEY_V2, manifest_json.as_str())];
+        let kvs = [(MANIFEST_KEY_V3, manifest_json.as_str())];
         let token_slices: Vec<&[u8]> = col_token_owned.iter().map(|v| v.as_slice()).collect();
         let rowset_slices: Vec<&[u8]> = col_rowset_owned.iter().map(|v| v.as_slice()).collect();
         let cols: &[(&str, ColumnData<'_>)] = &[

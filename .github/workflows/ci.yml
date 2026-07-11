@@ -1,16 +1,15 @@
 name: ci
 
-# Runs on every PR and on pushes to main. Branch protection on main
-# gates merges on the `build-test` job (the required check). Format
-# and clippy run as separate jobs that surface findings but are not
-# (yet) required — flip them to required once the codebase is clean
-# and the team agrees on style enforcement.
+# CI runs on release tags only (`v*`), plus manual dispatch. Day-to-day
+# development relies on local gates (fmt/clippy/test); the full build +
+# test matrix runs when a release tag is cut, keeping the ~5-min suite
+# off the per-push critical path. Re-add `pull_request` / `push:
+# branches: [main]` here if you want per-PR gating back.
 
 on:
-  pull_request:
-    branches: [main]
   push:
-    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
 
 # Cancel in-progress runs for the same PR / branch when a new commit
 # lands — saves CI minutes on quick-fire pushes.

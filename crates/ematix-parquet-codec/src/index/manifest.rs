@@ -38,6 +38,15 @@ use std::fmt;
 /// Bumped on any breaking change to the JSON shape.
 pub const MANIFEST_KEY: &str = "ematix_index_manifest_v1";
 
+/// v2 manifest key: same JSON payload as v1, but rowset byte-arrays
+/// are TAGGED (see the codec's `index::rowset` module) — 1-byte
+/// discriminator, then either a bitmap or a sparse row-id list.
+/// Writers emit v2 only; readers accept both keys. A v1-only reader
+/// finds no v1 manifest on a v2 sidecar and refuses loudly (its
+/// documented missing-manifest path) instead of misreading tagged
+/// bytes as a bitmap.
+pub const MANIFEST_KEY_V2: &str = "ematix_index_manifest_v2";
+
 /// Symbolic version string embedded in the manifest payload. Matches
 /// the suffix of [`MANIFEST_KEY`]. Readers compare on the suffix, not
 /// this field — the field is informational only and never

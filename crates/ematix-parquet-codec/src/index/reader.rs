@@ -26,8 +26,8 @@ use crate::index::fingerprint::compute_source_fingerprint;
 use crate::index::manifest::{
     IndexEntry, IndexKind, IndexManifest, ManifestError, MANIFEST_KEY, MANIFEST_KEY_V2,
 };
-use crate::index::rowset::{to_bitmap, RowsetFormat};
 use crate::index::page_layout::walk_data_pages;
+use crate::index::rowset::{to_bitmap, RowsetFormat};
 use crate::index::types::{IndexHit, Key};
 use crate::index::PhysicalType;
 use crate::read::{read_column_byte_array, read_column_i32, read_column_i64};
@@ -395,7 +395,9 @@ impl ParquetIndex {
         match (&idx.data, key) {
             (LoadedIndexData::SortedI64(d), Key::I64(v)) => eq_hits_i64(d, *v, self.rowset_format),
             (LoadedIndexData::SortedI32(d), Key::I32(v)) => eq_hits_i32(d, *v, self.rowset_format),
-            (LoadedIndexData::SortedBytes(d), Key::Bytes(v)) => eq_hits_bytes(d, v, self.rowset_format),
+            (LoadedIndexData::SortedBytes(d), Key::Bytes(v)) => {
+                eq_hits_bytes(d, v, self.rowset_format)
+            }
             _ => Err(CodecError::InvalidInput(format!(
                 "lookup_eq: key/index type mismatch on `{index_name}`"
             ))),
@@ -1042,7 +1044,14 @@ fn eq_hits_i64(d: &LoadedTypedI64, target: i64, format: RowsetFormat) -> Result<
     while end < d.values.len() && d.values[end] == target {
         end += 1;
     }
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end, format)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
 fn eq_hits_i32(d: &LoadedTypedI32, target: i32, format: RowsetFormat) -> Result<Vec<IndexHit>> {
@@ -1058,10 +1067,21 @@ fn eq_hits_i32(d: &LoadedTypedI32, target: i32, format: RowsetFormat) -> Result<
     while end < d.values.len() && d.values[end] == target {
         end += 1;
     }
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end, format)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn eq_hits_bytes(d: &LoadedTypedBytes, target: &[u8], format: RowsetFormat) -> Result<Vec<IndexHit>> {
+fn eq_hits_bytes(
+    d: &LoadedTypedBytes,
+    target: &[u8],
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     let pos = match d.values.binary_search_by(|v| v.as_slice().cmp(target)) {
         Ok(i) => i,
         Err(_) => return Ok(Vec::new()),
@@ -1074,32 +1094,78 @@ fn eq_hits_bytes(d: &LoadedTypedBytes, target: &[u8], format: RowsetFormat) -> R
     while end < d.values.len() && d.values[end].as_slice() == target {
         end += 1;
     }
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end, format)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn range_hits_i64(d: &LoadedTypedI64, range: RangeInclusive<i64>, format: RowsetFormat) -> Result<Vec<IndexHit>> {
+fn range_hits_i64(
+    d: &LoadedTypedI64,
+    range: RangeInclusive<i64>,
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     let (lo, hi) = (*range.start(), *range.end());
     // First index with value >= lo.
     let start = d.values.partition_point(|v| *v < lo);
     // First index with value > hi.
     let end = d.values.partition_point(|v| *v <= hi);
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end, format)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn range_hits_i32(d: &LoadedTypedI32, range: RangeInclusive<i32>, format: RowsetFormat) -> Result<Vec<IndexHit>> {
+fn range_hits_i32(
+    d: &LoadedTypedI32,
+    range: RangeInclusive<i32>,
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     let (lo, hi) = (*range.start(), *range.end());
     let start = d.values.partition_point(|v| *v < lo);
     let end = d.values.partition_point(|v| *v <= hi);
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end, format)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn range_hits_bytes(d: &LoadedTypedBytes, lo: &[u8], hi: &[u8], format: RowsetFormat) -> Result<Vec<IndexHit>> {
+fn range_hits_bytes(
+    d: &LoadedTypedBytes,
+    lo: &[u8],
+    hi: &[u8],
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     let start = d.values.partition_point(|v| v.as_slice() < lo);
     let end = d.values.partition_point(|v| v.as_slice() <= hi);
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end, format)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
-fn composite_eq_hits(d: &LoadedTypedCompositeI64I64, a: i64, b: i64, format: RowsetFormat) -> Result<Vec<IndexHit>> {
+fn composite_eq_hits(
+    d: &LoadedTypedCompositeI64I64,
+    a: i64,
+    b: i64,
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     // Two-step binary search:
     //   1. Find the run where values_a == a (partition by `< a` and `<= a`).
     //   2. Within that run, find the row where values_b == b.
@@ -1132,7 +1198,11 @@ fn composite_eq_hits(d: &LoadedTypedCompositeI64I64, a: i64, b: i64, format: Row
     Ok(out)
 }
 
-fn inverted_eq_hits(d: &LoadedTypedInverted, token: &[u8], format: RowsetFormat) -> Result<Vec<IndexHit>> {
+fn inverted_eq_hits(
+    d: &LoadedTypedInverted,
+    token: &[u8],
+    format: RowsetFormat,
+) -> Result<Vec<IndexHit>> {
     // `tokens` is sorted lex-ASC; binary search finds any row with
     // the target token, then linear scan covers duplicates of the
     // same token across pages.
@@ -1148,7 +1218,14 @@ fn inverted_eq_hits(d: &LoadedTypedInverted, token: &[u8], format: RowsetFormat)
     while end < d.tokens.len() && d.tokens[end].as_slice() == token {
         end += 1;
     }
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end, format)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
 fn composite_prefix_hits(
@@ -1158,7 +1235,14 @@ fn composite_prefix_hits(
 ) -> Result<Vec<IndexHit>> {
     let start = d.values_a.partition_point(|v| *v < a);
     let end = d.values_a.partition_point(|v| *v <= a);
-    collect_hits(&d.target_rgs, &d.target_pages, &d.rowsets, start, end, format)
+    collect_hits(
+        &d.target_rgs,
+        &d.target_pages,
+        &d.rowsets,
+        start,
+        end,
+        format,
+    )
 }
 
 fn collect_hits(

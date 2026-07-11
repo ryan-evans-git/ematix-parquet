@@ -55,7 +55,10 @@ pub(crate) fn encode_tagged(positions: &[u32], num_page_values: usize) -> Vec<u8
         out.extend_from_slice(&(num_page_values as u32).to_le_bytes());
         out.extend_from_slice(&(positions.len() as u32).to_le_bytes());
         for p in positions {
-            debug_assert!((*p as usize) < num_page_values, "row_within_page out of range");
+            debug_assert!(
+                (*p as usize) < num_page_values,
+                "row_within_page out of range"
+            );
             out.extend_from_slice(&p.to_le_bytes());
         }
         out
@@ -85,10 +88,8 @@ pub(crate) fn to_bitmap(bytes: &[u8], format: RowsetFormat) -> Result<Vec<u8>> {
                         bytes.len()
                     )));
                 }
-                let npv =
-                    u32::from_le_bytes(bytes[1..5].try_into().expect("4 bytes")) as usize;
-                let count =
-                    u32::from_le_bytes(bytes[5..9].try_into().expect("4 bytes")) as usize;
+                let npv = u32::from_le_bytes(bytes[1..5].try_into().expect("4 bytes")) as usize;
+                let count = u32::from_le_bytes(bytes[5..9].try_into().expect("4 bytes")) as usize;
                 if bytes.len() != 9 + 4 * count {
                     return Err(CodecError::InvalidInput(format!(
                         "v2 sparse rowset length mismatch: {} bytes for count={count}",
@@ -123,12 +124,14 @@ mod tests {
 
     #[test]
     fn sparse_round_trips_to_bitmap() {
-        let enc = encode_tagged(&[0, 3, 17], 20);
+        // 3 positions on a 200-value page: sparse = 21 B < bitmap 26 B.
+        let enc = encode_tagged(&[0, 3, 17], 200);
         assert_eq!(enc[0], TAG_SPARSE);
         let bm = to_bitmap(&enc, RowsetFormat::V2Tagged).unwrap();
-        assert_eq!(bm.len(), 3);
+        assert_eq!(bm.len(), 25);
         assert_eq!(bm[0], 0b0000_1001); // rows 0, 3
         assert_eq!(bm[2], 0b0000_0010); // row 17
+        assert!(bm[3..].iter().all(|b| *b == 0));
     }
 
     #[test]

@@ -40,7 +40,11 @@ fn baseline_eq(source: &ParquetFile, col: usize, key: i64) -> Vec<i64> {
     out
 }
 
-fn build(dir: &std::path::Path, prefix: &str, values: &[i64]) -> (std::path::PathBuf, std::path::PathBuf) {
+fn build(
+    dir: &std::path::Path,
+    prefix: &str,
+    values: &[i64],
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let src = dir.join(format!("{prefix}.parquet"));
     let idx = dir.join(format!("{prefix}.parquet.idx"));
     write_i64_column_to_path(&src, "v", values).unwrap();
@@ -144,7 +148,10 @@ fn mixed_density_eq_and_range_parity() {
     let rs = rowsets(&idx);
     let sparse = rs.iter().filter(|r| r.first() == Some(&0x01)).count();
     let bitmap = rs.iter().filter(|r| r.first() == Some(&0x00)).count();
-    assert!(sparse > 0 && bitmap > 0, "expected both forms, got sparse={sparse} bitmap={bitmap}");
+    assert!(
+        sparse > 0 && bitmap > 0,
+        "expected both forms, got sparse={sparse} bitmap={bitmap}"
+    );
 
     let source = ParquetFile::open(&src).unwrap();
     let pidx = ParquetIndex::open(&idx, &source).unwrap();

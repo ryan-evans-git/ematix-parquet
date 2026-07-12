@@ -1386,6 +1386,80 @@ impl LazyParquetIndex {
         key: i64,
         target_column: usize,
     ) -> Result<Vec<i64>> {
+        let bitmaps = self.eq_bitmaps(source, index_name, key)?;
+        let mut out: Vec<i64> = Vec::new();
+        for (rg, bitmap) in bitmaps {
+            crate::read::read_column_i64_masked_into(
+                source,
+                rg as usize,
+                target_column,
+                &bitmap,
+                &mut out,
+            )?;
+        }
+        Ok(out)
+    }
+
+    /// Lazy indexed eq + masked decode for an `INT32` TARGET column.
+    /// The INDEX key stays `i64` (the lazy path serves sorted-INT64
+    /// indexes only) — unlike the eager reader's same-named method,
+    /// whose `i32` key selects a sorted-INT32 index.
+    pub fn read_column_i32_where_eq(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key: i64,
+        target_column: usize,
+    ) -> Result<Vec<i32>> {
+        let bitmaps = self.eq_bitmaps(source, index_name, key)?;
+        let mut out: Vec<i32> = Vec::new();
+        for (rg, bitmap) in bitmaps {
+            crate::read::read_column_i32_masked_into(
+                source,
+                rg as usize,
+                target_column,
+                &bitmap,
+                &mut out,
+            )?;
+        }
+        Ok(out)
+    }
+
+    /// Lazy indexed eq + masked decode for a `BYTE_ARRAY` TARGET
+    /// column (same `i64` index-key semantics as
+    /// [`Self::read_column_i32_where_eq`]).
+    pub fn read_column_byte_array_where_eq(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key: i64,
+        target_column: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let bitmaps = self.eq_bitmaps(source, index_name, key)?;
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for (rg, bitmap) in bitmaps {
+            crate::read::read_column_byte_array_masked_into(
+                source,
+                rg as usize,
+                target_column,
+                &bitmap,
+                &mut out,
+            )?;
+        }
+        Ok(out)
+    }
+
+    /// Shared lazy eq machinery: resolve the sorted-INT64 index entry,
+    /// footer-prune + binary-search the chunked sidecar body for `key`,
+    /// and assemble per-source-row-group match bitmaps. Typed
+    /// `read_column_*_where_eq` wrappers differ only in the masked
+    /// materializer they feed these bitmaps into.
+    fn eq_bitmaps(
+        &self,
+        source: &ParquetFile,
+        index_name: &str,
+        key: i64,
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
         let entry = self
             .manifest
             .indexes
@@ -1449,18 +1523,7 @@ impl LazyParquetIndex {
         if hits.is_empty() {
             return Ok(Vec::new());
         }
-        let bitmaps = assemble_bitmaps_from(source, source_col, &hits)?;
-        let mut out: Vec<i64> = Vec::new();
-        for (rg, bitmap) in bitmaps {
-            crate::read::read_column_i64_masked_into(
-                source,
-                rg as usize,
-                target_column,
-                &bitmap,
-                &mut out,
-            )?;
-        }
-        Ok(out)
+        assemble_bitmaps_from(source, source_col, &hits)
     }
 }
 

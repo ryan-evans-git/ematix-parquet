@@ -150,3 +150,83 @@ fn lazy_serves_legacy_single_group_sidecars() {
         );
     }
 }
+
+/// The 0.17.3 typed materializers: the LAZY reader answers the same
+/// i64-keyed lookup while materializing INT32 and BYTE_ARRAY target
+/// columns — oracle-pinned against a full scan of the same columns.
+/// (The eq machinery is shared with the i64 path via `eq_bitmaps`;
+/// what's under test is the typed masked decode.)
+#[test]
+fn lazy_typed_targets_match_full_scan() {
+    use ematix_parquet_codec::read::{read_column_byte_array, read_column_i32};
+    use ematix_parquet_codec::write::{write_table_to_path, ColumnData};
+
+    let dir = tempfile::tempdir().unwrap();
+    let n: i64 = 10_000;
+    // ident: clustered duplicates (4 rows/id) so a hit materializes
+    // several rows; i32/bytes columns derived so the oracle is exact.
+    let ident: Vec<i64> = (0..n).map(|i| i / 4).collect();
+    let small: Vec<i32> = (0..n).map(|i| (i % 1_000) as i32).collect();
+    let tags: Vec<String> = (0..n).map(|i| format!("tag-{i:05}")).collect();
+    let tag_refs: Vec<&[u8]> = tags.iter().map(|s| s.as_bytes()).collect();
+
+    let src = dir.path().join("typed.parquet");
+    write_table_to_path(
+        &src,
+        &[
+            ("ident", ColumnData::I64(&ident)),
+            ("small", ColumnData::I32(&small)),
+            ("tag", ColumnData::ByteArray(&tag_refs)),
+        ],
+        ematix_parquet_format::types::CompressionCodec::Uncompressed,
+    )
+    .unwrap();
+    let idx = dir.path().join("typed.parquet.idx");
+    let source = ParquetFile::open(&src).unwrap();
+    IndexBuilder::new(&source)
+        .write_sorted_i64(&idx, "idx_ident", 0)
+        .unwrap();
+
+    let lazy = LazyParquetIndex::open(&idx, &source).unwrap();
+    for key in [0_i64, 1_234, (n / 4) - 1] {
+        // Oracle: full decode + row filter.
+        let md = source.metadata().unwrap();
+        let mut want_i32: Vec<i32> = Vec::new();
+        let mut want_bytes: Vec<Vec<u8>> = Vec::new();
+        for rg in 0..md.row_groups.len() {
+            let ids = read_column_i64(&source, rg, 0).unwrap();
+            let smalls = read_column_i32(&source, rg, 1).unwrap();
+            let tags = read_column_byte_array(&source, rg, 2).unwrap();
+            for (i, id) in ids.iter().enumerate() {
+                if *id == key {
+                    want_i32.push(smalls[i]);
+                    want_bytes.push(tags[i].clone());
+                }
+            }
+        }
+        assert_eq!(want_i32.len(), 4, "fixture: 4 rows per ident");
+
+        let mut got_i32 = lazy
+            .read_column_i32_where_eq(&source, "idx_ident", key, 1)
+            .unwrap();
+        let mut got_bytes = lazy
+            .read_column_byte_array_where_eq(&source, "idx_ident", key, 2)
+            .unwrap();
+        got_i32.sort_unstable();
+        want_i32.sort_unstable();
+        got_bytes.sort();
+        want_bytes.sort();
+        assert_eq!(got_i32, want_i32, "i32 target, key={key}");
+        assert_eq!(got_bytes, want_bytes, "byte_array target, key={key}");
+    }
+
+    // Absent key → empty across all typed materializers.
+    assert!(lazy
+        .read_column_i32_where_eq(&source, "idx_ident", n, 1)
+        .unwrap()
+        .is_empty());
+    assert!(lazy
+        .read_column_byte_array_where_eq(&source, "idx_ident", n, 2)
+        .unwrap()
+        .is_empty());
+}

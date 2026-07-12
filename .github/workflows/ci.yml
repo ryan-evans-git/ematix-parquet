@@ -1,12 +1,12 @@
 name: ci
 
-# CI runs on release tags only (`v*`), plus manual dispatch. Day-to-day
-# development relies on local gates (fmt/clippy/test); the full build +
-# test matrix runs when a release tag is cut, keeping the ~5-min suite
-# off the per-push critical path. Re-add `pull_request` / `push:
-# branches: [main]` here if you want per-PR gating back.
+# CI runs on pull requests and release tags (`v*`), plus manual
+# dispatch. Branch protection requires the four checks below on every
+# PR, so the suite must run PR-attached (tag-only CI left PRs
+# permanently blocked); pushes to branches stay off the critical path.
 
 on:
+  pull_request:
   push:
     tags: ['v*']
   workflow_dispatch:
